@@ -11,6 +11,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict
 
 from one_memory.database_access import main_database_transaction
+from one_memory.imports.access import cursor_identities_same_file
 from one_memory.imports.adapters import ScanPhase, SourceCursor
 
 #: Schema owned by `memory_server.migrations` (migration 7). No local copy:
@@ -216,6 +217,16 @@ class ImportJobStore:
             connection.execute(
                 "ALTER TABLE source_cursors ADD COLUMN read_to_end INTEGER NOT NULL DEFAULT 0"
             )
+        for table in ("source_cursors", "live_source_cursors"):
+            connection.execute(
+                f"""
+                UPDATE {table}
+                SET file_identity = 'ino:' || substr(file_identity, instr(file_identity, ':') + 1)
+                WHERE file_identity NOT GLOB '*[^0-9:]*'
+                  AND length(file_identity) - length(replace(file_identity, ':', '')) = 1
+                  AND file_identity GLOB '[0-9]*:[0-9]*'
+                """
+            )
         active = (
             ImportStatus.PENDING,
             ImportStatus.RUNNING,
@@ -279,6 +290,7 @@ class ImportJobStore:
         user_id: str,
         source_id: str,
         operation: Literal["history", "sync"] = "history",
+        history_after: datetime | None = None,
     ) -> ImportJob:
         now = datetime.now(UTC).isoformat()
         job_id = str(uuid4())
@@ -287,8 +299,8 @@ class ImportJobStore:
                 """
                 INSERT OR IGNORE INTO import_jobs (
                     job_id, user_id, source_id, status, created_at, updated_at,
-                    operation
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    operation, history_after
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -298,6 +310,7 @@ class ImportJobStore:
                     now,
                     now,
                     operation,
+                    history_after.isoformat() if history_after is not None else None,
                 ),
             )
             if created.rowcount == 0:
@@ -911,7 +924,9 @@ class ImportJobStore:
                     live = live_by_key.get(key)
                     if live is None and not baseline_missing_files:
                         continue
-                    rebased = live is None or str(live["file_identity"]) != cursor.file_identity
+                    rebased = live is None or not cursor_identities_same_file(
+                        str(live["file_identity"]), cursor.file_identity
+                    )
                     if live is not None and not rebased:
                         live_offset = _byte_checkpoint(str(live["checkpoint"]))
                         tail_offset = _byte_checkpoint(cursor.checkpoint)

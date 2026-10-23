@@ -20,6 +20,7 @@ from one_memory.imports.access import (
     AuthorizedSourceRoot,
     SourceAccessError,
     SourceAccessErrorCode,
+    cursor_identities_same_file,
     opaque_workspace_id,
     safe_project_label,
 )
@@ -628,7 +629,7 @@ def is_unchanged(source_file: AuthorizedSourceFile, cursors: dict[str, SourceCur
     return (
         previous is not None
         and previous.read_to_end
-        and previous.file_identity == source_file.file_identity
+        and cursor_identities_same_file(previous.file_identity, source_file.file_identity)
         and previous.observed_size == source_file.size
         and previous.observed_modified_ns == source_file.modified_ns
         # Chmod alone leaves size, mtime and inode untouched, so a file that
@@ -675,7 +676,7 @@ def touched_cursor(
     previous = options.cursors.get(source_file.safe_id)
     keep = (
         previous is not None
-        and previous.file_identity == source_file.file_identity
+        and cursor_identities_same_file(previous.file_identity, source_file.file_identity)
         and previous.observed_size <= source_file.size
     )
     # A kept cursor means the next scan resumes exactly where this one ended:
@@ -855,7 +856,7 @@ def resume_checkpoint(
     previous = options.cursors.get(source_file.safe_id)
     if previous is None:
         return None
-    if previous.file_identity != source_file.file_identity:
+    if not cursor_identities_same_file(previous.file_identity, source_file.file_identity):
         return None
     if source_file.size < previous.observed_size:
         return None

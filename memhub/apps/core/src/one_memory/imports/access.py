@@ -324,7 +324,7 @@ class AuthorizedSourceRoot:
             path=candidate,
             relative_path=relative,
             max_bytes=self.max_file_bytes,
-            file_identity=f"{details.st_dev}:{details.st_ino}",
+            file_identity=file_cursor_identity(details),
             size=details.st_size,
             modified_ns=details.st_mtime_ns,
             changed_ns=_changed_ns(details),
@@ -362,7 +362,7 @@ class AuthorizedSourceRoot:
             path=resolved,
             relative_path=relative,
             max_bytes=self.max_file_bytes,
-            file_identity=f"{details.st_dev}:{details.st_ino}",
+            file_identity=file_cursor_identity(details),
             size=details.st_size,
             modified_ns=details.st_mtime_ns,
             changed_ns=_changed_ns(details),
@@ -386,11 +386,10 @@ def _root_details(root: Path) -> tuple[Path, os.stat_result]:
 def _changed_ns(details: os.stat_result) -> int:
     """Stable creation time when the platform exposes one.
 
-    ext4 can recycle an inode number immediately after an unlink, so
-    ``st_dev:st_ino`` is not enough to tell a replacement from the file that was
-    authorised. macOS reports birth time, which a newly created replacement
-    cannot share. Linux has no portable birth-time field here, so zero means
-    "unavailable" and callers fall back to the existing inode identity.
+    ext4 can recycle an inode number immediately after an unlink, so the inode
+    alone cannot tell a replacement from the file that was authorised. macOS
+    reports birth time, which a newly created replacement cannot share. Linux
+    has no portable birth-time field here, so zero means "unavailable".
     """
     birthtime_ns = getattr(details, "st_birthtime_ns", None)
     if birthtime_ns is None:
@@ -399,8 +398,42 @@ def _changed_ns(details: os.stat_result) -> int:
     return int(birthtime_ns) if birthtime_ns is not None else 0
 
 
+def file_cursor_identity(details: os.stat_result) -> str:
+    """Inode and birth time. st_dev is excluded because macOS renumbers APFS volumes."""
+    return f"ino:{details.st_ino}:{_changed_ns(details)}"
+
+
+def _parse_cursor_identity(value: str) -> tuple[int, int | None] | None:
+    parts = value.split(":")
+    if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+        return int(parts[1]), None
+    if len(parts) == 2 and parts[0] == "ino" and parts[1].isdigit():
+        return int(parts[1]), None
+    if (
+        len(parts) == 3
+        and parts[0] == "ino"
+        and parts[1].isdigit()
+        and parts[2].isdigit()
+    ):
+        return int(parts[1]), int(parts[2])
+    return None
+
+
+def cursor_identities_same_file(left: str, right: str) -> bool:
+    """True when both identities name one file, including a pre-reboot ``st_dev:st_ino``."""
+    if left == right:
+        return True
+    parsed_left = _parse_cursor_identity(left)
+    parsed_right = _parse_cursor_identity(right)
+    if parsed_left is None or parsed_right is None or parsed_left[0] != parsed_right[0]:
+        return False
+    if parsed_left[1] is not None and parsed_right[1] is not None:
+        return parsed_left[1] == parsed_right[1]
+    return True
+
+
 def _same_file(details: os.stat_result, *, file_identity: str, changed_ns: int) -> bool:
-    if f"{details.st_dev}:{details.st_ino}" != file_identity:
+    if not cursor_identities_same_file(file_identity, file_cursor_identity(details)):
         return False
     return changed_ns == 0 or _changed_ns(details) == changed_ns
 

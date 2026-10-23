@@ -376,6 +376,12 @@ class ConnectSourcesRequest(BaseModel):
 
 ONBOARDING_LARGE_HISTORY_USER_TURNS = 200
 ONBOARDING_HISTORY_WINDOW = timedelta(days=3)
+RESUME_HISTORY_WINDOW = timedelta(days=1)
+
+
+def resume_history_after(now: datetime | None = None) -> datetime:
+    """Cutoff for a history job opened by startup or sync resume."""
+    return (now or datetime.now(UTC)) - RESUME_HISTORY_WINDOW
 
 
 class ConnectSourcesResponse(BaseModel):
@@ -2403,6 +2409,7 @@ def create_app(
             user_id="local",
             source_id=source_id,
             operation="history",
+            history_after=resume_history_after(),
         )
 
     async def _activate_source_resume(source_id: str) -> None:
