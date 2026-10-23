@@ -199,8 +199,8 @@ def test_connection_retry_reuses_completed_job_and_checks_root_snapshot(tmp_path
     ("turn_count", "age_days", "limited"),
     [
         (200, 4, False),
-        (201, 1, False),
-        (201, 4, True),
+        (201, 0, False),
+        (201, 2, True),
     ],
 )
 def test_onboarding_applies_large_history_window_to_all_sources(
@@ -279,7 +279,7 @@ def test_onboarding_applies_large_history_window_to_all_sources(
                 return
             assert len(cutoffs) == 1
             cutoff = datetime.fromisoformat(cutoffs.pop())
-            assert before - timedelta(days=3) <= cutoff <= after - timedelta(days=3)
+            assert before - timedelta(days=1) <= cutoff <= after - timedelta(days=1)
 
     asyncio.run(scenario())
 

@@ -375,7 +375,7 @@ class ConnectSourcesRequest(BaseModel):
 
 
 ONBOARDING_LARGE_HISTORY_USER_TURNS = 200
-ONBOARDING_HISTORY_WINDOW = timedelta(days=3)
+ONBOARDING_HISTORY_WINDOW = timedelta(days=1)
 RESUME_HISTORY_WINDOW = timedelta(days=1)
 
 
@@ -4493,7 +4493,7 @@ async def _has_large_old_history(adapter: SourceAdapter, *, cutoff: datetime) ->
     """Probe one authorized Harness with the same parsers the import will use.
 
     Stop as soon as both policy facts are proven: more than 200 genuine person
-    turns and at least one record older than the three-day cutoff. Counting
+    turns and at least one record older than the one-day cutoff. Counting
     parsed Evidence instead of transcript files prevents one giant coding
     session from bypassing the limit, while reusing the adapters keeps host
     envelopes and tool-shaped user records out of the count.
