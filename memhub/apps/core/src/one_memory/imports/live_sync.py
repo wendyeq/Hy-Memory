@@ -161,9 +161,7 @@ class PollingLiveSyncSupervisor:
         if source_id not in self.import_supervisor.adapters:
             return
         adapter = self.import_supervisor.adapters[source_id]
-        baselines = (
-            await adapter.live_baseline() if isinstance(adapter, _LiveBaselineAdapter) else {}
-        )
+        baselines, files = await self._baseline_files(adapter)
         await in_the_background(
             partial(
                 self.job_store.ensure_live_cursors,
@@ -171,6 +169,7 @@ class PollingLiveSyncSupervisor:
                 source_id=source_id,
                 baselines=baselines,
                 baseline_missing_files=baseline_missing_files,
+                files=files,
             )
         )
 
@@ -389,17 +388,23 @@ class PollingLiveSyncSupervisor:
         )
         if cursors:
             return cursors
-        baselines = (
-            await adapter.live_baseline() if isinstance(adapter, _LiveBaselineAdapter) else {}
-        )
+        baselines, files = await self._baseline_files(adapter)
         return await in_the_background(
             partial(
                 self.job_store.ensure_live_cursors,
                 user_id="local",
                 source_id=source_id,
                 baselines=baselines,
+                files=files,
             )
         )
+
+    async def _baseline_files(self, adapter: object) -> tuple[dict, dict]:
+        if not isinstance(adapter, _LiveBaselineAdapter):
+            return {}, {}
+        baselines = await adapter.live_baseline()
+        files = getattr(baselines, "files", None)
+        return baselines, dict(files) if isinstance(files, dict) else {}
 
     async def _run_sync(
         self, source_id: str, *, wait_for_completion: bool = True

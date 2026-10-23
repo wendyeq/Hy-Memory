@@ -1297,6 +1297,9 @@ def create_app(
                         source_id=source_id,
                         file_key=file_key,
                     )
+            app.state.import_job_store.tighten_automatic_history(
+                history_after=resume_history_after()
+            )
             app.state.import_supervisor.resume_interrupted()
             app.state.source_connection_store = SourceConnectionStore(
                 app.state.source_grant_store,
@@ -2392,6 +2395,13 @@ def create_app(
     async def _prepare_source_resume(source_id: str) -> None:
         """Prepare catch-up work before committing the new desired state."""
         await _live_sync(app).initialize_source(source_id, baseline_missing_files=True)
+        cutoff = resume_history_after()
+        await asyncio.to_thread(
+            _job_store(app).tighten_automatic_history,
+            history_after=cutoff,
+            user_id="local",
+            source_id=source_id,
+        )
         active = {
             ImportStatus.PENDING,
             ImportStatus.PAUSED,
@@ -2409,7 +2419,8 @@ def create_app(
             user_id="local",
             source_id=source_id,
             operation="history",
-            history_after=resume_history_after(),
+            history_after=cutoff,
+            history_intent="automatic",
         )
 
     async def _activate_source_resume(source_id: str) -> None:

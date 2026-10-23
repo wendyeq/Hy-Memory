@@ -251,7 +251,7 @@ class SourceConnectionStore:
         job_id = str(uuid4())
         db.execute(
             "INSERT INTO import_jobs (job_id,user_id,source_id,status,created_at,updated_at,"
-            "operation,history_after) VALUES (?,?,?,'pending',?,?,'history',?)",
+            "operation,history_after,history_intent) VALUES (?,?,?,'pending',?,?,'history',?,?)",
             (
                 job_id,
                 user_id,
@@ -259,6 +259,7 @@ class SourceConnectionStore:
                 now,
                 now,
                 history_after.isoformat() if history_after is not None else None,
+                "explicit",
             ),
         )
         return job_id

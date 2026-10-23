@@ -4,7 +4,11 @@ import os
 import sqlite3
 from pathlib import Path
 
-from one_memory.imports.access import AuthorizedSourceRoot, _changed_ns
+from one_memory.imports.access import (
+    AuthorizedSourceRoot,
+    _changed_ns,
+    cursor_identities_same_file,
+)
 from one_memory.imports.adapters import ScanOptions, SourceCursor
 from one_memory.imports.jobs import ImportJobStore
 from one_memory.imports.sources.common import is_unchanged, resume_checkpoint
@@ -44,13 +48,44 @@ def test_listed_file_identity_does_not_include_the_device_number(tmp_path: Path)
 
 
 def test_a_cursor_recorded_before_reboot_still_resumes(tmp_path: Path) -> None:
+    """APFS renumber keeps the inode and changes ``st_dev``.
+
+    Resume at the old offset. Do not treat that legacy identity as proof the
+    file is unchanged: another volume can reuse the inode, and skipping it
+    would drop the replacement. Missing a read is acceptable; a permanent
+    skip is not.
+    """
     source, path = _grant(tmp_path)
     details = os.stat(path)
     previous_boot = f"{details.st_dev + 1}:{details.st_ino}"
     cursor = _cursor(source, previous_boot)
 
     assert resume_checkpoint(source, ScanOptions(cursors={source.safe_id: cursor})) == "byte:4"
+    assert is_unchanged(source, {source.safe_id: cursor}) is False
+
+
+def test_cross_device_legacy_inode_is_not_skipped_as_unchanged(tmp_path: Path) -> None:
+    source, path = _grant(tmp_path)
+    details = os.stat(path)
+    legacy = _cursor(source, f"{details.st_dev + 9}:{details.st_ino}")
+    migrated = _cursor(source, f"ino:{details.st_ino}")
+    birthless = _cursor(source, f"ino:{details.st_ino}:0:{details.st_dev + 9}")
+
+    for cursor in (legacy, migrated, birthless):
+        assert is_unchanged(source, {source.safe_id: cursor}) is False
+        assert resume_checkpoint(source, ScanOptions(cursors={source.safe_id: cursor})) == "byte:4"
+    assert cursor_identities_same_file(
+        f"ino:{details.st_ino}:0:{details.st_dev}",
+        f"ino:{details.st_ino}:0:{details.st_dev + 9}",
+    ) is False
+
+
+def test_a_complete_identity_can_still_skip_an_unchanged_file(tmp_path: Path) -> None:
+    source, _path = _grant(tmp_path)
+    cursor = _cursor(source, source.file_identity)
+
     assert is_unchanged(source, {source.safe_id: cursor}) is True
+    assert resume_checkpoint(source, ScanOptions(cursors={source.safe_id: cursor})) == "byte:4"
 
 
 def test_a_different_inode_still_starts_over(tmp_path: Path) -> None:

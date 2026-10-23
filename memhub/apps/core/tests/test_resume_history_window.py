@@ -2,17 +2,22 @@
 
 import asyncio
 import json
+import sqlite3
 from datetime import UTC, datetime, timedelta
 
 from httpx import ASGITransport, AsyncClient
 from pydantic import SecretStr
 
-from one_memory.api import create_app
+from one_memory.api import create_app, resume_history_after
 from one_memory.config import Settings
 from one_memory.imports.grants import SourceGrantStore
+from one_memory.imports.jobs import ImportJobStore
 from one_memory.imports.sources.registry import RootCandidateKind, build_source_catalog
 from one_memory.secrets import InMemorySecretStore
 from tests.source_consent import authorized_request
+
+_OLD = "restored-30-day-history"
+_TODAY = "today-window"
 
 
 def _settings(tmp_path):
@@ -120,3 +125,220 @@ def test_sync_permission_resume_creates_a_one_day_history_window(tmp_path, monke
             _assert_one_day(jobs[0].history_after, started=started)
 
     asyncio.run(scenario())
+
+
+def _session(home, *, old: str, today: str) -> None:
+    root = home / ".claude" / "projects"
+    root.mkdir(parents=True)
+    old_at = (datetime.now(UTC) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    today_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def line(uuid: str, text: str, when: str) -> str:
+        return json.dumps(
+            {
+                "type": "user",
+                "sessionId": "session",
+                "uuid": uuid,
+                "timestamp": when,
+                "message": {"content": [{"type": "text", "text": text}]},
+            }
+        )
+
+    (root / "session.jsonl").write_text(
+        line("old", old, old_at) + "\n" + line("today", today, today_at) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _grant_claude(tmp_path, home) -> None:
+    data = tmp_path / "data"
+    data.mkdir()
+    SourceGrantStore(data / "one-memory.sqlite3", home=home).grant(
+        user_id="local",
+        source_id="claude-code",
+        root=home / ".claude" / "projects",
+        candidate_kind=RootCandidateKind.DEFAULT,
+    )
+
+
+def _preset_history(tmp_path, *, status: str, intent: str | None) -> None:
+    database = tmp_path / "data" / "one-memory.sqlite3"
+    ImportJobStore(database)
+    now = datetime.now(UTC).isoformat()
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            INSERT INTO import_jobs (
+                job_id, user_id, source_id, status, created_at, updated_at,
+                operation, history_after, history_intent
+            ) VALUES (?, ?, ?, ?, ?, ?, 'history', NULL, ?)
+            """,
+            ("preset-history", "local", "claude-code", status, now, now, intent),
+        )
+
+
+def _app(tmp_path, home):
+    return create_app(
+        _settings(tmp_path),
+        source_catalog=build_source_catalog(home=home, environment={}),
+        secret_store=InMemorySecretStore(),
+    )
+
+
+def _texts(app) -> list[str]:
+    return [record.verbatim for record in app.state.evidence_store.list_extractable()]
+
+
+def test_startup_bounds_a_windowless_pending_history(tmp_path, monkeypatch) -> None:
+    """An unfinished automatic catch-up must not import the whole old file."""
+    monkeypatch.setattr("one_memory.model_presets._preset_data", lambda: None)
+    home = tmp_path / "home"
+    _session(home, old=_OLD, today=_TODAY)
+    _grant_claude(tmp_path, home)
+    _preset_history(tmp_path, status="pending", intent=None)
+    (tmp_path / "data" / "config.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "sources": {"claude-code": {"sync_enabled": True}},
+                "sedimentation_enabled": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    app = _app(tmp_path, home)
+
+    async def scenario():
+        async with app.router.lifespan_context(app):
+            job = next(
+                job
+                for job in app.state.import_job_store.list_jobs()
+                if job.job_id == "preset-history"
+            )
+            _assert_one_day(job.history_after, started=datetime.now(UTC))
+            finished = await asyncio.wait_for(app.state.import_supervisor.wait(job.job_id), 30)
+            assert finished.stored == 1
+            assert _OLD not in _texts(app)
+            assert _TODAY in _texts(app)
+
+    asyncio.run(scenario())
+
+
+def test_reenabling_sync_bounds_a_windowless_paused_history(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("one_memory.model_presets._preset_data", lambda: None)
+    home = tmp_path / "home"
+    _session(home, old=_OLD, today=_TODAY)
+    _grant_claude(tmp_path, home)
+    _preset_history(tmp_path, status="paused", intent=None)
+    (tmp_path / "data" / "config.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "sources": {"claude-code": {"sync_enabled": False}},
+                "sedimentation_enabled": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    app = _app(tmp_path, home)
+
+    async def scenario():
+        async with (
+            app.router.lifespan_context(app),
+            AsyncClient(
+                transport=ASGITransport(app=app),
+                base_url="http://test",
+                headers={"Authorization": "Bearer test"},
+            ) as client,
+        ):
+            enabled = await client.post(
+                "/api/v1/sources/claude-code/sync-permission",
+                json={"enabled": True},
+            )
+            assert enabled.status_code == 200
+            job = app.state.import_job_store.require("preset-history")
+            _assert_one_day(job.history_after, started=datetime.now(UTC))
+            finished = await asyncio.wait_for(app.state.import_supervisor.wait(job.job_id), 30)
+            assert finished.stored == 1
+            assert _OLD not in _texts(app)
+            assert _TODAY in _texts(app)
+
+    asyncio.run(scenario())
+
+
+def test_startup_keeps_an_explicit_full_import(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("one_memory.model_presets._preset_data", lambda: None)
+    home = tmp_path / "home"
+    _session(home, old=_OLD, today=_TODAY)
+    _grant_claude(tmp_path, home)
+    _preset_history(tmp_path, status="pending", intent="explicit")
+    (tmp_path / "data" / "config.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "sources": {"claude-code": {"sync_enabled": True}},
+                "sedimentation_enabled": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    app = _app(tmp_path, home)
+
+    async def scenario():
+        async with app.router.lifespan_context(app):
+            job = app.state.import_job_store.require("preset-history")
+            assert job.history_after is None
+            finished = await asyncio.wait_for(app.state.import_supervisor.wait(job.job_id), 30)
+            assert finished.stored == 2
+            assert _OLD in _texts(app)
+            assert _TODAY in _texts(app)
+
+    asyncio.run(scenario())
+
+
+def test_automatic_reuse_does_not_narrow_an_explicit_full_import(tmp_path) -> None:
+    store = ImportJobStore(tmp_path / "jobs.sqlite3")
+    explicit = store.create(
+        user_id="local", source_id="claude-code", history_intent="explicit"
+    )
+    reused = store.create(
+        user_id="local",
+        source_id="claude-code",
+        history_after=resume_history_after(),
+        history_intent="automatic",
+    )
+
+    assert reused.job_id == explicit.job_id
+    assert reused.history_after is None
+
+
+def test_automatic_reuse_bounds_a_windowless_catchup(tmp_path) -> None:
+    store = ImportJobStore(tmp_path / "jobs.sqlite3")
+    store.create(user_id="local", source_id="claude-code")
+    reused = store.create(
+        user_id="local",
+        source_id="claude-code",
+        history_after=resume_history_after(),
+        history_intent="automatic",
+    )
+
+    assert reused.history_after is not None
+    _assert_one_day(reused.history_after, started=datetime.now(UTC))
+
+
+def test_automatic_reuse_bounds_a_cutoff_older_than_one_day(tmp_path) -> None:
+    store = ImportJobStore(tmp_path / "jobs.sqlite3")
+    store.create(
+        user_id="local",
+        source_id="claude-code",
+        history_after=datetime.now(UTC) - timedelta(days=30),
+        history_intent="automatic",
+    )
+    reused = store.create(
+        user_id="local",
+        source_id="claude-code",
+        history_after=resume_history_after(),
+        history_intent="automatic",
+    )
+
+    _assert_one_day(reused.history_after, started=datetime.now(UTC))

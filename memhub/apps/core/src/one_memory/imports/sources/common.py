@@ -20,6 +20,7 @@ from one_memory.imports.access import (
     AuthorizedSourceRoot,
     SourceAccessError,
     SourceAccessErrorCode,
+    cursor_identities_resume_compatible,
     cursor_identities_same_file,
     opaque_workspace_id,
     safe_project_label,
@@ -183,6 +184,18 @@ class SourceInstallState:
     detected: bool
 
 
+class _LiveBaseline(dict[str, SourceCursor]):
+    """EOF cursors plus the files they were listed from."""
+
+    def __init__(
+        self,
+        cursors: dict[str, SourceCursor],
+        files: dict[str, AuthorizedSourceFile],
+    ) -> None:
+        super().__init__(cursors)
+        self.files = files
+
+
 class JsonlSourceAdapter:
     def __init__(
         self,
@@ -264,7 +277,12 @@ class JsonlSourceAdapter:
         return bool(listing.changed or listing.failures)
 
     async def live_baseline(self) -> dict[str, SourceCursor]:
-        """Capture complete EOFs so realtime polling never backfills history."""
+        """Capture complete EOFs so realtime polling never backfills history.
+
+        The returned dict is a ``_LiveBaseline`` and carries the listed files
+        on ``.files``. Live retention uses them to check content anchors
+        without a second walk or shared adapter state.
+        """
         files = await asyncio.to_thread(
             list,
             discover_source_files(
@@ -273,7 +291,15 @@ class JsonlSourceAdapter:
                 max_targets=100_000,
             ),
         )
-        return await asyncio.to_thread(self._live_baseline_sync, files)
+        cursors = await asyncio.to_thread(self._live_baseline_sync, files)
+        listed = {
+            item.safe_id: item
+            for item in files
+            if isinstance(item, AuthorizedSourceFile)
+            and self.file_predicate(item)
+            and not item.relative_path.name.endswith(".zstd")
+        }
+        return _LiveBaseline(cursors, listed)
 
     def _live_baseline_sync(self, files: list[SourceFileDiscoveryEvent]) -> dict[str, SourceCursor]:
         cursors: dict[str, SourceCursor] = {}
@@ -625,6 +651,13 @@ def newest_first(files: list[AuthorizedSourceFile]) -> list[AuthorizedSourceFile
 
 
 def is_unchanged(source_file: AuthorizedSourceFile, cursors: dict[str, SourceCursor]) -> bool:
+    """True when this file can be skipped without opening it.
+
+    A legacy cursor that only shares an inode is not enough: another volume
+    can reuse that inode, and skipping would drop the replacement for good.
+    Resume may still start at the old offset; the anchor check, not this
+    gate, decides whether those bytes are the same file.
+    """
     previous = cursors.get(source_file.safe_id)
     return (
         previous is not None
@@ -676,7 +709,7 @@ def touched_cursor(
     previous = options.cursors.get(source_file.safe_id)
     keep = (
         previous is not None
-        and cursor_identities_same_file(previous.file_identity, source_file.file_identity)
+        and cursor_identities_resume_compatible(previous.file_identity, source_file.file_identity)
         and previous.observed_size <= source_file.size
     )
     # A kept cursor means the next scan resumes exactly where this one ended:
@@ -856,7 +889,7 @@ def resume_checkpoint(
     previous = options.cursors.get(source_file.safe_id)
     if previous is None:
         return None
-    if not cursor_identities_same_file(previous.file_identity, source_file.file_identity):
+    if not cursor_identities_resume_compatible(previous.file_identity, source_file.file_identity):
         return None
     if source_file.size < previous.observed_size:
         return None
