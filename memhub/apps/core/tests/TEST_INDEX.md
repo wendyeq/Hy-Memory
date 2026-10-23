@@ -168,6 +168,7 @@
 | `test_live_sync.py` | `contract` | 覆盖 live sync preempts a reader batch before it emits work、live sync cuts in front of a running history import、live sync does not resume a history import the user paused 等 24 个场景。 |
 | `test_live_sync_file_incremental.py` | `contract` | 覆盖 unchanged file metadata avoids a job and content read、changed file content is read once by the import job、workbuddy first live poll baselines history then imports only append 等 6 个场景。 |
 | `test_live_sync_job_coalescing.py` | `contract` | A poll that finds nothing must not leave an import job behind. |
+| `test_live_sync_startup_backfill.py` | `integration` | Startup must not reread a grown file from byte 0. |
 | `test_live_watch.py` | `contract` | 覆盖 a new turn lands well inside the ten second target、start prime catches a change that predates the watcher、a run that predates the change is followed by a fresh one 等 15 个场景。 |
 | `test_live_watch_grants.py` | `integration` | 覆盖 explicit sync grant starts watch without restart and revocation stops it 场景。 |
 | `test_local_embedding.py` | `contract` | Guards for the built-in embedding model. |
@@ -390,4 +391,4 @@
 | `test_workspace_recall.py` | `contract` | Workspace memories were unreachable from every host; these pin the way in. |
 | `test_write_queue_lease_renewal.py` | `contract` | Rule 8: a lease must outlive the work it covers, and be renewed while it runs. |
 
-共 385 个测试文件。
+共 386 个测试文件。
