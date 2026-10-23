@@ -1300,7 +1300,6 @@ def create_app(
             app.state.import_job_store.tighten_automatic_history(
                 history_after=resume_history_after()
             )
-            app.state.import_supervisor.resume_interrupted()
             app.state.source_connection_store = SourceConnectionStore(
                 app.state.source_grant_store,
                 app.state.import_job_store,
@@ -1343,6 +1342,11 @@ def create_app(
             app.state.live_sync_supervisor.set_watched_sources(
                 watch_roots if watching and runtime_settings.live_sync_enabled else ()
             )
+            # Rebase before resume or the watcher. Both read whatever live
+            # cursor is already stored, and a dead anchor on a grown file
+            # would import that file from byte 0.
+            await _baseline_enabled_live_sources()
+            app.state.import_supervisor.resume_interrupted()
             if runtime_settings.live_sync_enabled:
                 app.state.live_sync_supervisor.start()
                 if app.state.live_sync_watch is not None:
@@ -2441,6 +2445,16 @@ def create_app(
             raise HTTPException(status_code=409, detail=error.code) from None
         if app.state.settings.automatic_memory_processing:
             _start_backfill(app)
+
+    async def _baseline_enabled_live_sources() -> None:
+        """Anchor sync-enabled sources before startup reads a stale live cursor."""
+        for source_id, source in _config_store(app).document().sources.items():
+            if not source.sync_enabled:
+                continue
+            if source_id not in _supervisor(app).adapters:
+                continue
+            async with app.state.source_permission_locks.setdefault(source_id, asyncio.Lock()):
+                await _live_sync(app).initialize_source(source_id, baseline_missing_files=True)
 
     async def _reconcile_source_sync_from_config() -> None:
         for source_id, source in _config_store(app).document().sources.items():

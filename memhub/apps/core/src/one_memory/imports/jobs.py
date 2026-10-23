@@ -140,6 +140,29 @@ def _retained_live_cursor_reads_from_zero(
         return True
 
 
+def _stored_live_offset_must_rebase(
+    stored: sqlite3.Row,
+    tail: SourceCursor,
+    source_file: AuthorizedSourceFile | None,
+) -> bool:
+    """True when ``stored`` must not seed the realtime lane.
+
+    An incompatible identity, a gap past the live backlog, or an anchor that
+    would make the next sync start at byte 0 all take the fresh tail instead.
+    """
+    if not cursor_identities_resume_compatible(str(stored["file_identity"]), tail.file_identity):
+        return True
+    stored_offset = _byte_checkpoint(str(stored["checkpoint"]))
+    tail_offset = _byte_checkpoint(tail.checkpoint)
+    if (
+        stored_offset is not None
+        and tail_offset is not None
+        and tail_offset - stored_offset > MAX_LIVE_BACKLOG_BYTES
+    ):
+        return True
+    return _retained_live_cursor_reads_from_zero(stored, source_file)
+
+
 #: Checkpoint kinds whose offset is a comparable numeric position: `byte:` for
 #: JSONL sources, `record:`/`row:`/`rowid:` for SQLite-backed ones. Written as
 #: one anchored pattern rather than a tuple of literals because the SQLite
@@ -1041,8 +1064,8 @@ class ImportJobStore:
                     (user_id, source_id),
                 ).fetchall()
                 history_cursors = {
-                    row["file_key"]: SourceCursor(
-                        file_key=row["file_key"],
+                    str(row["file_key"]): SourceCursor(
+                        file_key=str(row["file_key"]),
                         file_identity=row["file_identity"],
                         checkpoint=row["checkpoint"],
                         checkpoint_anchor=row["checkpoint_anchor"],
@@ -1052,9 +1075,18 @@ class ImportJobStore:
                     )
                     for row in history
                 }
-                selected = (
-                    baselines if active_history is not None else {**baselines, **history_cursors}
-                )
+                if active_history is not None:
+                    selected = baselines
+                else:
+                    selected = dict(baselines)
+                    for row in history:
+                        key = str(row["file_key"])
+                        baseline = baselines.get(key)
+                        if baseline is not None and _stored_live_offset_must_rebase(
+                            row, baseline, listed.get(key)
+                        ):
+                            continue
+                        selected[key] = history_cursors[key]
                 for cursor in selected.values():
                     self._upsert_cursor(connection, owner, cursor, now)
             else:
@@ -1072,17 +1104,9 @@ class ImportJobStore:
                     live = live_by_key.get(key)
                     if live is None and not baseline_missing_files:
                         continue
-                    rebased = live is None or not cursor_identities_resume_compatible(
-                        str(live["file_identity"]), cursor.file_identity
+                    rebased = live is None or _stored_live_offset_must_rebase(
+                        live, cursor, listed.get(key)
                     )
-                    if live is not None and not rebased:
-                        live_offset = _byte_checkpoint(str(live["checkpoint"]))
-                        tail_offset = _byte_checkpoint(cursor.checkpoint)
-                        rebased = (
-                            live_offset is not None
-                            and tail_offset is not None
-                            and tail_offset - live_offset > MAX_LIVE_BACKLOG_BYTES
-                        ) or _retained_live_cursor_reads_from_zero(live, listed.get(key))
                     if rebased:
                         self._upsert_cursor(connection, owner, cursor, now)
                         if connection.execute(
