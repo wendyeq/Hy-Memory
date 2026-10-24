@@ -81,6 +81,7 @@ def open_sqlite_readonly(
                     details,
                     file_identity=source_file.file_identity,
                     changed_ns=source_file.changed_ns,
+                    device=source_file.device,
                 )
             ):
                 raise SourceAccessError(SourceAccessErrorCode.SOURCE_UNAVAILABLE)

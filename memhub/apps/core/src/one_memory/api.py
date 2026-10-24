@@ -375,7 +375,13 @@ class ConnectSourcesRequest(BaseModel):
 
 
 ONBOARDING_LARGE_HISTORY_USER_TURNS = 200
-ONBOARDING_HISTORY_WINDOW = timedelta(days=3)
+ONBOARDING_HISTORY_WINDOW = timedelta(days=1)
+RESUME_HISTORY_WINDOW = timedelta(days=1)
+
+
+def resume_history_after(now: datetime | None = None) -> datetime:
+    """Cutoff for a history job opened by startup or sync resume."""
+    return (now or datetime.now(UTC)) - RESUME_HISTORY_WINDOW
 
 
 class ConnectSourcesResponse(BaseModel):
@@ -1291,7 +1297,9 @@ def create_app(
                         source_id=source_id,
                         file_key=file_key,
                     )
-            app.state.import_supervisor.resume_interrupted()
+            app.state.import_job_store.tighten_automatic_history(
+                history_after=resume_history_after()
+            )
             app.state.source_connection_store = SourceConnectionStore(
                 app.state.source_grant_store,
                 app.state.import_job_store,
@@ -1334,6 +1342,11 @@ def create_app(
             app.state.live_sync_supervisor.set_watched_sources(
                 watch_roots if watching and runtime_settings.live_sync_enabled else ()
             )
+            # Rebase before resume or the watcher. Both read whatever live
+            # cursor is already stored, and a dead anchor on a grown file
+            # would import that file from byte 0.
+            await _baseline_enabled_live_sources()
+            app.state.import_supervisor.resume_interrupted()
             if runtime_settings.live_sync_enabled:
                 app.state.live_sync_supervisor.start()
                 if app.state.live_sync_watch is not None:
@@ -2386,6 +2399,13 @@ def create_app(
     async def _prepare_source_resume(source_id: str) -> None:
         """Prepare catch-up work before committing the new desired state."""
         await _live_sync(app).initialize_source(source_id, baseline_missing_files=True)
+        cutoff = resume_history_after()
+        await asyncio.to_thread(
+            _job_store(app).tighten_automatic_history,
+            history_after=cutoff,
+            user_id="local",
+            source_id=source_id,
+        )
         active = {
             ImportStatus.PENDING,
             ImportStatus.PAUSED,
@@ -2403,6 +2423,8 @@ def create_app(
             user_id="local",
             source_id=source_id,
             operation="history",
+            history_after=cutoff,
+            history_intent="automatic",
         )
 
     async def _activate_source_resume(source_id: str) -> None:
@@ -2423,6 +2445,16 @@ def create_app(
             raise HTTPException(status_code=409, detail=error.code) from None
         if app.state.settings.automatic_memory_processing:
             _start_backfill(app)
+
+    async def _baseline_enabled_live_sources() -> None:
+        """Anchor sync-enabled sources before startup reads a stale live cursor."""
+        for source_id, source in _config_store(app).document().sources.items():
+            if not source.sync_enabled:
+                continue
+            if source_id not in _supervisor(app).adapters:
+                continue
+            async with app.state.source_permission_locks.setdefault(source_id, asyncio.Lock()):
+                await _live_sync(app).initialize_source(source_id, baseline_missing_files=True)
 
     async def _reconcile_source_sync_from_config() -> None:
         for source_id, source in _config_store(app).document().sources.items():
@@ -4461,7 +4493,7 @@ async def _has_large_old_history(adapter: SourceAdapter, *, cutoff: datetime) ->
     """Probe one authorized Harness with the same parsers the import will use.
 
     Stop as soon as both policy facts are proven: more than 200 genuine person
-    turns and at least one record older than the three-day cutoff. Counting
+    turns and at least one record older than the one-day cutoff. Counting
     parsed Evidence instead of transcript files prevents one giant coding
     session from bypassing the limit, while reusing the adapters keeps host
     envelopes and tool-shaped user records out of the count.

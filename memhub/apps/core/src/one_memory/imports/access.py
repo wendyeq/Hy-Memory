@@ -53,6 +53,10 @@ class AuthorizedSourceFile:
     root_identity: str | None = None
     requested_root: Path | None = None
     access_check: Callable[[], None] | None = field(default=None, repr=False, compare=False)
+    #: Listing-time ``st_dev``. Not a persisted cursor identity: APFS renumbers
+    #: it across boots. The open is same-boot, so it still rejects a different
+    #: filesystem that reused the inode between list and read.
+    device: int | None = None
 
     @property
     def safe_id(self) -> str:
@@ -174,6 +178,7 @@ def _open_relative_file(source: AuthorizedSourceFile) -> BinaryIO:
             details,
             file_identity=source.file_identity,
             changed_ns=source.changed_ns,
+            device=source.device,
         ):
             raise SourceAccessError(SourceAccessErrorCode.SOURCE_UNAVAILABLE)
         if details.st_size > source.max_bytes:
@@ -324,13 +329,14 @@ class AuthorizedSourceRoot:
             path=candidate,
             relative_path=relative,
             max_bytes=self.max_file_bytes,
-            file_identity=f"{details.st_dev}:{details.st_ino}",
+            file_identity=file_cursor_identity(details),
             size=details.st_size,
             modified_ns=details.st_mtime_ns,
             changed_ns=_changed_ns(details),
             root_identity=self.root_identity,
             requested_root=self.requested_root,
             access_check=self.access_check,
+            device=details.st_dev,
         )
 
     def authorize_file(self, candidate: Path) -> AuthorizedSourceFile:
@@ -362,13 +368,14 @@ class AuthorizedSourceRoot:
             path=resolved,
             relative_path=relative,
             max_bytes=self.max_file_bytes,
-            file_identity=f"{details.st_dev}:{details.st_ino}",
+            file_identity=file_cursor_identity(details),
             size=details.st_size,
             modified_ns=details.st_mtime_ns,
             changed_ns=_changed_ns(details),
             root_identity=self.root_identity,
             requested_root=self.requested_root,
             access_check=self.access_check,
+            device=details.st_dev,
         )
 
 
@@ -386,11 +393,10 @@ def _root_details(root: Path) -> tuple[Path, os.stat_result]:
 def _changed_ns(details: os.stat_result) -> int:
     """Stable creation time when the platform exposes one.
 
-    ext4 can recycle an inode number immediately after an unlink, so
-    ``st_dev:st_ino`` is not enough to tell a replacement from the file that was
-    authorised. macOS reports birth time, which a newly created replacement
-    cannot share. Linux has no portable birth-time field here, so zero means
-    "unavailable" and callers fall back to the existing inode identity.
+    ext4 can recycle an inode number immediately after an unlink, so the inode
+    alone cannot tell a replacement from the file that was authorised. macOS
+    reports birth time, which a newly created replacement cannot share. Linux
+    has no portable birth-time field here, so zero means "unavailable".
     """
     birthtime_ns = getattr(details, "st_birthtime_ns", None)
     if birthtime_ns is None:
@@ -399,8 +405,124 @@ def _changed_ns(details: os.stat_result) -> int:
     return int(birthtime_ns) if birthtime_ns is not None else 0
 
 
-def _same_file(details: os.stat_result, *, file_identity: str, changed_ns: int) -> bool:
-    if f"{details.st_dev}:{details.st_ino}" != file_identity:
+def file_cursor_identity(details: os.stat_result) -> str:
+    """Inode and birth time. ``st_dev`` is excluded when birth time exists.
+
+    macOS renumbers APFS volumes across reboots, so a device-bound identity
+    would forget every file after restart. Birth time distinguishes a
+    replacement that reused the inode. Linux has no birth time here: inode
+    numbers are only unique per filesystem, so the device stays in the
+    identity. A later reboot that renumbers that device resumes through
+    ``cursor_identities_resume_compatible`` instead of skipping the file.
+    """
+    birth = _changed_ns(details)
+    if birth == 0:
+        return f"ino:{details.st_ino}:0:{details.st_dev}"
+    return f"ino:{details.st_ino}:{birth}"
+
+
+def _parse_cursor_identity(value: str) -> tuple[int, int | None] | None:
+    """Inode and birth time. Birth ``0`` or a legacy ``st_dev:st_ino`` is missing birth."""
+    parts = value.split(":")
+    if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+        return int(parts[1]), None
+    if len(parts) == 2 and parts[0] == "ino" and parts[1].isdigit():
+        return int(parts[1]), None
+    if (
+        len(parts) == 3
+        and parts[0] == "ino"
+        and parts[1].isdigit()
+        and parts[2].isdigit()
+    ):
+        birth = int(parts[2])
+        return int(parts[1]), None if birth == 0 else birth
+    if (
+        len(parts) == 4
+        and parts[0] == "ino"
+        and parts[1].isdigit()
+        and parts[2] == "0"
+        and parts[3].isdigit()
+    ):
+        return int(parts[1]), None
+    return None
+
+
+def _complete_identity(value: str) -> bool:
+    """True when ``value`` is more than an inode number.
+
+    A real birth time, or a birth-less identity that still names its
+    filesystem (``ino:<inode>:0:<device>``), can decide "same file".
+    ``st_dev:st_ino``, ``ino:<inode>`` and ``ino:<inode>:0`` cannot: another
+    mount can reuse the inode. Missing that file is acceptable. Skipping it
+    as already read is not.
+    """
+    parsed = _parse_cursor_identity(value)
+    if parsed is None:
+        return True
+    if parsed[1] is not None:
+        return True
+    parts = value.split(":")
+    return len(parts) == 4 and parts[0] == "ino" and parts[2] == "0"
+
+
+def cursor_identities_same_file(left: str, right: str) -> bool:
+    """True only when both identities are complete and name one file.
+
+    Same inode with a missing birth time is not enough. Use
+    ``cursor_identities_resume_compatible`` to continue a pre-reboot cursor;
+    do not use that weaker check to skip a file.
+    """
+    if left == right:
+        return _complete_identity(left)
+    parsed_left = _parse_cursor_identity(left)
+    parsed_right = _parse_cursor_identity(right)
+    if parsed_left is None or parsed_right is None or parsed_left[0] != parsed_right[0]:
+        return False
+    if parsed_left[1] is None or parsed_right[1] is None:
+        return False
+    return parsed_left[1] == parsed_right[1]
+
+
+def cursor_identities_resume_compatible(left: str, right: str) -> bool:
+    """Whether a stored offset may be tried against this file.
+
+    APFS reboot keeps the inode and changes ``st_dev``. Legacy cursors are
+    ``<st_dev>:<st_ino>`` or migrated ``ino:<inode>`` with no birth time, so
+    inode equality is enough to *try* the old offset. The content anchor
+    still has to match. It is not enough to treat the file as unchanged.
+
+    A cross-volume inode collision fails that anchor check and is rebuilt
+    under the history window instead of being skipped forever. Bytes before
+    the old offset can be missed. That is preferred to importing the other
+    file's history, or to never reading a replaced file.
+    """
+    if cursor_identities_same_file(left, right):
+        return True
+    parsed_left = _parse_cursor_identity(left)
+    parsed_right = _parse_cursor_identity(right)
+    if parsed_left is None or parsed_right is None or parsed_left[0] != parsed_right[0]:
+        return False
+    if parsed_left[1] is not None and parsed_right[1] is not None:
+        return parsed_left[1] == parsed_right[1]
+    return True
+
+
+def _same_file(
+    details: os.stat_result,
+    *,
+    file_identity: str,
+    changed_ns: int,
+    device: int | None = None,
+) -> bool:
+    """Same-boot check that the opened descriptor is the listed file.
+
+    Persisted cursors deliberately ignore ``st_dev`` when birth time exists.
+    This does not: listing and open happen in one boot, and a different
+    device is a different filesystem even when the inode number matches.
+    """
+    if device is not None and details.st_dev != device:
+        return False
+    if not cursor_identities_same_file(file_identity, file_cursor_identity(details)):
         return False
     return changed_ns == 0 or _changed_ns(details) == changed_ns
 

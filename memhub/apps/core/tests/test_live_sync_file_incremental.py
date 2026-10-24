@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+import os
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from one_memory.imports.access import AuthorizedSourceFile, AuthorizedSourceRoot
@@ -24,6 +28,7 @@ from one_memory.imports.sources.openclaw import (
     OPENCLAW_DESCRIPTOR,
     OpenClawSourceAdapter,
 )
+from one_memory.imports.sources.claude_code import create_claude_code_adapter
 from one_memory.imports.sources.workbuddy import create_workbuddy_adapter
 from one_memory.imports.storage import EvidenceStore
 from one_memory.imports.supervisor import ImportSupervisor
@@ -409,3 +414,155 @@ def test_openclaw_unsupported_state_db_is_a_persistent_aggregated_skip(
         "reason": "unsupported_schema",
         "count": 2,
     }
+
+
+def _claude_line(uuid: str, text: str, when: str) -> bytes:
+    return (
+        json.dumps(
+            {
+                "type": "user",
+                "sessionId": "session",
+                "uuid": uuid,
+                "timestamp": when,
+                "message": {"content": [{"type": "text", "text": text}]},
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode()
+
+
+def _claude_harness(tmp_path: Path, root: Path):
+    grant = AuthorizedSourceRoot.grant(
+        source_id="claude-code",
+        root=root,
+        user_confirmed=True,
+        home=tmp_path / "home",
+    )
+    database = tmp_path / "one-memory.sqlite3"
+    evidence = EvidenceStore(database)
+    jobs = ImportJobStore(database)
+    imports = ImportSupervisor(
+        adapters={"claude-code": create_claude_code_adapter(grant)},
+        evidence_store=evidence,
+        job_store=jobs,
+    )
+    live = PollingLiveSyncSupervisor(
+        source_ids=("claude-code",),
+        import_supervisor=imports,
+        job_store=jobs,
+    )
+    return grant, evidence, jobs, imports, live
+
+
+def _insert_legacy_live_cursor(
+    jobs: ImportJobStore, source: AuthorizedSourceFile, line: bytes
+) -> None:
+    details = source.path.stat()
+    with sqlite3.connect(jobs.database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO live_source_cursors (
+                user_id, source_id, file_key, file_identity, checkpoint,
+                checkpoint_anchor, observed_size, observed_modified_ns, updated_at, read_to_end
+            ) VALUES ('local', 'claude-code', ?, ?, ?, ?, ?, ?, ?, 1)
+            """,
+            (
+                source.safe_id,
+                f"{details.st_dev + 1}:{details.st_ino}",
+                f"byte:{len(line)}",
+                hashlib.sha256(line).hexdigest(),
+                len(line),
+                details.st_mtime_ns,
+                "2026-10-06T00:00:00+00:00",
+            ),
+        )
+
+
+def _texts(evidence: EvidenceStore) -> list[str]:
+    return [record.verbatim for record in evidence.list_extractable()]
+
+
+def test_rewritten_growth_after_device_change_does_not_sync_old_history(tmp_path: Path) -> None:
+    """Same inode, new device, rewritten and longer, but still a small backlog.
+
+    Sync must not read from zero and store the 30-day line. A bounded history
+    job is already present; it does not make the live lane safe by itself.
+    """
+
+    async def scenario() -> None:
+        root = tmp_path / "projects"
+        root.mkdir()
+        path = root / "session.jsonl"
+        old = (datetime.now(UTC) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        original = _claude_line("known", "known-turn", old)
+        path.write_bytes(original)
+        grant, evidence, jobs, imports, live = _claude_harness(tmp_path, root)
+        source = grant.authorize_file(path)
+        inode = path.stat().st_ino
+        _insert_legacy_live_cursor(jobs, source, original)
+        rewritten = _claude_line("known", "known-turn ", old) + _claude_line(
+            "old", "restored-30-day-history", old
+        )
+        descriptor = os.open(path, os.O_RDWR)
+        try:
+            os.write(descriptor, rewritten)
+            os.ftruncate(descriptor, len(rewritten))
+        finally:
+            os.close(descriptor)
+        assert path.stat().st_ino == inode
+        assert len(rewritten) - len(original) < 256 * 1024
+        jobs.create(
+            user_id="local",
+            source_id="claude-code",
+            history_after=datetime.now(UTC) - timedelta(days=1),
+            history_intent="automatic",
+        )
+        try:
+            await live.initialize_source("claude-code")
+            cursor = jobs.get_source_cursors(
+                user_id="local", source_id="claude-code", operation="sync"
+            )[source.safe_id]
+            assert cursor.checkpoint == f"byte:{path.stat().st_size}"
+            synced = await live.trigger("claude-code")
+            assert "restored-30-day-history" not in _texts(evidence)
+            assert synced is None or synced.stored == 0
+        finally:
+            await live.shutdown()
+            await imports.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_device_change_keeps_a_live_cursor_when_the_anchor_still_holds(tmp_path: Path) -> None:
+    """A legal offline append still resumes. Device renumber alone is not a rebase."""
+
+    async def scenario() -> None:
+        root = tmp_path / "projects"
+        root.mkdir()
+        path = root / "session.jsonl"
+        old = (datetime.now(UTC) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        today = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        original = _claude_line("known", "known-turn", old)
+        path.write_bytes(original)
+        grant, evidence, jobs, imports, live = _claude_harness(tmp_path, root)
+        source = grant.authorize_file(path)
+        _insert_legacy_live_cursor(jobs, source, original)
+        appended = _claude_line("new", "offline-append", today)
+        with path.open("ab") as handle:
+            handle.write(appended)
+        try:
+            await live.initialize_source("claude-code")
+            cursor = jobs.get_source_cursors(
+                user_id="local", source_id="claude-code", operation="sync"
+            )[source.safe_id]
+            assert cursor.checkpoint == f"byte:{len(original)}"
+            synced = await live.trigger("claude-code")
+            assert synced is not None and synced.status is ImportStatus.COMPLETED
+            assert synced.stored == 1
+            assert _texts(evidence) == ["offline-append"]
+        finally:
+            await live.shutdown()
+            await imports.shutdown()
+
+    asyncio.run(scenario())

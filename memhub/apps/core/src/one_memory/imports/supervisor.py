@@ -91,7 +91,12 @@ class ImportSupervisor:
     ) -> ImportJob:
         if self.source_enabled is not None and not self.source_enabled(source_id):
             raise SourceAccessError(SourceAccessErrorCode.GRANT_REQUIRED)
-        return self.job_store.create(user_id="local", source_id=source_id, operation=operation)
+        return self.job_store.create(
+            user_id="local",
+            source_id=source_id,
+            operation=operation,
+            history_intent="explicit" if operation == "history" else None,
+        )
 
     def enqueue(self, job_id: str) -> ImportJob:
         if job_id in self._drains:

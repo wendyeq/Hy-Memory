@@ -109,6 +109,7 @@
 | `test_extraction_state.py` | `unit` | Three extraction states: extracted, outside the window, or still queued. |
 | `test_extraction_window.py` | `unit` | Extraction window: outside it, evidence stays searchable and out of the queue. |
 | `test_fault_matrix.py` | `integration` | A7-03: the fault matrix is complete, and the dangerous outcomes are pinned. |
+| `test_file_cursor_identity_reboot.py` | `contract` | File cursors must survive an APFS volume renumber, the way root identity does. |
 | `test_file_cursor_import.py` | `contract` | History import is live sync from an empty cursor: stat, skip unchanged, read forward. |
 | `test_file_import_operations.py` | `integration` | Bounded synthetic uploads; operation identity is not a content dedup key. |
 | `test_file_import_operations_review.py` | `contract` | Upload refusal/legacy compatibility review with bounded synthetic files only. |
@@ -167,6 +168,7 @@
 | `test_live_sync.py` | `contract` | 覆盖 live sync preempts a reader batch before it emits work、live sync cuts in front of a running history import、live sync does not resume a history import the user paused 等 24 个场景。 |
 | `test_live_sync_file_incremental.py` | `contract` | 覆盖 unchanged file metadata avoids a job and content read、changed file content is read once by the import job、workbuddy first live poll baselines history then imports only append 等 6 个场景。 |
 | `test_live_sync_job_coalescing.py` | `contract` | A poll that finds nothing must not leave an import job behind. |
+| `test_live_sync_startup_backfill.py` | `integration` | Startup must not reread a grown file from byte 0. |
 | `test_live_watch.py` | `contract` | 覆盖 a new turn lands well inside the ten second target、start prime catches a change that predates the watcher、a run that predates the change is followed by a fresh one 等 15 个场景。 |
 | `test_live_watch_grants.py` | `integration` | 覆盖 explicit sync grant starts watch without restart and revocation stops it 场景。 |
 | `test_local_embedding.py` | `contract` | Guards for the built-in embedding model. |
@@ -287,6 +289,7 @@
 | `test_recall_scope_control.py` | `integration` | 覆盖 external scope cannot override shared or host workspace boundary、scope only mutation is versioned without changing status or reindexing 场景。 |
 | `test_recall_scope_off_loop.py` | `contract` | The workspace lookup behind an external recall must not run on the loop. |
 | `test_recent_first_import.py` | `contract` | Recent-file priority survives restart through a selection-bound frozen copy. |
+| `test_resume_history_window.py` | `integration` | Startup and sync resume must not open an unbounded history import. |
 | `test_retrieval_chunking.py` | `contract` | 覆盖 default 384 body 64 overlap and exact source slices、all prefix and special tokens count toward strict 512 budget、real tokenizer covers long chinese middle and tail object locations 等 20 个场景。 |
 | `test_retrieval_eligibility_benchmark.py` | `contract` | 覆盖 scale probe proves composite authority index changes the plan 场景。 |
 | `test_retrieval_index_store.py` | `contract` | 覆盖 constructor and reads do not create database or schema、explicit initialization rolls back and never grants model policy、consumer and jobs commit together 等 19 个场景。 |
@@ -388,4 +391,4 @@
 | `test_workspace_recall.py` | `contract` | Workspace memories were unreachable from every host; these pin the way in. |
 | `test_write_queue_lease_renewal.py` | `contract` | Rule 8: a lease must outlive the work it covers, and be renewed while it runs. |
 
-共 383 个测试文件。
+共 386 个测试文件。

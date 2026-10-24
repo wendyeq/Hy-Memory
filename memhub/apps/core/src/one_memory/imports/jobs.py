@@ -1,6 +1,7 @@
 import logging
 import re
 import sqlite3
+from collections.abc import Mapping
 from contextlib import AbstractContextManager, nullcontext
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -11,7 +12,9 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict
 
 from one_memory.database_access import main_database_transaction
+from one_memory.imports.access import AuthorizedSourceFile, cursor_identities_resume_compatible
 from one_memory.imports.adapters import ScanPhase, SourceCursor
+from one_memory.imports.readers import verify_jsonl_checkpoint
 
 #: Schema owned by `memory_server.migrations` (migration 7). No local copy:
 #: a second copy would drift from the migration that claims to define it, and
@@ -105,6 +108,61 @@ def _byte_checkpoint(value: str) -> int | None:
         return None
 
 
+def _retained_live_cursor_reads_from_zero(
+    live: sqlite3.Row,
+    source_file: AuthorizedSourceFile | None,
+) -> bool:
+    """True when keeping this live offset would make the next sync start at byte 0.
+
+    A valid anchor plus a small backlog is a legal offline append and must
+    keep the old offset. An anchor that no longer matches, once the file has
+    grown or shrunk, is not: ``resume_checkpoint`` then returns None and the
+    realtime lane imports whatever was never stored. Rebase that cursor to
+    the current tail instead. The bounded history job owns the rebuild.
+    Same-size anchor failure rewinds one line and does not read from zero.
+    """
+    if source_file is None:
+        return False
+    observed = int(live["observed_size"])
+    if source_file.size < observed:
+        return True
+    checkpoint = str(live["checkpoint"])
+    anchor = live["checkpoint_anchor"]
+    if source_file.size == observed or not checkpoint.startswith("byte:") or not anchor:
+        return False
+    try:
+        return not verify_jsonl_checkpoint(
+            source_file,
+            checkpoint=checkpoint,
+            anchor=str(anchor),
+        )
+    except (OSError, ValueError):
+        return True
+
+
+def _stored_live_offset_must_rebase(
+    stored: sqlite3.Row,
+    tail: SourceCursor,
+    source_file: AuthorizedSourceFile | None,
+) -> bool:
+    """True when ``stored`` must not seed the realtime lane.
+
+    An incompatible identity, a gap past the live backlog, or an anchor that
+    would make the next sync start at byte 0 all take the fresh tail instead.
+    """
+    if not cursor_identities_resume_compatible(str(stored["file_identity"]), tail.file_identity):
+        return True
+    stored_offset = _byte_checkpoint(str(stored["checkpoint"]))
+    tail_offset = _byte_checkpoint(tail.checkpoint)
+    if (
+        stored_offset is not None
+        and tail_offset is not None
+        and tail_offset - stored_offset > MAX_LIVE_BACKLOG_BYTES
+    ):
+        return True
+    return _retained_live_cursor_reads_from_zero(stored, source_file)
+
+
 #: Checkpoint kinds whose offset is a comparable numeric position: `byte:` for
 #: JSONL sources, `record:`/`row:`/`rowid:` for SQLite-backed ones. Written as
 #: one anchored pattern rather than a tuple of literals because the SQLite
@@ -179,6 +237,7 @@ class ImportJobStore:
             "merged": "INTEGER NOT NULL DEFAULT 0",
             "operation": "TEXT NOT NULL DEFAULT 'history'",
             "history_after": "TEXT",
+            "history_intent": "TEXT",
         }
         for name, declaration in additions.items():
             if name not in columns:
@@ -215,6 +274,16 @@ class ImportJobStore:
         if "read_to_end" not in cursor_columns:
             connection.execute(
                 "ALTER TABLE source_cursors ADD COLUMN read_to_end INTEGER NOT NULL DEFAULT 0"
+            )
+        for table in ("source_cursors", "live_source_cursors"):
+            connection.execute(
+                f"""
+                UPDATE {table}
+                SET file_identity = 'ino:' || substr(file_identity, instr(file_identity, ':') + 1)
+                WHERE file_identity NOT GLOB '*[^0-9:]*'
+                  AND length(file_identity) - length(replace(file_identity, ':', '')) = 1
+                  AND file_identity GLOB '[0-9]*:[0-9]*'
+                """
             )
         active = (
             ImportStatus.PENDING,
@@ -279,7 +348,18 @@ class ImportJobStore:
         user_id: str,
         source_id: str,
         operation: Literal["history", "sync"] = "history",
+        history_after: datetime | None = None,
+        history_intent: Literal["automatic", "explicit"] | None = None,
     ) -> ImportJob:
+        """Open a job, or return the active one for this source and operation.
+
+        ``history_intent='explicit'`` is a user-requested import. Its window
+        is whatever the caller stored, including none. ``automatic`` is the
+        startup and sync-resume catch-up. Reusing one of those must not keep
+        an empty or older cutoff: the window passed in replaces it.
+        """
+        if history_intent not in {None, "automatic", "explicit"}:
+            raise ValueError("history_intent must be automatic, explicit, or empty")
         now = datetime.now(UTC).isoformat()
         job_id = str(uuid4())
         with self._connect(writing=True) as connection:
@@ -287,8 +367,8 @@ class ImportJobStore:
                 """
                 INSERT OR IGNORE INTO import_jobs (
                     job_id, user_id, source_id, status, created_at, updated_at,
-                    operation
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    operation, history_after, history_intent
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -298,6 +378,8 @@ class ImportJobStore:
                     now,
                     now,
                     operation,
+                    history_after.isoformat() if history_after is not None else None,
+                    history_intent,
                 ),
             )
             if created.rowcount == 0:
@@ -323,7 +405,106 @@ class ImportJobStore:
                 if existing is None:
                     raise RuntimeError("Active import job constraint has no owner")
                 job_id = existing["job_id"]
+                if (
+                    operation == "history"
+                    and history_intent == "automatic"
+                    and history_after is not None
+                ):
+                    self._tighten_automatic_history_row(
+                        connection,
+                        job_id=job_id,
+                        history_after=history_after,
+                        now=now,
+                    )
         return self.require(job_id)
+
+    def tighten_automatic_history(
+        self,
+        *,
+        history_after: datetime,
+        user_id: str | None = None,
+        source_id: str | None = None,
+    ) -> int:
+        """Give unfinished automatic catch-up a cutoff before it is queued.
+
+        Rows with ``history_intent='explicit'`` are left alone, including a
+        full import whose cutoff is null. A null intent is a catch-up from
+        before intents were recorded; an empty or older cutoff on one of
+        those is tightened. A cutoff already inside ``history_after`` is kept.
+        """
+        clauses = [
+            "operation = 'history'",
+            "status IN ('pending', 'running', 'paused', 'interrupted', 'failed')",
+        ]
+        parameters: list[str] = []
+        if user_id is not None:
+            clauses.append("user_id = ?")
+            parameters.append(user_id)
+        if source_id is not None:
+            clauses.append("source_id = ?")
+            parameters.append(source_id)
+        now = datetime.now(UTC).isoformat()
+        changed = 0
+        with self._connect(writing=True) as connection:
+            rows = connection.execute(
+                f"SELECT job_id FROM import_jobs WHERE {' AND '.join(clauses)}",
+                parameters,
+            ).fetchall()
+            for row in rows:
+                if self._tighten_automatic_history_row(
+                    connection,
+                    job_id=str(row["job_id"]),
+                    history_after=history_after,
+                    now=now,
+                ):
+                    changed += 1
+        return changed
+
+    @staticmethod
+    def _tighten_automatic_history_row(
+        connection: sqlite3.Connection,
+        *,
+        job_id: str,
+        history_after: datetime,
+        now: str,
+    ) -> bool:
+        row = connection.execute(
+            """
+            SELECT operation, status, history_after, history_intent
+            FROM import_jobs WHERE job_id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+        if row is None or row["operation"] != "history" or row["history_intent"] == "explicit":
+            return False
+        if row["status"] not in {
+            ImportStatus.PENDING,
+            ImportStatus.RUNNING,
+            ImportStatus.PAUSED,
+            ImportStatus.INTERRUPTED,
+            ImportStatus.FAILED,
+        }:
+            return False
+        cutoff = history_after
+        if cutoff.tzinfo is None:
+            cutoff = cutoff.replace(tzinfo=UTC)
+        current = (
+            datetime.fromisoformat(row["history_after"]) if row["history_after"] else None
+        )
+        if current is not None:
+            if current.tzinfo is None:
+                current = current.replace(tzinfo=UTC)
+            if current >= cutoff:
+                return False
+        connection.execute(
+            """
+            UPDATE import_jobs
+            SET history_after = ?, history_intent = 'automatic', updated_at = ?
+            WHERE job_id = ?
+            """,
+            (cutoff.isoformat(), now, job_id),
+        )
+        return True
 
     def replace_never_published_snapshot_failures(self) -> list[ImportJob]:
         """Cancel a history that failed inside the old snapshot copy, and open another.
@@ -856,13 +1037,15 @@ class ImportJobStore:
         source_id: str,
         baselines: dict[str, SourceCursor],
         baseline_missing_files: bool = True,
+        files: Mapping[str, AuthorizedSourceFile] | None = None,
     ) -> dict[str, SourceCursor]:
         """Initialize the realtime tail without turning it into a history scan."""
+        listed = files or {}
         now = datetime.now(UTC).isoformat()
         with self._connect(writing=True) as connection:
             live_rows = connection.execute(
-                "SELECT file_key,file_identity,checkpoint FROM live_source_cursors "
-                "WHERE user_id=? AND source_id=?",
+                "SELECT file_key,file_identity,checkpoint,checkpoint_anchor,observed_size "
+                "FROM live_source_cursors WHERE user_id=? AND source_id=?",
                 (user_id, source_id),
             ).fetchall()
             active_history = connection.execute(
@@ -881,8 +1064,8 @@ class ImportJobStore:
                     (user_id, source_id),
                 ).fetchall()
                 history_cursors = {
-                    row["file_key"]: SourceCursor(
-                        file_key=row["file_key"],
+                    str(row["file_key"]): SourceCursor(
+                        file_key=str(row["file_key"]),
                         file_identity=row["file_identity"],
                         checkpoint=row["checkpoint"],
                         checkpoint_anchor=row["checkpoint_anchor"],
@@ -892,9 +1075,18 @@ class ImportJobStore:
                     )
                     for row in history
                 }
-                selected = (
-                    baselines if active_history is not None else {**baselines, **history_cursors}
-                )
+                if active_history is not None:
+                    selected = baselines
+                else:
+                    selected = dict(baselines)
+                    for row in history:
+                        key = str(row["file_key"])
+                        baseline = baselines.get(key)
+                        if baseline is not None and _stored_live_offset_must_rebase(
+                            row, baseline, listed.get(key)
+                        ):
+                            continue
+                        selected[key] = history_cursors[key]
                 for cursor in selected.values():
                     self._upsert_cursor(connection, owner, cursor, now)
             else:
@@ -904,22 +1096,17 @@ class ImportJobStore:
                 # a reset to byte zero, but doing so in the realtime lane turns
                 # the replacement corpus into thousands of fake live jobs.
                 # Rebase missing/replaced live files to the freshly captured
-                # tail; history owns everything before it. Same-identity
-                # cursors are left untouched so a real append cannot be skipped.
+                # tail; history owns everything before it. A compatible cursor
+                # is kept only when its anchor still holds, so a legal append
+                # is not skipped and a rewritten file is not reread from zero.
                 live_by_key = {str(row["file_key"]): row for row in live_rows}
                 for key, cursor in baselines.items():
                     live = live_by_key.get(key)
                     if live is None and not baseline_missing_files:
                         continue
-                    rebased = live is None or str(live["file_identity"]) != cursor.file_identity
-                    if live is not None and not rebased:
-                        live_offset = _byte_checkpoint(str(live["checkpoint"]))
-                        tail_offset = _byte_checkpoint(cursor.checkpoint)
-                        rebased = (
-                            live_offset is not None
-                            and tail_offset is not None
-                            and tail_offset - live_offset > MAX_LIVE_BACKLOG_BYTES
-                        )
+                    rebased = live is None or _stored_live_offset_must_rebase(
+                        live, cursor, listed.get(key)
+                    )
                     if rebased:
                         self._upsert_cursor(connection, owner, cursor, now)
                         if connection.execute(

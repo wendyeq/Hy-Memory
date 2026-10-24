@@ -43,6 +43,7 @@ from one_memory.imports.sources.common import (
     ParsedSkip,
     SourceInstallState,
     SourceRecordContext,
+    _LiveBaseline,
     discovery_failure_code,
     followed_by_tool,
     is_unchanged,
@@ -537,8 +538,9 @@ def _with_write_ahead_log(database: AuthorizedSourceFile) -> AuthorizedSourceFil
     return replace(database, modified_ns=int.from_bytes(version, "big") & ((1 << 63) - 1))
 
 
-def _live_baseline(listing: _CursorListing) -> dict[str, SourceCursor]:
+def _live_baseline(listing: _CursorListing) -> _LiveBaseline:
     cursors: dict[str, SourceCursor] = {}
+    files: dict[str, AuthorizedSourceFile] = {}
     for source_file in listing.transcripts:
         try:
             checkpoint, anchor = jsonl_complete_tail(source_file)
@@ -547,6 +549,7 @@ def _live_baseline(listing: _CursorListing) -> dict[str, SourceCursor]:
         cursors[source_file.safe_id] = source_cursor(
             source_file, checkpoint, checkpoint_anchor=anchor
         ).model_copy(update={"read_to_end": checkpoint == f"byte:{source_file.size}"})
+        files[source_file.safe_id] = source_file
     for source_file in listing.stores:
         try:
             admitted = source_file.admit()
@@ -561,6 +564,7 @@ def _live_baseline(listing: _CursorListing) -> dict[str, SourceCursor]:
         cursors[source_file.safe_id] = source_cursor(
             source_file, f"rowid:{rowid}", checkpoint_anchor=anchor
         ).model_copy(update={"read_to_end": True})
+        files[source_file.safe_id] = source_file
     for source_file in listing.legacy:
         try:
             admitted = source_file.admit()
@@ -575,7 +579,8 @@ def _live_baseline(listing: _CursorListing) -> dict[str, SourceCursor]:
         cursors[source_file.safe_id] = source_cursor(
             source_file, f"row:{rowid}", checkpoint_anchor=anchor
         ).model_copy(update={"read_to_end": True})
-    return cursors
+        files[source_file.safe_id] = source_file
+    return _LiveBaseline(cursors, files)
 
 
 def _is_cursor_data_file(source_file: AuthorizedSourceFile) -> bool:
