@@ -46,6 +46,7 @@ from one_memory.imports.discovery import (
     discovered_off_loop,
 )
 from one_memory.imports.models import (
+    MAX_VERBATIM_CHARACTERS,
     EvidenceContentKind,
     EvidenceInput,
     EvidenceOrigin,
@@ -66,6 +67,21 @@ from one_memory.imports.readers import (
 from one_memory.imports.sources.parsing import parse_timestamp
 
 _log = logging.getLogger(__name__)
+
+
+def _clamp_verbatim(text: str) -> str:
+    """Keep one pathological record from violating EvidenceInput's limit.
+
+    A single pasted dump larger than MAX_VERBATIM_CHARACTERS used to fail
+    validation, retry, and then wedge the whole history import on the same
+    record. Keep the head and make the truncation explicit and actionable.
+    """
+    if len(text) <= MAX_VERBATIM_CHARACTERS:
+        return text
+    marker = f"\n…[truncated: original {len(text)} chars]"
+    keep = max(0, MAX_VERBATIM_CHARACTERS - len(marker))
+    return text[:keep] + marker
+
 
 #: At most one read heartbeat per second. Faster would be more writes than the
 #: counts are worth; slower leaves the job's visible state stale.
@@ -662,7 +678,7 @@ def is_unchanged(source_file: AuthorizedSourceFile, cursors: dict[str, SourceCur
     return (
         previous is not None
         and previous.read_to_end
-        and cursor_identities_same_file(previous.file_identity, source_file.file_identity)
+        and _unchanged_cursor_identity(previous, source_file)
         and previous.observed_size == source_file.size
         and previous.observed_modified_ns == source_file.modified_ns
         # Chmod alone leaves size, mtime and inode untouched, so a file that
@@ -709,7 +725,7 @@ def touched_cursor(
     previous = options.cursors.get(source_file.safe_id)
     keep = (
         previous is not None
-        and cursor_identities_resume_compatible(previous.file_identity, source_file.file_identity)
+        and _same_file(previous, source_file)
         and previous.observed_size <= source_file.size
     )
     # A kept cursor means the next scan resumes exactly where this one ended:
@@ -889,7 +905,7 @@ def resume_checkpoint(
     previous = options.cursors.get(source_file.safe_id)
     if previous is None:
         return None
-    if not cursor_identities_resume_compatible(previous.file_identity, source_file.file_identity):
+    if not _same_file(previous, source_file):
         return None
     if source_file.size < previous.observed_size:
         return None
@@ -1064,12 +1080,62 @@ def source_cursor(
 ) -> SourceCursor:
     return SourceCursor(
         file_key=source_file.safe_id,
-        file_identity=source_file.file_identity,
+        file_identity=_cursor_file_identity(source_file),
         checkpoint=checkpoint,
         checkpoint_anchor=checkpoint_anchor,
         observed_size=source_file.size,
         observed_modified_ns=source_file.modified_ns,
     )
+
+
+def _cursor_file_identity(source_file: AuthorizedSourceFile) -> str:
+    return (
+        f"{source_file.file_identity}{_VERSION_SEPARATOR}{source_file.cursor_version}"
+        if source_file.cursor_version
+        else source_file.file_identity
+    )
+
+
+_VERSION_SEPARATOR = ":v:"
+
+
+def _cursor_identity_body(identity: str) -> str:
+    return identity.partition(_VERSION_SEPARATOR)[0]
+
+
+def _stored_cursor_version(identity: str) -> str:
+    _body, separator, version = identity.partition(_VERSION_SEPARATOR)
+    return version if separator else ""
+
+
+def _same_file(previous: SourceCursor, source_file: AuthorizedSourceFile) -> bool:
+    """Whether a stored cursor may still be tried against this file.
+
+    A Cursor WAL version after ``:v:`` means the file changed. ``is_unchanged``
+    owns that check. The token does not mean the file was replaced. Resume
+    compares inode and birth time, so a legacy ``st_dev:st_ino`` cursor can
+    try its old offset after an APFS reboot. The content anchor still has to
+    match. Skipping the file is a stricter check than this one.
+    """
+    return cursor_identities_resume_compatible(
+        _cursor_identity_body(previous.file_identity),
+        source_file.file_identity,
+    )
+
+
+def _unchanged_cursor_identity(previous: SourceCursor, source_file: AuthorizedSourceFile) -> bool:
+    """True when the cursor names this file and the same WAL version.
+
+    Inode equality alone is not enough to skip a file. A legacy cursor that
+    only shares an inode must be resumed and anchor-checked, not skipped.
+    A WAL version change is a change even when size and mtime match.
+    """
+    if not cursor_identities_same_file(
+        _cursor_identity_body(previous.file_identity),
+        source_file.file_identity,
+    ):
+        return False
+    return _stored_cursor_version(previous.file_identity) == (source_file.cursor_version or "")
 
 
 _POSITION = re.compile(r"(?<=:)\d+(?=:|$)")
@@ -1110,8 +1176,10 @@ def to_evidence(
         role=parsed.role,
         written_by=parsed.written_by,
         created_at=parsed.created_at,
-        verbatim=parsed.verbatim,
-        raw_verbatim=parsed.raw_verbatim,
+        verbatim=_clamp_verbatim(parsed.verbatim),
+        raw_verbatim=(
+            None if parsed.raw_verbatim is None else _clamp_verbatim(parsed.raw_verbatim)
+        ),
         origin_meta={
             EvidenceOrigin.FILE: OriginMetadata(
                 source_version=origin.source_version or source_version,
@@ -1136,6 +1204,11 @@ def discovery_failure_code(
 ) -> ScanIssueCode:
     if failure.reason_code is SourceAccessErrorCode.BUDGET_EXCEEDED:
         return ScanIssueCode.BUDGET_EXCEEDED
+    if failure.reason_code is SourceAccessErrorCode.FILE_TOO_LARGE:
+        # The file is readable and its format is fine; only its size is over
+        # the access gate. Reporting that as `unsupported_schema` sends the
+        # user looking for a parser problem that does not exist.
+        return ScanIssueCode.FILE_TOO_LARGE
     return ScanIssueCode.UNSUPPORTED_SCHEMA
 
 
@@ -1143,6 +1216,8 @@ def _scan_failure_code(code: SourceAccessErrorCode) -> ScanIssueCode:
     """Map a per-file open failure onto a machine code, never onto free text."""
     if code is SourceAccessErrorCode.BUDGET_EXCEEDED:
         return ScanIssueCode.BUDGET_EXCEEDED
+    if code is SourceAccessErrorCode.FILE_TOO_LARGE:
+        return ScanIssueCode.FILE_TOO_LARGE
     if code is SourceAccessErrorCode.SYMLINK_NOT_ALLOWED:
         return ScanIssueCode.UNSUPPORTED_SCHEMA
     if code in {

@@ -94,12 +94,14 @@ it("returns only diagnostic events written during this desktop launch", async ()
   await mkdir(logs, { recursive: true });
   const target = path.join(logs, "diagnostic-core.jsonl");
   const old = {
+    schema_version: 1,
     timestamp: "2026-10-14T09:00:00.000Z",
     level: "info",
     service: "core",
     component: "core.startup",
     event: "core.old",
     outcome: "succeeded",
+    session_id: "11111111-1111-4111-8111-111111111111",
   };
   await writeFile(target, `${JSON.stringify(old)}\n`);
   const cursor = await captureDebugLogCursor(dataDir);
@@ -109,6 +111,11 @@ it("returns only diagnostic events written during this desktop launch", async ()
     timestamp: "2026-10-14T10:01:00.000Z",
     event: "core.current",
     level: "warn",
+    details: {
+      count: 1,
+      "custom.private": "/Users/private/query.txt",
+      credential_hint: "ghp_private_token",
+    },
   };
   await appendFile(target, `${JSON.stringify(current)}\nnot-json\n`);
 
@@ -118,8 +125,11 @@ it("returns only diagnostic events written during this desktop launch", async ()
   expect(snapshot.entries[0]).toMatchObject({
     event: "core.current",
     level: "warn",
+    details: { count: 1 },
     source: "diagnostic",
   });
+  expect(JSON.stringify(snapshot)).not.toContain("/Users/private");
+  expect(JSON.stringify(snapshot)).not.toContain("ghp_private_token");
 });
 
 it("tracks diagnostic JSONL across rotation without rereading the old prefix", async () => {
@@ -130,12 +140,14 @@ it("tracks diagnostic JSONL across rotation without rereading the old prefix", a
   const target = path.join(logs, "diagnostic-core.jsonl");
   const event = (name: string, timestamp: string) =>
     JSON.stringify({
+      schema_version: 1,
       timestamp,
       level: "info",
       service: "core",
       component: "core.test",
       event: name,
       outcome: "succeeded",
+      session_id: "22222222-2222-4222-8222-222222222222",
     });
   await writeFile(target, `${event("before", "2026-10-14T09:00:00.000Z")}\n`);
   const cursor = await captureDebugLogCursor(dataDir);
@@ -218,37 +230,21 @@ it("filters raw Core INFO and DEBUG while preserving warnings and errors", async
   ).toBe(true);
 });
 
-it("shows HY pipeline metrics without exposing model content", async () => {
-  const dataDir = await mkdtemp(
-    path.join(os.tmpdir(), "om-debug-hy-pipeline-"),
-  );
+it("does not read HY's own log directory", async () => {
+  // MemHub turns the HY pipeline log off; files left by older builds and
+  // HY's text log stay on disk but are not part of the Debug panel.
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "om-debug-hy-logs-"));
   roots.push(dataDir);
-  const pipelineDir = path.join(
-    dataDir,
-    "hy-memory",
-    "governed-v2",
-    "logs",
-    "default",
-  );
-  await mkdir(pipelineDir, { recursive: true });
-  const target = path.join(pipelineDir, "2026-10-14.log");
-  await writeFile(target, "");
+  const hyLogs = path.join(dataDir, "hy-memory", "governed-v2", "logs");
+  await mkdir(path.join(hyLogs, "default"), { recursive: true });
   const cursor = await captureDebugLogCursor(dataDir);
-  await appendFile(
-    target,
-    `${JSON.stringify({
-      request_id: "request-safe-1",
-      user_id: "private-user",
-      agent_id: "private-agent",
-      session_id: "private-session",
-      step: "EXTRACT",
-      prompt: "private prompt",
-      content: "private response",
-      parsed: "private parsed output",
-      tokens: 42,
-      elapsed_ms: 123.5,
-      timestamp: "2026-10-14T10:01:00.000",
-    })}\n`,
+  await writeFile(
+    path.join(hyLogs, "default", "2026-10-14.log"),
+    `${JSON.stringify({ request_id: "old-pipeline", step: "EXTRACT" })}\n`,
+  );
+  await writeFile(
+    path.join(hyLogs, "hy_memory.log"),
+    "2026-10-14 10:01:00 [WARNING] [-] hy_memory.client: hy text log\n",
   );
 
   const snapshot = await readDebugLogSnapshot(
@@ -257,29 +253,11 @@ it("shows HY pipeline metrics without exposing model content", async () => {
     cursor,
   );
 
-  expect(snapshot.entries).toEqual([
-    expect.objectContaining({
-      service: "hy-memory",
-      component: "hy.pipeline",
-      event: "hy.pipeline.extract",
-      message: "EXTRACT · 42 tokens · 124 ms",
-      duration_ms: 123.5,
-      trace_id: "request-safe-1",
-      details: { phase: "EXTRACT", count: 42 },
-      source: "pipeline",
-    }),
-  ]);
-  const serialized = JSON.stringify(snapshot);
-  for (const secret of [
-    "private prompt",
-    "private response",
-    "private parsed output",
-    "private-user",
-    "private-agent",
-    "private-session",
-  ]) {
-    expect(serialized).not.toContain(secret);
-  }
+  expect(snapshot.entries).toEqual([]);
+  expect(cursor).toEqual({
+    diagnosticLogs: [],
+    serviceLogs: expect.any(Array),
+  });
 });
 
 it("logs a renderer ui-action with action, page, phase and the shared trace id", async () => {

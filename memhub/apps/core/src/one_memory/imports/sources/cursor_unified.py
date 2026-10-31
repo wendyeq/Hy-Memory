@@ -534,8 +534,8 @@ def _with_write_ahead_log(database: AuthorizedSourceFile) -> AuthorizedSourceFil
     version = hashlib.blake2b(
         f"{database.modified_ns}:{journal.st_mtime_ns}:{journal.st_size}:{journal.st_ino}".encode(),
         digest_size=8,
-    ).digest()
-    return replace(database, modified_ns=int.from_bytes(version, "big") & ((1 << 63) - 1))
+    ).hexdigest()
+    return replace(database, cursor_version=version)
 
 
 def _live_baseline(listing: _CursorListing) -> _LiveBaseline:
@@ -851,9 +851,7 @@ def _read_store_messages(
                         reason_code=ScanIssueCode.UNKNOWN_RECORD,
                     )
                     continue
-                host_timestamp = (
-                    _cursor_host_timestamp(content) if role == "user" else None
-                )
+                host_timestamp = _cursor_host_timestamp(content) if role == "user" else None
                 fallback_timestamp = datetime.fromtimestamp(
                     source_file.modified_ns / 1_000_000_000,
                     tz=UTC,

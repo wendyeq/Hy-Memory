@@ -126,12 +126,34 @@ const SAFE_STABLE_RUNTIME_ERROR_CODES = new Set([
   "installed_version_conflict",
   "distribution_downgrade_refused",
   "install_current_unmanaged",
+  // Migration runs before the app window exists, so these are the only names
+  // a first launch can be given. They stay codes here and become sentences in
+  // STABLE_RUNTIME_USER_MESSAGES: a person reading the dialog never sees them.
+  "packaged_runtime_not_current",
+  "sdk_migration_preflight_failed",
+  "sdk_migration_memory_unreadable",
+  "sdk_migration_model_profile_required",
+  "sdk_migration_model_secret_unavailable",
+  "sdk_migration_secure_storage_unavailable",
+  "sdk_migration_disk_space_insufficient",
+  "sdk_migration_cutover_failed",
+  "sdk_migration_bundle_copy_failed",
+  "sdk_migration_response_invalid",
+  "sdk_migration_status_unavailable",
+  "sdk_migration_incomplete",
+  "runtime_service_not_ready",
 ]);
+
+/** Every migration code is a stable token Core or the orchestrator chose;
+ * keeping it (instead of collapsing to `desktop_start_failed`) is what lets a
+ * report be matched to the line in `sdk-migration.log`. */
+const MIGRATION_CODE = /^sdk_(?:migration|data_plane)_[a-z0-9_]{1,80}$/;
 
 export function stableRuntimeErrorCode(error: unknown): string {
   if (
     error instanceof Error &&
-    SAFE_STABLE_RUNTIME_ERROR_CODES.has(error.message)
+    (SAFE_STABLE_RUNTIME_ERROR_CODES.has(error.message) ||
+      MIGRATION_CODE.test(error.message))
   ) {
     return error.message;
   }
@@ -191,6 +213,32 @@ export const STABLE_RUNTIME_USER_MESSAGES: Record<string, string> = {
     "已安装的运行环境比这个安装包更新，无法用旧安装包启动。请安装最新版本的 MemHub；你的记忆数据不会受到影响。",
   install_current_unmanaged:
     "运行环境的安装目录被改动过，无法安全接管。请重新安装 MemHub，你的记忆数据不会受到影响。",
+  packaged_runtime_not_current:
+    "新版本的运行环境没有装上，MemHub 不会用旧版本继续运行。请重新安装 MemHub；如果仍然失败，请把这个提示反馈给我们。你的记忆数据不会受到影响。",
+  sdk_migration_memory_unreadable:
+    "升级前核对发现，新版本还读不到你的全部记忆，所以没有切换数据源，旧数据保持原样可用。请把这个提示反馈给我们；原有记忆数据不会丢失。",
+  sdk_migration_model_profile_required:
+    "升级记忆数据格式需要先有可用的模型配置，用来核对新版本能否读回你的记忆。请在旧版本中完成模型配置后重启；你的记忆数据不会受到影响。",
+  sdk_migration_model_secret_unavailable:
+    "模型密钥读不到（可能被系统钥匙串拒绝），无法核对新版本能否读回你的记忆。请允许 MemHub 访问钥匙串后重新启动；你的记忆数据不会受到影响。",
+  sdk_migration_secure_storage_unavailable:
+    "系统钥匙串暂时不可用，无法核对新版本能否读回你的记忆。请解锁钥匙串后重新启动；你的记忆数据不会受到影响。",
+  sdk_migration_disk_space_insufficient:
+    "磁盘空间不足，升级记忆数据格式时中断了。请至少腾出与记忆数据同等大小的可用空间（可在「关于本机 → 储存空间」查看），然后重新启动 MemHub；升级会自动继续，原有记忆数据不会丢失。",
+  sdk_migration_bundle_copy_failed:
+    "升级前备份没有写完，通常是磁盘空间不足。请清理磁盘空间后重新启动；原有记忆数据不会丢失。",
+  sdk_migration_cutover_failed:
+    "切换数据源时失败，原有记忆数据仍然完整可用。请重新启动重试；如果仍然失败，请把这个提示反馈给我们。",
+  sdk_migration_preflight_failed:
+    "升级前的检查没有通过，升级已停止。请重新启动重试；如果仍然失败，请把这个提示反馈给我们，原有记忆数据不会丢失。",
+  sdk_migration_status_unavailable:
+    "读不到升级状态，无法判断是否需要升级。请重新启动 MemHub；如果仍然失败，请重新安装，你的记忆数据不会受到影响。",
+  sdk_migration_response_invalid:
+    "升级过程返回了无法识别的内容，已停止。原有记忆数据不会丢失；请重新启动重试，如果仍然失败，请把这个提示反馈给我们。",
+  sdk_migration_incomplete:
+    "记忆数据格式升级没有完成，MemHub 暂时无法打开。请重新启动重试；如果仍然失败，请把这个提示反馈给我们，原有记忆数据不会丢失。",
+  runtime_service_not_ready:
+    "记忆服务仍在首次启动，请稍候后重试。你的记忆数据不会受到影响。",
   desktop_start_failed:
     "MemHub 启动失败。请重新启动；如果仍然打不开，请重新安装，你的记忆数据不会受到影响。",
 };
@@ -202,4 +250,45 @@ export function stableRuntimeUserMessage(error: unknown): string {
     STABLE_RUNTIME_USER_MESSAGES.desktop_start_failed ??
     ""
   );
+}
+
+/** What the startup dialog body says.
+ *
+ * A code we wrote copy for becomes a sentence. Every other code is shown as it
+ * is: this dialog is the last thing a person sees before the app closes, and an
+ * unexpected failure is more useful as the code support can look up than as a
+ * reassuring sentence that erases which failure actually fired. */
+export function stableRuntimeFailureDetail(error: unknown): string {
+  if (!(error instanceof Error)) {
+    return STABLE_RUNTIME_USER_MESSAGES.desktop_start_failed ?? "";
+  }
+  return STABLE_RUNTIME_USER_MESSAGES[error.message] ?? error.message;
+}
+
+/** The installed Runtime must be at least the build this App carries. */
+export async function requireCurrentRuntimeAtLeast(
+  installRoot: string,
+  buildNumber: number | undefined,
+): Promise<void> {
+  if (buildNumber === undefined) return;
+  const manifest = await readFile(
+    path.join(installRoot, "current", "manifest.json"),
+    "utf8",
+  )
+    .then((text) => JSON.parse(text) as { build_number?: unknown })
+    .catch(() => null);
+  const installed = manifest?.build_number;
+  if (typeof installed !== "number" || installed < buildNumber) {
+    throw new Error("packaged_runtime_not_current");
+  }
+}
+
+export function startupFailureCause(error: unknown, home: string): string {
+  const text =
+    error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+  return text
+    .split(home)
+    .join("~")
+    .replace(/[\r\n]+/g, " ")
+    .slice(0, 300);
 }

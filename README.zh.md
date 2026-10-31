@@ -33,6 +33,7 @@
 ## 最新动态
 
 * *<mark>[new]</mark>* 🔥🔥🔥 **[2026-10]**: 🚀 **模型开源** 在 Hugging Face 发布 **Hy-Memory-30B-A3B** 的 **FP8**（**[Hy-Memory-30B-A3B-FP8](https://huggingface.co/tencent/Hy-Memory-30B-A3B-FP8)**）与 **GGUF**（**[Hy-Memory-30B-A3B-GGUF](https://huggingface.co/tencent/Hy-Memory-30B-A3B-GGUF)**）量化版本模型！
+* *<mark>[new]</mark>* 🔥🔥🔥 **[2026-10]**: 📦 **正式发布 [MemHub v1.0.5](https://github.com/Tencent-Hunyuan/Hy-Memory/releases/tag/v1.0.5)**：支持中文、英文和西班牙语界面，可通过一次性配对码连接更多自定义 Harness，并优化了记忆浏览、搜索、启动和异常恢复；底层使用 **`hy-memory==2.0.8`**。详见发布说明。
 * *<mark>[new]</mark>* 🔥🔥🔥 **[2026-10]**: 📦 **正式发布 [MemHub v1.0.4](https://github.com/Tencent-Hunyuan/Hy-Memory/releases/tag/v1.0.4)** 与 **[memhub-cli 1.0.5](https://www.npmjs.com/package/memhub-cli/v/1.0.5)**，提供已签名的 macOS 桌面应用及经过验证的 macOS/Linux Runtime！
 * *<mark>[new]</mark>* 🔥🔥🔥 **[2026-10]**: 🚀 **正式发布** **Hy Memory 2.0 (`hy-memory==2.0.4`)**（已上线 [PyPI](https://pypi.org/project/hy-memory/2.0.4/)），并开源 **Hy-Memory** monorepo 与 **[MemHub](memhub/README.md)**！
 * *<mark>[new]</mark>* 🔥🔥🔥 **[2026-10]**: 🚀 **模型开源** 在 Hugging Face 发布 **[Hy-Memory-30B-A3B](https://huggingface.co/tencent/Hy-Memory-30B-A3B)** 长期记忆写入模型及[技术报告](https://arxiv.org/abs/2610.22196)！
@@ -65,13 +66,13 @@
 ### 1. 安装
 
 ```bash
-pip install hy-memory==2.0.3              # 核心（含 ChromaDB 与 Kuzu）
-pip install "hy-memory[qdrant]==2.0.3"    # + Qdrant
-pip install "hy-memory[faiss]==2.0.3"     # + FAISS
-pip install "hy-memory[graph]==2.0.3"     # + Neo4j
-pip install "hy-memory[mysql]==2.0.3"     # + MySQL 缓存
-pip install "hy-memory[rerank]==2.0.3"    # + 本地多语言 cross-encoder rerank
-pip install "hy-memory[all]==2.0.3"       # 全部
+pip install hy-memory==2.0.4              # 核心（含 ChromaDB 与 Kuzu）
+pip install "hy-memory[qdrant]==2.0.4"    # + Qdrant
+pip install "hy-memory[faiss]==2.0.4"     # + FAISS
+pip install "hy-memory[graph]==2.0.4"     # + Neo4j
+pip install "hy-memory[mysql]==2.0.4"     # + MySQL 缓存
+pip install "hy-memory[rerank]==2.0.4"    # + 本地多语言 cross-encoder rerank
+pip install "hy-memory[all]==2.0.4"       # 全部
 ```
 
 ### 2. 配置
@@ -153,7 +154,7 @@ result = client.search(
 
 result["facts"]          # 事实层
 result["experiences"]    # 经验层
-result["chain_block"]    # 仅 coding：版本演进上下文
+result["chain_block"]    # 仅 coding：版本演进上下文（默认空；需 MEMORY_CODING_CHAIN_BLOCK_ENABLED）
 ```
 
 ### 5. 自动路由、来源过滤与进阶 API
@@ -253,6 +254,7 @@ Coding 与 Working **复用同一套双层 pipeline 和数据 schema**，区别�
 - [Graph 记忆设计](docs/pro_graph_design.md) — 图投影、重排、关系路径与部署限制
 - [环境变量模板](.env.example) — 可直接复制的配置模板
 - [MemHub 说明文档](memhub/README.md) — 本地优先桌面端与 CLI 产品总览、Runtime 命令与隐私边界
+- [Hermes 原生记忆 Provider](plugins/hermes/README.md) — 显式用户与 Agent 隔离，独立 HTTP 服务，自动记录与召回默认关闭。
 - [OpenClaw 插件](plugins/openclaw/README.md) — Agent 集成见 `plugins/`（总览：[plugins/README.md](plugins/README.md)）
 
 ### License

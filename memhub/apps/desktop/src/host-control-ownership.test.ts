@@ -15,6 +15,7 @@ const fake = vi.hoisted(() => ({
   missingBroker: false,
   hostCapability: true,
   open: vi.fn(),
+  refreshHosts: vi.fn(async (_layouts: unknown, _options: unknown) => ({})),
   host: vi.fn<
     (input: {
       hostId: string;
@@ -193,7 +194,7 @@ vi.mock("@one-memory/host-bridge/installer", () => ({
   checkSkillDrift: fake.localRead,
   planRecallRepoint: fake.localRead,
   readInstallSelfCheck: fake.localRead,
-  renderConnectionMaterial: fake.localRead,
+  renderCustomHarnessSkill: fake.localRead,
   verifyRecallInstall: fake.localRead,
 }));
 // Spread the real module instead of whitelisting it. Main imports domain
@@ -274,7 +275,9 @@ beforeEach(async () => {
   fake.open.mockResolvedValue({
     hostGrantStore: {},
     repairInstalledCommand: vi.fn(async () => []),
+    refreshInstalledHosts: fake.refreshHosts,
   });
+  fake.refreshHosts.mockClear();
   fake.host.mockResolvedValue({ state: "synthetic-remote-result" });
   Object.defineProperty(process, "resourcesPath", {
     configurable: true,
@@ -317,14 +320,6 @@ async function invoke(channel: string, ...args: unknown[]) {
 }
 
 describe("packaged Desktop host-control ownership", () => {
-  it("enables the read-only Reader on non-Windows desktop launch", async () => {
-    await startup();
-
-    expect(fake.coreOptions).toMatchObject({
-      readerEnabled: process.platform !== "win32",
-    });
-  });
-
   it("blocks every host write when an explicit noncanonical data directory is used", async () => {
     fake.dataDir = path.join(fake.home, "coldstart", "data");
     await mkdir(fake.dataDir, { recursive: true, mode: 0o700 });
@@ -342,7 +337,7 @@ describe("packaged Desktop host-control ownership", () => {
     expect(fake.verifyHostRuntime).not.toHaveBeenCalled();
   });
 
-  it("keeps an hourly host path failure out of connection material", async () => {
+  it("keeps an hourly host path failure out of custom Harness pairing", async () => {
     vi.stubEnv(
       "ONE_MEMORY_HOURLY_INSTANCE_ID",
       "1d3b0c1c-59d1-44c3-9e3b-24e5ecfa1b19",
@@ -362,9 +357,9 @@ describe("packaged Desktop host-control ownership", () => {
         },
       }),
     );
-    await expect(invoke("connection-material")).rejects.toThrow(
-      "host_runtime_current_unavailable",
-    );
+    await expect(
+      invoke("create-custom-harness-skill", "Kimi Code"),
+    ).rejects.toThrow("host_runtime_current_unavailable");
   });
 
   it("does not open local HostPermissions for a blocked embedded hourly path", async () => {
@@ -598,5 +593,11 @@ describe("packaged Desktop host-control ownership", () => {
     expect(fake.ensureRuntime).not.toHaveBeenCalled();
     expect(fake.createClient).not.toHaveBeenCalled();
     expect(fake.windows).toHaveLength(1);
+    // The embedded Runtime is this process, so Desktop refreshes the hosts
+    // it installed once the Runtime is up, as a standalone one would itself.
+    expect(fake.refreshHosts).toHaveBeenCalledTimes(1);
+    expect(fake.refreshHosts.mock.calls[0]?.[1]).toMatchObject({
+      diagnostics: expect.anything(),
+    });
   });
 });

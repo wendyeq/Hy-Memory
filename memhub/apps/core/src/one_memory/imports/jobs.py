@@ -488,9 +488,7 @@ class ImportJobStore:
         cutoff = history_after
         if cutoff.tzinfo is None:
             cutoff = cutoff.replace(tzinfo=UTC)
-        current = (
-            datetime.fromisoformat(row["history_after"]) if row["history_after"] else None
-        )
+        current = datetime.fromisoformat(row["history_after"]) if row["history_after"] else None
         if current is not None:
             if current.tzinfo is None:
                 current = current.replace(tzinfo=UTC)
@@ -506,15 +504,14 @@ class ImportJobStore:
         )
         return True
 
-    def replace_never_published_snapshot_failures(self) -> list[ImportJob]:
-        """Cancel a history that failed inside the old snapshot copy, and open another.
+    def replace_never_published_snapshot_failures(self) -> None:
+        """Cancel a history that failed inside the old snapshot copy.
 
         History no longer copies a snapshot, so a copy that was cancelled or
         left half-written says nothing about the source. Leaving the failed row
-        in place would keep the history slot, and that source would never be
-        read again.
+        in place would keep the history slot. Startup does not open a replacement
+        history job. A person starts that import explicitly.
         """
-        opened: list[ImportJob] = []
         for job in self.list_jobs(status=ImportStatus.FAILED):
             if job.operation != "history" or job.stored != 0:
                 continue
@@ -522,14 +519,6 @@ class ImportJobStore:
             if not reasons or not reasons <= self._UNPUBLISHED_SNAPSHOT_FAILURES:
                 continue
             self.transition(job.job_id, ImportStatus.CANCELLED)
-            opened.append(
-                self.create(
-                    user_id=job.user_id,
-                    source_id=job.source_id,
-                    operation="history",
-                )
-            )
-        return opened
 
     def transition(self, job_id: str, target: ImportStatus) -> ImportJob:
         current = self.require(job_id)

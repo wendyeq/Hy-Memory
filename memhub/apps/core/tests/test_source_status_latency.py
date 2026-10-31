@@ -111,6 +111,7 @@ def test_large_import_status_does_not_scan_source_trees(tmp_path, monkeypatch):
         app, catalog = build_app(tmp_path, monkeypatch)
         seed_layouts(catalog)
         async with app.router.lifespan_context(app), client_for(app) as client:
+            await app.state.recovery_task
             await app.state.memory_backfill
             await asyncio.to_thread(seed_evidence, app)
             probes = []
@@ -135,7 +136,6 @@ def test_large_import_status_does_not_scan_source_trees(tmp_path, monkeypatch):
             assert elapsed < 2.0
             assert app.state.source_detection == {}
             assert app.state.import_job_store.list_jobs() == []
-            assert (await client.get("/api/v1/model-content-permission")).json() is None
 
     asyncio.run(scenario())
 

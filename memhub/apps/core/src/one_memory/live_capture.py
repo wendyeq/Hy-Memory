@@ -1,6 +1,7 @@
 """Write visible hook text into Evidence. Tool output stays out."""
 
 import json
+import os
 import time
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -74,12 +75,13 @@ _FILE_FALLBACK = {
 }
 _FALLBACK_EVENTS = frozenset({"Stop", "stop", "SubagentStop", "StopFailure"})
 _TEXT_BLOCKS = frozenset({"text"})
+SDK_MIGRATION_CAPTURE_FENCE = ".sdk-migration-capture-fence.json"
 
 
 def database_path() -> Path:
-    from one_memory.workbuddy_boundary import database_path as boundary_database
+    from one_memory.config import load_settings
 
-    return boundary_database()
+    return load_settings().data_dir / "one-memory.sqlite3"
 
 
 def capture_stdio(source_id: str, stdin: TextIO, output: TextIO) -> int:
@@ -88,15 +90,47 @@ def capture_stdio(source_id: str, stdin: TextIO, output: TextIO) -> int:
     del output
     if source_id not in CAPTURE_SOURCES:
         return 2
+    database = database_path()
+    if sdk_migration_capture_fenced(database.parent):
+        return 0
     try:
         payload = json.loads(stdin.read() or "")
     except json.JSONDecodeError:
         return 0
     try:
-        capture_hook(source_id, payload, database_path())
+        capture_hook(source_id, payload, database)
     except Exception:
         return 0
     return 0
+
+
+def sdk_migration_capture_fenced(data_dir: Path) -> bool:
+    """Ignore stale fences; a live migration or a failed one pauses hook writes.
+
+    A failed upgrade migration leaves the fence `frozen` (no pid): the home was
+    put back as it was before the upgrade and takes no writes until the next
+    migration attempt, which replaces the fence and lifts it on success.
+    """
+    marker = data_dir / SDK_MIGRATION_CAPTURE_FENCE
+    try:
+        document = json.loads(marker.read_text(encoding="utf-8"))
+        if isinstance(document, dict) and document.get("frozen") is True:
+            return True
+        pid = int(document["pid"])
+        if pid < 1:
+            raise ValueError("invalid migration fence pid")
+        os.kill(pid, 0)
+        return True
+    except FileNotFoundError:
+        return False
+    except ProcessLookupError:
+        marker.unlink(missing_ok=True)
+        return False
+    except PermissionError:
+        return True
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError, OSError):
+        marker.unlink(missing_ok=True)
+        return False
 
 
 def capture_hook(source_id: str, payload: object, database: Path) -> bool:
@@ -222,24 +256,19 @@ def record_capture_rejection(
 
 
 def _submit_live_memory(store: EvidenceStore, record: EvidenceRecord, *, changed: bool) -> None:
+    """Add the record to its conversation's live assembling row.
+
+    The turn rule decides what is written (`turn_batches`): a turn is
+    complete when the next user message arrives, batches are 5 turns or
+    8000 characters, and Core writes the rest after 10 quiet minutes.
+    """
     if not changed or not _sync_open(store.database_path, record.source_id):
         return
-    from one_memory.memory_processing import _conversation_chunks
     from one_memory.memory_server.durable_queue import DurableWriteQueue
-    from one_memory.memory_server.unified_entry import UnifiedWriteIntake
 
-    intake = UnifiedWriteIntake(DurableWriteQueue(store.database_path, evidence=store))
-    for chunk in _conversation_chunks(
-        store.list_conversation(record.evidence_id),
-        max_turns=12,
-        completed_only=True,
-    ):
-        if (
-            record in chunk
-            and any(item.role == "user" for item in chunk)
-            and any(item.role == "assistant" for item in chunk)
-        ):
-            intake.submit_records(chunk, priority="live")
+    DurableWriteQueue(store.database_path, evidence=store).assemble_live_records(
+        (record,), file_key=f"hook:{record.conversation_id}"
+    )
 
 
 def _conversation(payload: dict[str, object]) -> str | None:

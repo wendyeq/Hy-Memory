@@ -145,20 +145,25 @@ describe("memhub short-command contract", () => {
       [command.usage, command.alternative_usage ?? ""].join("\n"),
     ).join("\n");
     for (const shortForm of [
-      "memhub calls clear",
-      "memhub import-file upload",
-      "memhub import-file commit",
-      "memhub import-file discard",
-      "memhub notes add",
-      "memhub notes process",
+      "memhub memories add",
+      "memhub memories add-status",
       "memhub models setup",
+      "memhub models add",
+      "memhub models test",
       "memhub models activate",
       "memhub models edit",
-      "memhub extraction set",
-      "memhub graph width",
-      "memhub processing extract",
+      "memhub graph-width",
+      "memhub sources connect",
+      "memhub write submit",
+      "memhub write status",
+      "memhub memories update",
+      "memhub memories delete",
     ]) {
       expect(flattened).toContain(shortForm);
+    }
+    // No "note" concept and no plan files on the CLI surface.
+    for (const removed of ["memhub notes", "memhub calls", "--plan-file"]) {
+      expect(flattened).not.toContain(removed);
     }
     expect(COMMANDS.some((command) => command.name === "permission")).toBe(
       false,
@@ -212,7 +217,7 @@ describe("memhub short-command contract", () => {
   // but an earlier catalog text still claimed they were "尚不可用". A user
   // reading `help path` would not try a command that works.
   it("does not call the wired path/adapter commands unavailable", () => {
-    for (const name of ["path", "adapter"]) {
+    for (const name of ["scan-roots", "adapter"]) {
       const command = COMMANDS.find((entry) => entry.name === name);
       expect(command).toBeDefined();
       const text = [
@@ -278,7 +283,7 @@ describe("memhub short-command contract", () => {
     }
   });
 
-  it("keeps plan-file apply previews free of diagnostic side effects", {
+  it("keeps destructive previews free of diagnostic side effects", {
     timeout: 20_000,
   }, async () => {
     expect(
@@ -292,9 +297,10 @@ describe("memhub short-command contract", () => {
     );
     try {
       for (const [index, argv] of [
-        ["sources", "import", "--plan-file", path.join(root, "plan.json")],
-        ["models", "configure", "--plan-file", path.join(root, "plan.json")],
-        ["memories", "apply", "--plan-file", path.join(root, "plan.json")],
+        ["memories", "delete", "m-1"],
+        ["models", "remove", "44444444-4444-4444-8444-444444444444"],
+        ["backup", "restore", "--source", path.join(root, "backup.sqlite3")],
+        ["graph-width", "--decision", "rebuild_with_new"],
       ].entries()) {
         const dataDir = path.join(root, `data-${index}`);
         await import("node:fs/promises").then(({ mkdir }) =>
@@ -306,8 +312,8 @@ describe("memhub short-command contract", () => {
             stdio: "pipe",
           });
         } catch {
-          // The missing plan or stopped Runtime is expected; the guard is
-          // that even the failure path did not add a diagnostic file.
+          // A failure path is acceptable; the guard is that no preview adds
+          // a diagnostic file.
         }
         expect(await readdir(dataDir)).toEqual([]);
       }

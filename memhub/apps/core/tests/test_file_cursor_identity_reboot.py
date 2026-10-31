@@ -40,10 +40,21 @@ def _cursor(source, identity: str, *, checkpoint: str = "byte:4") -> SourceCurso
 
 
 def test_listed_file_identity_does_not_include_the_device_number(tmp_path: Path) -> None:
+    """A birth time is enough. Linux has no birth time here, so the device stays.
+
+    The old expectation was ``ino:<inode>:<birth>`` on every platform. This
+    machine reports no birth time, and ``file_cursor_identity`` then keeps
+    ``st_dev`` so an inode recycled on another mount is not the same file.
+    """
     source, path = _grant(tmp_path)
     details = os.stat(path)
+    birth = _changed_ns(details)
+    if birth == 0:
+        expected = f"ino:{details.st_ino}:0:{details.st_dev}"
+    else:
+        expected = f"ino:{details.st_ino}:{birth}"
 
-    assert source.file_identity == f"ino:{details.st_ino}:{_changed_ns(details)}"
+    assert source.file_identity == expected
     assert not source.file_identity.startswith(f"{details.st_dev}:")
 
 
@@ -74,10 +85,13 @@ def test_cross_device_legacy_inode_is_not_skipped_as_unchanged(tmp_path: Path) -
     for cursor in (legacy, migrated, birthless):
         assert is_unchanged(source, {source.safe_id: cursor}) is False
         assert resume_checkpoint(source, ScanOptions(cursors={source.safe_id: cursor})) == "byte:4"
-    assert cursor_identities_same_file(
-        f"ino:{details.st_ino}:0:{details.st_dev}",
-        f"ino:{details.st_ino}:0:{details.st_dev + 9}",
-    ) is False
+    assert (
+        cursor_identities_same_file(
+            f"ino:{details.st_ino}:0:{details.st_dev}",
+            f"ino:{details.st_ino}:0:{details.st_dev + 9}",
+        )
+        is False
+    )
 
 
 def test_a_complete_identity_can_still_skip_an_unchanged_file(tmp_path: Path) -> None:
@@ -98,11 +112,21 @@ def test_a_different_inode_still_starts_over(tmp_path: Path) -> None:
 
 
 def test_a_different_birth_does_not_resume(tmp_path: Path) -> None:
+    """Two real birth times must not share an offset.
+
+    With no birth time on the file, a stored birth is only an inode match.
+    Resume may try the old offset. The content anchor still has to match.
+    """
     source, path = _grant(tmp_path)
     details = os.stat(path)
-    cursor = _cursor(source, f"ino:{details.st_ino}:{_changed_ns(details) + 1}")
+    birth = _changed_ns(details)
+    cursor = _cursor(source, f"ino:{details.st_ino}:{birth + 1}")
+    checkpoint = resume_checkpoint(source, ScanOptions(cursors={source.safe_id: cursor}))
 
-    assert resume_checkpoint(source, ScanOptions(cursors={source.safe_id: cursor})) is None
+    if birth == 0:
+        assert checkpoint == "byte:4"
+    else:
+        assert checkpoint is None
 
 
 def test_reopening_the_job_store_rewrites_legacy_cursor_identity(tmp_path: Path) -> None:
@@ -148,19 +172,17 @@ def test_reopening_the_job_store_rewrites_legacy_cursor_identity(tmp_path: Path)
         )
 
     reopened = ImportJobStore(database)
-    stored = reopened.get_source_cursors(
-        user_id="local", source_id="fixture", operation="history"
-    )[source.safe_id]
-    live = reopened.get_source_cursors(
-        user_id="local", source_id="fixture", operation="sync"
-    )[source.safe_id]
+    stored = reopened.get_source_cursors(user_id="local", source_id="fixture", operation="history")[
+        source.safe_id
+    ]
+    live = reopened.get_source_cursors(user_id="local", source_id="fixture", operation="sync")[
+        source.safe_id
+    ]
 
     assert stored.file_identity == f"ino:{details.st_ino}"
     assert stored.checkpoint == "byte:4"
     assert live.file_identity == "not-a-device-inode"
-    assert (
-        resume_checkpoint(source, ScanOptions(cursors={source.safe_id: stored})) == "byte:4"
-    )
+    assert resume_checkpoint(source, ScanOptions(cursors={source.safe_id: stored})) == "byte:4"
     again = ImportJobStore(database)
     assert (
         again.get_source_cursors(user_id="local", source_id="fixture", operation="history")[
@@ -168,5 +190,3 @@ def test_reopening_the_job_store_rewrites_legacy_cursor_identity(tmp_path: Path)
         ].file_identity
         == stored.file_identity
     )
-
-

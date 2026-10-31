@@ -55,9 +55,22 @@ except Exception:
 from .client import HyMemoryClient
 from .inspector import MemoryInspector
 from .runtime import SharedRuntime
+from .snapshot import (
+    DataPlaneRestore,
+    DataPlaneSnapshot,
+    DataPlaneSnapshotRejected,
+    restore_local_data_plane,
+    snapshot_local_data_plane,
+)
 
 # ====== 配置 ======
 from .config import MemoryConfig
+from .embedding import (
+    EmbeddingDimensionMismatchError,
+    EmbeddingService,
+    EmbeddingServiceProtocol,
+)
+from .retrieval import AmbiguousMemoryIdError, MemoryKind, MemoryVariant
 
 # ====== Embedding 端点覆盖（per-call，不改 model/dims，只换接入端点）======
 from .core.embed_service import embed_endpoint_override
@@ -111,8 +124,20 @@ __all__ = [
     "HyMemoryClient",
     "MemoryInspector",
     "SharedRuntime",
+    "DataPlaneRestore",
+    "DataPlaneSnapshot",
+    "DataPlaneSnapshotRejected",
+    "restore_local_data_plane",
+    "snapshot_local_data_plane",
     # 配置
     "MemoryConfig",
+    # 公共扩展协议 / 精确读取类型
+    "EmbeddingService",
+    "EmbeddingServiceProtocol",
+    "EmbeddingDimensionMismatchError",
+    "MemoryKind",
+    "MemoryVariant",
+    "AmbiguousMemoryIdError",
     # Embedding 端点覆盖
     "embed_endpoint_override",
     # 高级 API

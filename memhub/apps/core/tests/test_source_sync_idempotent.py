@@ -79,6 +79,14 @@ def test_repeating_the_current_state_has_no_duplicate_runtime_work(tmp_path, mon
 
 
 def test_resume_backfills_content_that_arrived_while_paused(tmp_path, monkeypatch):
+    """A file that appears while sync is paused is imported by sync, not history.
+
+    Enabling sync used to open a history job and import the file that was
+    already there. That automatic history is gone, so the first enable does
+    not store it. The file written during the pause has no cursor yet, and
+    resume must read it with a sync job.
+    """
+
     async def scenario():
         monkeypatch.setattr("one_memory.model_presets._preset_data", lambda: None)
         home = tmp_path / "home"
@@ -117,7 +125,12 @@ def test_resume_backfills_content_that_arrived_while_paused(tmp_path, monkeypatc
             )
             for job in app.state.import_job_store.list_jobs():
                 await asyncio.wait_for(app.state.import_supervisor.wait(job.job_id), 10)
-            assert app.state.evidence_store.count() == 1
+            assert [
+                job.operation
+                for job in app.state.import_job_store.list_jobs()
+                if job.operation == "history"
+            ] == []
+            assert app.state.evidence_store.count() == 0
 
             paused = await client.post(
                 "/api/v1/sources/claude-code/sync-permission",
@@ -135,9 +148,82 @@ def test_resume_backfills_content_that_arrived_while_paused(tmp_path, monkeypatc
             catch_up = [
                 job for job in app.state.import_job_store.list_jobs() if job.job_id not in existing
             ]
-            assert catch_up
+            assert [job.operation for job in catch_up] == ["sync"]
             for job in catch_up:
                 await asyncio.wait_for(app.state.import_supervisor.wait(job.job_id), 10)
-            assert app.state.evidence_store.count() == 2
+            assert app.state.evidence_store.count() == 1
+            assert any(
+                "while-paused" in record.verbatim
+                for record in app.state.evidence_store.list_extractable()
+            )
+
+    asyncio.run(scenario())
+
+
+def test_resume_leaves_an_old_uncursored_file_at_eof(tmp_path, monkeypatch):
+    """A file that already existed when sync was turned off is not imported.
+
+    Turning sync off anchors files that have no cursor yet. A file created
+    after that stays without a cursor, and resume reads only that file.
+    """
+
+    async def scenario():
+        monkeypatch.setattr("one_memory.model_presets._preset_data", lambda: None)
+        home = tmp_path / "home"
+        root = home / ".claude/projects"
+        root.mkdir(parents=True)
+        app = create_app(
+            Settings(
+                _env_file=None,
+                data_dir=tmp_path / "data",
+                source_home=home,
+                api_token=SecretStr("test"),
+                imports_enabled=True,
+                automatic_memory_processing=False,
+                live_sync_watch_enabled=False,
+                live_sync_interval_seconds=3600,
+            ),
+            source_catalog=build_source_catalog(home=home, environment={}),
+            secret_store=InMemorySecretStore(),
+        )
+        async with (
+            app.router.lifespan_context(app),
+            AsyncClient(
+                transport=ASGITransport(app=app),
+                base_url="http://test",
+                headers={"Authorization": "Bearer test"},
+            ) as client,
+        ):
+            await client.post(
+                "/api/v1/sources/claude-code/authorize",
+                json=await authorized_request(client, "claude-code"),
+            )
+            enabled = await client.post(
+                "/api/v1/sources/claude-code/sync-permission",
+                json={"enabled": True},
+            )
+            assert enabled.status_code == 200
+            write_turn(root, "old-untracked")
+            paused = await client.post(
+                "/api/v1/sources/claude-code/sync-permission",
+                json={"enabled": False},
+            )
+            assert paused.status_code == 200
+            write_turn(root, "while-paused")
+            resumed = await client.post(
+                "/api/v1/sources/claude-code/sync-permission",
+                json={"enabled": True},
+            )
+            assert resumed.status_code == 200
+            for job in app.state.import_job_store.list_jobs():
+                await asyncio.wait_for(app.state.import_supervisor.wait(job.job_id), 10)
+            texts = [record.verbatim for record in app.state.evidence_store.list_extractable()]
+            assert any("while-paused" in text for text in texts)
+            assert all("old-untracked" not in text for text in texts)
+            assert [
+                job.operation
+                for job in app.state.import_job_store.list_jobs()
+                if job.operation == "history"
+            ] == []
 
     asyncio.run(scenario())
