@@ -2317,34 +2317,17 @@ def create_app(
         return SourceSyncState(source_id=source_id, sync_enabled=request.enabled)
 
     async def _prepare_source_resume(source_id: str) -> None:
-        """Prepare catch-up work before committing the new desired state."""
+        """Anchor live cursors before sync. Do not open a history job.
+
+        An unfinished automatic history already on disk is tightened to one
+        day. A person starts a new history job explicitly.
+        """
         await _live_sync(app).initialize_source(source_id, baseline_missing_files=True)
-        cutoff = resume_history_after()
         await asyncio.to_thread(
             _job_store(app).tighten_automatic_history,
-            history_after=cutoff,
+            history_after=resume_history_after(),
             user_id="local",
             source_id=source_id,
-        )
-        active = {
-            ImportStatus.PENDING,
-            ImportStatus.PAUSED,
-            ImportStatus.INTERRUPTED,
-            ImportStatus.RUNNING,
-            ImportStatus.FAILED,
-        }
-        if any(
-            job.source_id == source_id and job.operation == "history" and job.status in active
-            for job in _job_store(app).list_jobs()
-        ):
-            return
-        await asyncio.to_thread(
-            _job_store(app).create,
-            user_id="local",
-            source_id=source_id,
-            operation="history",
-            history_after=cutoff,
-            history_intent="automatic",
         )
 
     async def _activate_source_resume(source_id: str) -> None:

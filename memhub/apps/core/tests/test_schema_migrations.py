@@ -105,13 +105,13 @@ def test_old_active_job_index_lets_a_sync_sit_beside_paused_history(tmp_path) ->
     assert reopened.require(history.job_id).status is ImportStatus.PAUSED
 
 
-def test_a_never_published_snapshot_failure_opens_a_new_history_job(tmp_path) -> None:
+def test_a_never_published_snapshot_failure_does_not_open_a_history_job(tmp_path) -> None:
     """Cursor's open database failed the snapshot, then every retry was incomplete.
 
     The failed row keeps the history slot, and the same job id cannot capture
-    again. Startup has to cancel that row and open a new pending job. History
-    no longer reads through a snapshot, so a leftover snapshot directory does
-    not keep the row; a different failure still stays where it is.
+    again. Startup cancels that row. It used to open a replacement history
+    job. That automatic import is gone. A different failure still stays failed.
+    A leftover snapshot directory does not keep the cancelled row.
     """
     database = tmp_path / "one-memory.sqlite3"
     snapshots = tmp_path / "import-snapshots"
@@ -127,13 +127,11 @@ def test_a_never_published_snapshot_failure_opens_a_new_history_job(tmp_path) ->
 
     opened = store.replace_never_published_snapshot_failures()
 
+    assert opened == []
     assert store.require(stuck.job_id).status is ImportStatus.CANCELLED
-    assert sorted(job.source_id for job in opened) == ["claude-code", "cursor"]
-    assert stuck.job_id not in {job.job_id for job in opened}
-    assert all(job.status is ImportStatus.PENDING for job in opened)
-    assert all(job.operation == "history" for job in opened)
-    assert store.require(limited.job_id).status is ImportStatus.FAILED
     assert store.require(published.job_id).status is ImportStatus.CANCELLED
+    assert store.require(limited.job_id).status is ImportStatus.FAILED
+    assert [job.job_id for job in store.list_jobs() if job.status is ImportStatus.PENDING] == []
 
 
 def _fail(store: ImportJobStore, source_id: str, reasons: tuple[str, ...]):

@@ -1,4 +1,4 @@
-"""Startup and sync resume must not open an unbounded history import."""
+"""Startup and sync resume must not open a history import."""
 
 import asyncio
 import json
@@ -42,7 +42,16 @@ def _assert_one_day(history_after: datetime | None, *, started: datetime) -> Non
     assert timedelta(hours=23) < delta < timedelta(hours=25)
 
 
-def test_core_startup_creates_a_one_day_history_window(tmp_path, monkeypatch) -> None:
+async def _finish_recovery(app) -> None:
+    task = app.state.recovery_task
+    if task is not None:
+        await task
+    assert app.state.recovery == "done"
+    assert app.state.recovery_failed_steps == ()
+
+
+def test_core_startup_does_not_create_a_history_job(tmp_path, monkeypatch) -> None:
+    """Startup recovery used to open an automatic history job. It no longer does."""
     monkeypatch.setattr("one_memory.model_presets._preset_data", lambda: None)
     home = tmp_path / "home"
     root = home / ".claude" / "projects"
@@ -66,7 +75,6 @@ def test_core_startup_creates_a_one_day_history_window(tmp_path, monkeypatch) ->
         ),
         encoding="utf-8",
     )
-    started = datetime.now(UTC)
     app = create_app(
         _settings(tmp_path),
         source_catalog=build_source_catalog(home=home, environment={}),
@@ -75,18 +83,22 @@ def test_core_startup_creates_a_one_day_history_window(tmp_path, monkeypatch) ->
 
     async def scenario():
         async with app.router.lifespan_context(app):
-            jobs = [
-                job
+            await _finish_recovery(app)
+            assert [
+                job.operation
                 for job in app.state.import_job_store.list_jobs()
-                if job.source_id == "claude-code" and job.operation == "history"
-            ]
-            assert len(jobs) == 1
-            _assert_one_day(jobs[0].history_after, started=started)
+                if job.source_id == "claude-code"
+            ] == []
 
     asyncio.run(scenario())
 
 
-def test_sync_permission_resume_creates_a_one_day_history_window(tmp_path, monkeypatch) -> None:
+def test_sync_permission_resume_does_not_create_a_history_job(tmp_path, monkeypatch) -> None:
+    """Enabling sync anchors cursors and does not open history.
+
+    A later sync request still opens a sync job. A history job still opens
+    when the caller asks for one.
+    """
     monkeypatch.setattr("one_memory.model_presets._preset_data", lambda: None)
     home = tmp_path / "home"
     (home / ".claude" / "projects").mkdir(parents=True)
@@ -105,24 +117,37 @@ def test_sync_permission_resume_creates_a_one_day_history_window(tmp_path, monke
                 headers={"Authorization": "Bearer test"},
             ) as client,
         ):
+            await _finish_recovery(app)
             authorized = await client.post(
                 "/api/v1/sources/claude-code/authorize",
                 json=await authorized_request(client, "claude-code"),
             )
             assert authorized.status_code == 200
-            started = datetime.now(UTC)
             enabled = await client.post(
                 "/api/v1/sources/claude-code/sync-permission",
                 json={"enabled": True},
             )
             assert enabled.status_code == 200
-            jobs = [
+            assert [
+                job.operation
+                for job in app.state.import_job_store.list_jobs()
+                if job.source_id == "claude-code" and job.operation == "history"
+            ] == []
+            synced = await client.post("/api/v1/sources/claude-code/sync")
+            assert synced.status_code == 200
+            assert synced.json()["operation"] == "sync"
+            manual = await client.post(
+                "/api/v1/import-jobs",
+                json={"source_id": "claude-code", "operation": "history"},
+            )
+            assert manual.status_code == 200
+            assert manual.json()["operation"] == "history"
+            history = [
                 job
                 for job in app.state.import_job_store.list_jobs()
                 if job.source_id == "claude-code" and job.operation == "history"
             ]
-            assert len(jobs) == 1
-            _assert_one_day(jobs[0].history_after, started=started)
+            assert [job.job_id for job in history] == [manual.json()["job_id"]]
 
     asyncio.run(scenario())
 
@@ -210,6 +235,7 @@ def test_startup_bounds_a_windowless_pending_history(tmp_path, monkeypatch) -> N
 
     async def scenario():
         async with app.router.lifespan_context(app):
+            await _finish_recovery(app)
             job = next(
                 job
                 for job in app.state.import_job_store.list_jobs()
@@ -286,6 +312,7 @@ def test_startup_keeps_an_explicit_full_import(tmp_path, monkeypatch) -> None:
 
     async def scenario():
         async with app.router.lifespan_context(app):
+            await _finish_recovery(app)
             job = app.state.import_job_store.require("preset-history")
             assert job.history_after is None
             finished = await asyncio.wait_for(app.state.import_supervisor.wait(job.job_id), 30)
