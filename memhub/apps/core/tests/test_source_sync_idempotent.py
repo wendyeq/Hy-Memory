@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import os
+import sqlite3
 
 from httpx import ASGITransport, AsyncClient
 from pydantic import SecretStr
@@ -138,6 +140,7 @@ def test_resume_backfills_content_that_arrived_while_paused(tmp_path, monkeypatc
             )
             assert paused.json()["sync_enabled"] is False
             write_turn(root, "while-paused")
+            _set_mtime(root / "while-paused.jsonl", _paused_ns(tmp_path) + 5_000_000_000)
             existing = {job.job_id for job in app.state.import_job_store.list_jobs()}
 
             resumed = await client.post(
@@ -158,3 +161,88 @@ def test_resume_backfills_content_that_arrived_while_paused(tmp_path, monkeypatc
             )
 
     asyncio.run(scenario())
+
+
+def test_resume_leaves_an_old_uncursored_file_at_eof(tmp_path, monkeypatch):
+    """A file that already existed at pause, with no cursor, is not imported.
+
+    Reading every never-cursored file from byte 0 would be a history import
+    under the sync operation. The pause time recorded when sync is turned off
+    keeps those older files at EOF. A file created after that time is still read.
+    """
+
+    async def scenario():
+        monkeypatch.setattr("one_memory.model_presets._preset_data", lambda: None)
+        home = tmp_path / "home"
+        root = home / ".claude/projects"
+        root.mkdir(parents=True)
+        app = create_app(
+            Settings(
+                _env_file=None,
+                data_dir=tmp_path / "data",
+                source_home=home,
+                api_token=SecretStr("test"),
+                imports_enabled=True,
+                automatic_memory_processing=False,
+                live_sync_watch_enabled=False,
+                live_sync_interval_seconds=3600,
+            ),
+            source_catalog=build_source_catalog(home=home, environment={}),
+            secret_store=InMemorySecretStore(),
+        )
+        async with (
+            app.router.lifespan_context(app),
+            AsyncClient(
+                transport=ASGITransport(app=app),
+                base_url="http://test",
+                headers={"Authorization": "Bearer test"},
+            ) as client,
+        ):
+            await client.post(
+                "/api/v1/sources/claude-code/authorize",
+                json=await authorized_request(client, "claude-code"),
+            )
+            enabled = await client.post(
+                "/api/v1/sources/claude-code/sync-permission",
+                json={"enabled": True},
+            )
+            assert enabled.status_code == 200
+            write_turn(root, "old-untracked")
+            paused = await client.post(
+                "/api/v1/sources/claude-code/sync-permission",
+                json={"enabled": False},
+            )
+            assert paused.status_code == 200
+            paused_ns = _paused_ns(tmp_path)
+            _set_mtime(root / "old-untracked.jsonl", paused_ns - 5_000_000_000)
+            write_turn(root, "while-paused")
+            _set_mtime(root / "while-paused.jsonl", paused_ns + 5_000_000_000)
+            resumed = await client.post(
+                "/api/v1/sources/claude-code/sync-permission",
+                json={"enabled": True},
+            )
+            assert resumed.status_code == 200
+            for job in app.state.import_job_store.list_jobs():
+                await asyncio.wait_for(app.state.import_supervisor.wait(job.job_id), 10)
+            texts = [record.verbatim for record in app.state.evidence_store.list_extractable()]
+            assert any("while-paused" in text for text in texts)
+            assert all("old-untracked" not in text for text in texts)
+            assert [
+                job.operation
+                for job in app.state.import_job_store.list_jobs()
+                if job.operation == "history"
+            ] == []
+
+    asyncio.run(scenario())
+
+
+def _paused_ns(tmp_path) -> int:
+    database = tmp_path / "data" / "one-memory.sqlite3"
+    with sqlite3.connect(database) as connection:
+        row = connection.execute("SELECT paused_at FROM source_sync_pause").fetchone()
+    assert row is not None
+    return int(row[0])
+
+
+def _set_mtime(path, mtime_ns: int) -> None:
+    os.utime(path, ns=(mtime_ns, mtime_ns))

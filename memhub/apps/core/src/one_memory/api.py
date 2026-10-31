@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 import sys
+import tempfile
 import time
 from collections.abc import (
     AsyncIterator,
@@ -405,6 +406,26 @@ RESUME_HISTORY_WINDOW = timedelta(days=1)
 def resume_history_after(now: datetime | None = None) -> datetime:
     """Cutoff for a history job opened by startup or sync resume."""
     return (now or datetime.now(UTC)) - RESUME_HISTORY_WINDOW
+
+
+def _source_clock_ns(root: Path | None) -> int:
+    """Now, on the same filesystem clock as source file mtimes.
+
+    ``time.time_ns()`` can sit ahead of ``st_mtime_ns``. A cutoff taken from
+    the wall clock then treats a file saved just after pause as if it had
+    already been there.
+    """
+    if root is not None and root.is_dir():
+        try:
+            descriptor, name = tempfile.mkstemp(prefix=".memhub-pause-", dir=root)
+            os.close(descriptor)
+            try:
+                return os.stat(name).st_mtime_ns
+            finally:
+                os.unlink(name)
+        except OSError:
+            pass
+    return time.time_ns()
 
 
 class ConnectSourcesResponse(BaseModel):
@@ -2292,6 +2313,22 @@ def create_app(
                 await _activate_source_resume(source_id)
             await _refresh_live_watch(app)
             raise _sync_refused("sync_config_write_failed") from error
+        if not request.enabled:
+            try:
+                grant = await asyncio.to_thread(
+                    _grant_store(app).authorized_root,
+                    user_id="local",
+                    source_id=source_id,
+                )
+            except SourceAccessError:
+                grant = None
+            paused_ns = _source_clock_ns(None if grant is None else grant.root)
+            await asyncio.to_thread(
+                _job_store(app).mark_sync_paused,
+                user_id="local",
+                source_id=source_id,
+                paused_ns=paused_ns,
+            )
         try:
             if request.enabled:
                 try:
@@ -2319,8 +2356,10 @@ def create_app(
     async def _prepare_source_resume(source_id: str) -> None:
         """Repair live cursors before sync. Do not open a history job.
 
-        A file that appears while sync is off must stay without a cursor.
-        Baselining it to EOF would drop the bytes the next sync should read.
+        Missing files are not all read from byte 0. A file older than the
+        recorded pause stays at EOF. A file newer than that pause is left
+        without a cursor so the following sync reads it. With no recorded
+        pause, every missing file stays at EOF.
         An existing cursor is still rebased when its anchor is dead.
         An unfinished automatic history already on disk is tightened to one
         day. A person starts a new history job explicitly.
