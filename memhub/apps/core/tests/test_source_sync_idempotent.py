@@ -79,6 +79,14 @@ def test_repeating_the_current_state_has_no_duplicate_runtime_work(tmp_path, mon
 
 
 def test_resume_backfills_content_that_arrived_while_paused(tmp_path, monkeypatch):
+    """A file that appears while sync is paused is imported by sync, not history.
+
+    Enabling sync used to open a history job and import the file that was
+    already there. That automatic history is gone, so the first enable does
+    not store it. The file written during the pause has no cursor yet, and
+    resume must read it with a sync job.
+    """
+
     async def scenario():
         monkeypatch.setattr("one_memory.model_presets._preset_data", lambda: None)
         home = tmp_path / "home"
@@ -117,7 +125,12 @@ def test_resume_backfills_content_that_arrived_while_paused(tmp_path, monkeypatc
             )
             for job in app.state.import_job_store.list_jobs():
                 await asyncio.wait_for(app.state.import_supervisor.wait(job.job_id), 10)
-            assert app.state.evidence_store.count() == 1
+            assert [
+                job.operation
+                for job in app.state.import_job_store.list_jobs()
+                if job.operation == "history"
+            ] == []
+            assert app.state.evidence_store.count() == 0
 
             paused = await client.post(
                 "/api/v1/sources/claude-code/sync-permission",
@@ -135,9 +148,13 @@ def test_resume_backfills_content_that_arrived_while_paused(tmp_path, monkeypatc
             catch_up = [
                 job for job in app.state.import_job_store.list_jobs() if job.job_id not in existing
             ]
-            assert catch_up
+            assert [job.operation for job in catch_up] == ["sync"]
             for job in catch_up:
                 await asyncio.wait_for(app.state.import_supervisor.wait(job.job_id), 10)
-            assert app.state.evidence_store.count() == 2
+            assert app.state.evidence_store.count() == 1
+            assert any(
+                "while-paused" in record.verbatim
+                for record in app.state.evidence_store.list_extractable()
+            )
 
     asyncio.run(scenario())

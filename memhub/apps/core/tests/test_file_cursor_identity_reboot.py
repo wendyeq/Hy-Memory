@@ -85,10 +85,13 @@ def test_cross_device_legacy_inode_is_not_skipped_as_unchanged(tmp_path: Path) -
     for cursor in (legacy, migrated, birthless):
         assert is_unchanged(source, {source.safe_id: cursor}) is False
         assert resume_checkpoint(source, ScanOptions(cursors={source.safe_id: cursor})) == "byte:4"
-    assert cursor_identities_same_file(
-        f"ino:{details.st_ino}:0:{details.st_dev}",
-        f"ino:{details.st_ino}:0:{details.st_dev + 9}",
-    ) is False
+    assert (
+        cursor_identities_same_file(
+            f"ino:{details.st_ino}:0:{details.st_dev}",
+            f"ino:{details.st_ino}:0:{details.st_dev + 9}",
+        )
+        is False
+    )
 
 
 def test_a_complete_identity_can_still_skip_an_unchanged_file(tmp_path: Path) -> None:
@@ -169,19 +172,17 @@ def test_reopening_the_job_store_rewrites_legacy_cursor_identity(tmp_path: Path)
         )
 
     reopened = ImportJobStore(database)
-    stored = reopened.get_source_cursors(
-        user_id="local", source_id="fixture", operation="history"
-    )[source.safe_id]
-    live = reopened.get_source_cursors(
-        user_id="local", source_id="fixture", operation="sync"
-    )[source.safe_id]
+    stored = reopened.get_source_cursors(user_id="local", source_id="fixture", operation="history")[
+        source.safe_id
+    ]
+    live = reopened.get_source_cursors(user_id="local", source_id="fixture", operation="sync")[
+        source.safe_id
+    ]
 
     assert stored.file_identity == f"ino:{details.st_ino}"
     assert stored.checkpoint == "byte:4"
     assert live.file_identity == "not-a-device-inode"
-    assert (
-        resume_checkpoint(source, ScanOptions(cursors={source.safe_id: stored})) == "byte:4"
-    )
+    assert resume_checkpoint(source, ScanOptions(cursors={source.safe_id: stored})) == "byte:4"
     again = ImportJobStore(database)
     assert (
         again.get_source_cursors(user_id="local", source_id="fixture", operation="history")[
@@ -189,5 +190,3 @@ def test_reopening_the_job_store_rewrites_legacy_cursor_identity(tmp_path: Path)
         ].file_identity
         == stored.file_identity
     )
-
-

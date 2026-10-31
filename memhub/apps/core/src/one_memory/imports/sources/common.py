@@ -1123,9 +1123,7 @@ def _same_file(previous: SourceCursor, source_file: AuthorizedSourceFile) -> boo
     )
 
 
-def _unchanged_cursor_identity(
-    previous: SourceCursor, source_file: AuthorizedSourceFile
-) -> bool:
+def _unchanged_cursor_identity(previous: SourceCursor, source_file: AuthorizedSourceFile) -> bool:
     """True when the cursor names this file and the same WAL version.
 
     Inode equality alone is not enough to skip a file. A legacy cursor that

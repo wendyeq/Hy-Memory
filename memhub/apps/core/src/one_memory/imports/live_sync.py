@@ -8,7 +8,7 @@ from contextlib import suppress
 from datetime import UTC, datetime
 from enum import StrEnum
 from functools import partial
-from typing import Protocol, runtime_checkable
+from typing import Protocol, cast, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
 
@@ -18,6 +18,7 @@ from one_memory.diagnostic_log import (
     diagnostic_exception,
     record_database_error,
 )
+from one_memory.imports.access import AuthorizedSourceFile
 from one_memory.imports.adapters import (
     ScanCursorTouch,
     ScanFailure,
@@ -399,12 +400,16 @@ class PollingLiveSyncSupervisor:
             )
         )
 
-    async def _baseline_files(self, adapter: object) -> tuple[dict, dict]:
+    async def _baseline_files(
+        self, adapter: object
+    ) -> tuple[dict[str, SourceCursor], dict[str, AuthorizedSourceFile]]:
         if not isinstance(adapter, _LiveBaselineAdapter):
             return {}, {}
         baselines = await adapter.live_baseline()
-        files = getattr(baselines, "files", None)
-        return baselines, dict(files) if isinstance(files, dict) else {}
+        raw_files = getattr(baselines, "files", None)
+        if not isinstance(raw_files, dict):
+            return baselines, {}
+        return baselines, cast(dict[str, AuthorizedSourceFile], dict(raw_files))
 
     async def _run_sync(
         self, source_id: str, *, wait_for_completion: bool = True

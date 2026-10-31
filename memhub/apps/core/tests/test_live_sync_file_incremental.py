@@ -24,11 +24,11 @@ from one_memory.imports.jobs import ImportJobStore, ImportStatus
 from one_memory.imports.live_sync import PollingLiveSyncSupervisor
 from one_memory.imports.models import EvidenceInput, EvidenceOrigin, OriginMetadata, WrittenBy
 from one_memory.imports.sources import openclaw as openclaw_module
+from one_memory.imports.sources.claude_code import create_claude_code_adapter
 from one_memory.imports.sources.openclaw import (
     OPENCLAW_DESCRIPTOR,
     OpenClawSourceAdapter,
 )
-from one_memory.imports.sources.claude_code import create_claude_code_adapter
 from one_memory.imports.sources.workbuddy import create_workbuddy_adapter
 from one_memory.imports.storage import EvidenceStore
 from one_memory.imports.supervisor import ImportSupervisor

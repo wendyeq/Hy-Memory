@@ -125,9 +125,8 @@ def test_a_never_published_snapshot_failure_does_not_open_a_history_job(tmp_path
     published = _fail(store, "claude-code", ("snapshot_incomplete",))
     (snapshots / published.job_id).mkdir(parents=True)
 
-    opened = store.replace_never_published_snapshot_failures()
+    store.replace_never_published_snapshot_failures()
 
-    assert opened == []
     assert store.require(stuck.job_id).status is ImportStatus.CANCELLED
     assert store.require(published.job_id).status is ImportStatus.CANCELLED
     assert store.require(limited.job_id).status is ImportStatus.FAILED

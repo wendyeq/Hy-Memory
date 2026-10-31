@@ -325,9 +325,7 @@ def test_startup_keeps_an_explicit_full_import(tmp_path, monkeypatch) -> None:
 
 def test_automatic_reuse_does_not_narrow_an_explicit_full_import(tmp_path) -> None:
     store = ImportJobStore(tmp_path / "jobs.sqlite3")
-    explicit = store.create(
-        user_id="local", source_id="claude-code", history_intent="explicit"
-    )
+    explicit = store.create(user_id="local", source_id="claude-code", history_intent="explicit")
     reused = store.create(
         user_id="local",
         source_id="claude-code",

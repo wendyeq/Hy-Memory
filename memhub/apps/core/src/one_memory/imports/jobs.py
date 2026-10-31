@@ -488,9 +488,7 @@ class ImportJobStore:
         cutoff = history_after
         if cutoff.tzinfo is None:
             cutoff = cutoff.replace(tzinfo=UTC)
-        current = (
-            datetime.fromisoformat(row["history_after"]) if row["history_after"] else None
-        )
+        current = datetime.fromisoformat(row["history_after"]) if row["history_after"] else None
         if current is not None:
             if current.tzinfo is None:
                 current = current.replace(tzinfo=UTC)
@@ -506,7 +504,7 @@ class ImportJobStore:
         )
         return True
 
-    def replace_never_published_snapshot_failures(self) -> list[ImportJob]:
+    def replace_never_published_snapshot_failures(self) -> None:
         """Cancel a history that failed inside the old snapshot copy.
 
         History no longer copies a snapshot, so a copy that was cancelled or
@@ -521,7 +519,6 @@ class ImportJobStore:
             if not reasons or not reasons <= self._UNPUBLISHED_SNAPSHOT_FAILURES:
                 continue
             self.transition(job.job_id, ImportStatus.CANCELLED)
-        return []
 
     def transition(self, job_id: str, target: ImportStatus) -> ImportJob:
         current = self.require(job_id)

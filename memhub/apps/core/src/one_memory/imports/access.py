@@ -432,12 +432,7 @@ def _parse_cursor_identity(value: str) -> tuple[int, int | None] | None:
         return int(parts[1]), None
     if len(parts) == 2 and parts[0] == "ino" and parts[1].isdigit():
         return int(parts[1]), None
-    if (
-        len(parts) == 3
-        and parts[0] == "ino"
-        and parts[1].isdigit()
-        and parts[2].isdigit()
-    ):
+    if len(parts) == 3 and parts[0] == "ino" and parts[1].isdigit() and parts[2].isdigit():
         birth = int(parts[2])
         return int(parts[1]), None if birth == 0 else birth
     if (

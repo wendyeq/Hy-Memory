@@ -254,6 +254,13 @@ def test_sync_runtime_failure_does_not_commit_the_requested_state(tmp_path, monk
 
 
 def test_startup_reconciles_enabled_source_from_config(tmp_path, monkeypatch):
+    """Startup no longer opens a history job for a sync-enabled source.
+
+    The old assertion required that history catch-up. A file with no live
+    cursor is anchored at EOF so realtime sync does not reread it as history.
+    Content that arrives later, after that cursor exists, is what sync reads.
+    """
+
     async def scenario():
         monkeypatch.setattr("one_memory.model_presets._preset_data", lambda: None)
         home = tmp_path / "home"
@@ -297,14 +304,13 @@ def test_startup_reconciles_enabled_source_from_config(tmp_path, monkeypatch):
         async with restored.router.lifespan_context(restored):
             # The reconcile runs after readiness, in recovery.
             await restored.state.recovery_task
+            assert restored.state.recovery == "done"
             history = [
                 job
                 for job in restored.state.import_job_store.list_jobs()
                 if job.source_id == "claude-code" and job.operation == "history"
             ]
-            assert history, "startup must create the catch-up work described by config.json"
-            for job in history:
-                await asyncio.wait_for(restored.state.import_supervisor.wait(job.job_id), timeout=5)
-            assert restored.state.evidence_store.count() == 1
+            assert history == []
+            assert restored.state.evidence_store.count() == 0
 
     asyncio.run(scenario())

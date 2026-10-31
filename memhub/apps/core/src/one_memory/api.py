@@ -2317,12 +2317,15 @@ def create_app(
         return SourceSyncState(source_id=source_id, sync_enabled=request.enabled)
 
     async def _prepare_source_resume(source_id: str) -> None:
-        """Anchor live cursors before sync. Do not open a history job.
+        """Repair live cursors before sync. Do not open a history job.
 
+        A file that appears while sync is off must stay without a cursor.
+        Baselining it to EOF would drop the bytes the next sync should read.
+        An existing cursor is still rebased when its anchor is dead.
         An unfinished automatic history already on disk is tightened to one
         day. A person starts a new history job explicitly.
         """
-        await _live_sync(app).initialize_source(source_id, baseline_missing_files=True)
+        await _live_sync(app).initialize_source(source_id, baseline_missing_files=False)
         await asyncio.to_thread(
             _job_store(app).tighten_automatic_history,
             history_after=resume_history_after(),
@@ -2344,6 +2347,10 @@ def create_app(
                     ImportStatus.FAILED,
                 }:
                     _supervisor(app).resume(job.job_id)
+            # Incremental sync, not a history job. A file that showed up
+            # while sync was paused is read from its start. A file that
+            # already has a cursor is read from that cursor.
+            await _live_sync(app).trigger(source_id)
         except SourceAccessError as error:
             raise HTTPException(status_code=409, detail=error.code) from None
         if app.state.settings.automatic_memory_processing:
