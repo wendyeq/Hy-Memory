@@ -5,6 +5,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { useMemoryLanguage } from "./memory-language";
 import { useMediaPreference } from "./use-media-preference";
 
 type Phase = "closed" | "opening" | "open" | "closing";
@@ -14,12 +15,16 @@ export function MemoryEvidencePanel({
   onClose,
   children,
   suspended = false,
+  scrollResetKey,
 }: {
   open: boolean;
   onClose(): void;
   children: ReactNode;
   suspended?: boolean;
+  /** A different detail starts at the top instead of inheriting old scroll. */
+  scrollResetKey?: string | null;
 }) {
+  const { text } = useMemoryLanguage();
   const compact = useMediaPreference("(max-width: 1100px)");
   const reduceMotion = useMediaPreference("(prefers-reduced-motion: reduce)");
   const reduceTransparency = useMediaPreference(
@@ -35,8 +40,20 @@ export function MemoryEvidencePanel({
     reduceMotion,
     reduceTransparency,
   });
+  const priorScrollOwner = useRef({ key: scrollResetKey, suspended });
   const present = !compact || open || phase !== "closed";
   const modal = compact && present && !suspended;
+
+  useLayoutEffect(() => {
+    const previous = priorScrollOwner.current;
+    priorScrollOwner.current = { key: scrollResetKey, suspended };
+    if (
+      !suspended &&
+      (previous.key !== scrollResetKey || previous.suspended) &&
+      panel.current
+    )
+      panel.current.scrollTop = 0;
+  }, [scrollResetKey, suspended]);
 
   useLayoutEffect(() => {
     const element = panel.current;
@@ -135,7 +152,7 @@ export function MemoryEvidencePanel({
       className="map-inspector"
       {...(modal ? { role: "dialog", "aria-modal": !suspended } : {})}
       inert={suspended}
-      aria-label="记忆与原文"
+      aria-label={text("记忆与原文")}
       data-tour-id="memory-original-pane"
       tabIndex={-1}
       hidden={!present || (compact && suspended)}

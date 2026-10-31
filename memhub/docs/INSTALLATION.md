@@ -1,13 +1,13 @@
 # MemHub 安装与发行
 
-MemHub `v1.0.3`（build 7）的发行目标如下：
+MemHub `v1.0.5`（build 36）的发行目标如下：
 
 | 平台 | 发行物 | 构建与验收 |
 | --- | --- | --- |
 | Linux x64 | Runtime tar.gz | GitHub Actions 原生 x64 runner |
 | Linux arm64 | Runtime tar.gz | GitHub Actions 原生 arm64 runner |
 | macOS arm64 | DMG 与 Runtime tar.gz | Developer ID 签名、公证和原生 arm64 验收 |
-| macOS x64 | DMG 与 Runtime tar.gz | Developer ID 签名、公证和原生 Intel 验收 |
+| macOS x64 | 无 | 本版本不提供 Intel 构建 |
 | Windows | 无 | 当前不支持 |
 
 正式支持以对应 GitHub Release 的 `release-manifest.json` 为准。Manifest 记录版本、
@@ -39,7 +39,8 @@ memhub status
 4. 校验 HTTPS URL、重定向域名、文件大小与 SHA-256；
 5. 安全解压并交叉验证内部 manifest 的版本、build、commit、协议和逐文件哈希；
 6. 调用现有安装事务，注册用户级服务和受管 CLI 链接；
-7. 失败时回滚，并保留当前 Runtime 和 Memory 数据。
+7. 记忆数据迁移开始前失败会回滚，并保留当前 Runtime 和 Memory 数据；迁移开始后失败
+   保留新版本、拒绝启动（不会用旧版本打开数据），并输出迁移日志与反馈地址。
 
 不带 `--yes` 的 `memhub install` 只下载较小的 Release manifest 并展示计划；显式确认后才
 下载完整 Runtime。npm `postinstall` 不下载 Runtime、不注册服务、不修改 shell profile。
@@ -100,15 +101,16 @@ Downloader 使用标准 `HTTPS_PROXY`/`https_proxy` 与 `NO_PROXY`/`no_proxy` �
 - `npm uninstall -g memhub-cli`：只删除 npm CLI；不停止或删除受管 Runtime，不删除 Memory。
   完整 fake Release 验收会在 Runtime 运行中执行真实 npm uninstall，并再次验证
   systemd、`current`、受管 `memhub`、doctor 和 SQLite 均仍可用。
-- `memhub upgrade`：下载并校验新 Runtime，健康检查失败时恢复旧版本。
+- `memhub upgrade`：下载并校验新 Runtime；旧版本写过的数据会先迁移到 SDK 数据面（先做完整备份，终端显示进度），再启动新 Runtime。迁移失败时恢复旧版本；迁移完成后旧版本无法打开数据，健康检查失败时保留新版本并提示 `memhub restart` / `memhub doctor`。
 - `memhub uninstall`：停止并移除受管服务、Runtime versions/current 和受管 CLI 链接；
   默认保留数据。
 - `memhub delete-data`：唯一删除 Memory 的命令；Runtime 必须已停止，并要求 `--yes` 与
   `--confirm <精确数据路径>` 两次确认。
 
-默认数据目录是 `~/.one-memory`。Python Core 是唯一业务数据写入者，SQLite 数据不位于
-npm package、App 临时目录或受管 Runtime 的版本目录中。Python Core 及其依赖由 Runtime
-携带，不会向用户的系统 Python 安装 package。
+默认数据目录是 `~/.one-memory`。Python Core 是 MemHub 管理库的唯一写入者；
+memory/raw 数据平面只通过 Hy Memory SDK 写入。SQLite 数据不位于 npm package、
+App 临时目录或受管 Runtime 的版本目录中。Python Core 及其依赖由 Runtime 携带，
+不会向用户的系统 Python 安装 package。
 
 ## 代理、镜像和离线来源
 

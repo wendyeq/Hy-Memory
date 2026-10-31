@@ -59,6 +59,7 @@ export {
   diagnosticZipFilename,
   exportDiagnosticBundle,
   exportDiagnosticZip,
+  projectDiagnosticEventForSafeOutput,
   pruneDiagnosticLogs,
   readDiagnosticEvents,
   recordDiagnosticMarker,
@@ -78,6 +79,7 @@ export {
 } from "./host-control-client.js";
 export {
   HostPermissions,
+  type HostRefreshReport,
   LOCAL_EXPERIENCE_UNAVAILABLE,
   type RecallPermissionStatus,
   type RevokeRecallPermissionInput,
@@ -153,6 +155,10 @@ export {
   waitForRuntimeProcess,
 } from "./runtime-launcher.js";
 export {
+  type RuntimeMaintenanceDependencies,
+  withRuntimeMaintenanceFence,
+} from "./runtime-maintenance.js";
+export {
   type ManagedRuntime,
   RuntimeService,
   type RuntimeServiceOptions,
@@ -169,6 +175,30 @@ export {
   RuntimeSupervisor,
   type RuntimeSupervisorOptions,
 } from "./runtime-supervisor.js";
+export {
+  type CoreCommand,
+  readInstalledRuntimeSource,
+  runSdkMigration,
+  type SdkMigrationCommandResult,
+  type SdkMigrationOptions,
+  type SdkMigrationResult,
+} from "./sdk-migration.js";
+export {
+  clearSdkMigrationBlock,
+  freezeCapture,
+  readSdkMigrationBlock,
+  recordSdkMigrationBlock,
+  SDK_MIGRATION_CAPTURE_FENCE,
+  SDK_MIGRATION_LOG_NAME,
+  type SdkMigrationBlock,
+  type SdkMigrationBlockDetails,
+  type SdkMigrationCaller,
+  type SdkMigrationLogEntry,
+  type SdkMigrationSource,
+  sdkMigrationLogPath,
+  thawCapture,
+  writeSdkMigrationLog,
+} from "./sdk-migration-log.js";
 export {
   installUserService,
   parseDisabledOverride,

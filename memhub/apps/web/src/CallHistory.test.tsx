@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import { readFileSync } from "node:fs";
 import {
   act,
   cleanup,
@@ -10,12 +11,20 @@ import {
   within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+
+it("permite crecer al botón de retorno y ajustar la barra sin cortar el español", () => {
+  const css = readFileSync(`${process.cwd()}/src/call-history.css`, "utf8");
+  expect(css).toMatch(/\.call-history-back\.r6-button\s*\{[^}]*width:\s*auto/s);
+  expect(css).toMatch(/\.call-history-actions\s*\{[^}]*flex-wrap:\s*wrap/s);
+});
+
 import { CallHistory } from "./CallHistory";
 import type {
   CallEvent,
   CallHistoryPage,
   ResolvedCallReference,
 } from "./call-history-client";
+import { LANGUAGE_STORAGE_KEY, LanguageProvider } from "./gui-language";
 
 const { getHistory, clearEvents, clearAllEvents, getReferences } = vi.hoisted(
   () => ({
@@ -25,10 +34,6 @@ const { getHistory, clearEvents, clearAllEvents, getReferences } = vi.hoisted(
     getReferences: vi.fn(),
   }),
 );
-const getConversation = vi.hoisted(() => vi.fn());
-vi.mock("./api", () => ({
-  getConversation,
-}));
 vi.mock("./call-history-client", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./call-history-client")>()),
   getCallHistory: getHistory,
@@ -115,11 +120,6 @@ beforeEach(() => {
   getHistory.mockReset().mockResolvedValue(page());
   clearEvents.mockReset().mockResolvedValue(undefined);
   clearAllEvents.mockReset().mockResolvedValue(undefined);
-  getConversation.mockReset().mockResolvedValue({
-    conversation_id: "c1",
-    source_id: "source-1",
-    messages: [{ verbatim: "current permitted original" }],
-  });
   getReferences.mockReset().mockImplementation(async (call: CallEvent) =>
     call.references.map((reference) => ({
       ...reference,
@@ -138,6 +138,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  window.localStorage.removeItem(LANGUAGE_STORAGE_KEY);
   if (originalShowModal)
     Object.defineProperty(
       HTMLDialogElement.prototype,
@@ -146,6 +147,68 @@ afterEach(() => {
     );
   else Reflect.deleteProperty(HTMLDialogElement.prototype, "showModal");
 });
+
+it("traduce el historial en vivo sin cambiar nombres ni contenido importado", async () => {
+  window.localStorage.setItem(LANGUAGE_STORAGE_KEY, "es");
+  render(
+    <LanguageProvider>
+      <CallHistory onBack={vi.fn()} />
+    </LanguageProvider>,
+  );
+  const first = await loaded();
+  expect(
+    screen.getByRole("heading", { name: "Historial de uso" }),
+  ).toBeTruthy();
+  expect(first.textContent).toBe("Cursor encontró 3 contenidos relacionados");
+  fireEvent.click(first);
+  expect(
+    screen.getByRole("heading", { name: "Esta consulta de memorias" }),
+  ).toBeTruthy();
+  expect(screen.getAllByText("Consulta completada")).toHaveLength(2);
+  expect(screen.getByText("Consulta de memorias")).toBeTruthy();
+  window.localStorage.setItem(LANGUAGE_STORAGE_KEY, "zh-CN");
+  fireEvent(window, new StorageEvent("storage", { key: LANGUAGE_STORAGE_KEY }));
+  expect(screen.getByRole("heading", { name: "这次查记忆" })).toBeTruthy();
+  window.localStorage.removeItem(LANGUAGE_STORAGE_KEY);
+});
+
+it.each([0, 1, 3])(
+  "muestra %i registros con confirmación española y conserva títulos opacos",
+  async (count) => {
+    getHistory.mockResolvedValue(
+      page(
+        Array.from({ length: count }, (_, index) =>
+          event(`event-${index}`, {
+            host_id: "Aplicación 中文",
+            references: [],
+          }),
+        ),
+      ),
+    );
+    window.localStorage.setItem(LANGUAGE_STORAGE_KEY, "es");
+    render(
+      <LanguageProvider>
+        <CallHistory onBack={vi.fn()} />
+      </LanguageProvider>,
+    );
+    if (!count) {
+      expect(
+        await screen.findByText("Todavía no hay registros de uso"),
+      ).toBeTruthy();
+      return;
+    }
+    await loaded("event-0");
+    expect(screen.getAllByText(/Aplicación 中文 encontró/)).toHaveLength(count);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Borrar registros de esta página" }),
+    );
+    expect(screen.getByRole("dialog").textContent).toContain(
+      count === 1
+        ? "¿Borrar el 1 registro de esta página?"
+        : "¿Borrar los 3 registros de esta página?",
+    );
+  },
+);
 
 it("loads a bounded first page and returns to applications", async () => {
   const pending = deferred<CallHistoryPage>();
@@ -354,7 +417,7 @@ it("does not claim delivery for a call Core never completed", async () => {
   const detail = screen.getByRole("article", { name: "调用详情" });
   expect(within(detail).queryByText(/已返回给/)).toBeNull();
   expect(
-    within(detail).getByText("One Memory 暂时不可用，这次回答没有带上记忆。"),
+    within(detail).getByText("MemHub 暂时不可用，这次回答没有带上记忆。"),
   ).toBeTruthy();
 });
 it("does not restate an undelivered result as returned", async () => {
@@ -414,7 +477,7 @@ it.each([
     "查询超时，没有提供记忆",
     "直接调用（诊断） 这次没来得及查到记忆",
   ],
-  ["unavailable", "One Memory 暂时不可用", "直接调用（诊断） 暂时无法查记忆"],
+  ["unavailable", "MemHub 暂时不可用", "直接调用（诊断） 暂时无法查记忆"],
   ["denied", "当前未授权查询", "直接调用（诊断） 未获准查记忆"],
 ] as const)(
   "renders the %s state without claiming external adoption",
@@ -471,7 +534,7 @@ it("does not call an unavailable call returned", async () => {
   const detail = screen.getByRole("article", { name: "调用详情" });
   expect(within(detail).queryByText(/· 已返回/)).toBeNull();
   expect(
-    within(detail).getAllByText(/One Memory 暂时不可用/).length,
+    within(detail).getAllByText(/MemHub 暂时不可用/).length,
   ).toBeGreaterThan(0);
   expect(within(detail).queryByText(/采用未确认|Core/)).toBeNull();
 });
@@ -769,28 +832,20 @@ it("resolves titles only on detail selection and shows explicit loading without 
   expect(screen.getByText("记忆 · permission-checked-memory")).toBeTruthy();
   expect(screen.getByText("source-1")).toBeTruthy();
   expect(screen.queryByRole("link")).toBeNull();
-  expect(screen.getByRole("button", { name: "查看原文" })).toBeTruthy();
+  // A raw reference has no by-id read on the SDK data plane; only a memory opens.
+  expect(screen.queryByRole("button", { name: "查看原文" })).toBeNull();
   expect(screen.getByRole("button", { name: "查看记忆" })).toBeTruthy();
   expect(storage).not.toHaveBeenCalled();
   expect(call.references[0]).not.toHaveProperty("title");
 });
 
-it("opens currently permitted memory or evidence and hides withdrawn titles", async () => {
+it("opens a currently permitted memory and hides withdrawn titles", async () => {
   const onOpenMemory = vi.fn();
-  const onOpenEvidence = vi.fn();
   getReferences.mockResolvedValueOnce(resolved(event(), "permission-checked"));
-  render(
-    <CallHistory
-      onBack={vi.fn()}
-      onOpenMemory={onOpenMemory}
-      onOpenEvidence={onOpenEvidence}
-    />,
-  );
+  render(<CallHistory onBack={vi.fn()} onOpenMemory={onOpenMemory} />);
   fireEvent.click(await loaded());
   await screen.findByText("原文 · permission-checked-raw");
-  fireEvent.click(screen.getByRole("button", { name: "查看原文" }));
   fireEvent.click(screen.getByRole("button", { name: "查看记忆" }));
-  expect(onOpenEvidence).toHaveBeenCalledExactlyOnceWith("raw-1");
   expect(onOpenMemory).toHaveBeenCalledExactlyOnceWith("memory-1");
   getReferences.mockResolvedValueOnce([
     {

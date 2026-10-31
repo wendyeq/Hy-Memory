@@ -50,6 +50,10 @@ class AuthorizedSourceFile:
     size: int
     modified_ns: int
     changed_ns: int
+    # Source-specific change token (for example Cursor's WAL identity). It is
+    # cursor metadata only; modified_ns remains the real filesystem mtime used
+    # as a fallback conversation timestamp.
+    cursor_version: str | None = None
     root_identity: str | None = None
     requested_root: Path | None = None
     access_check: Callable[[], None] | None = field(default=None, repr=False, compare=False)
@@ -571,8 +575,11 @@ def safe_project_label(value: str | None) -> str | None:
 def opaque_workspace_id(source_id: str, workspace: str | None) -> str | None:
     if not workspace:
         return None
-    normalized = str(Path(workspace).expanduser())
-    digest = hashlib.sha256(f"{source_id}\0{normalized}".encode()).hexdigest()
+    if len(workspace) > 4_096 or any(ord(character) < 32 for character in workspace):
+        return None
+    # Workspace is an opaque identity, not a filesystem target. Hash the
+    # caller's exact value without expansion, resolution, stat, open, or join.
+    digest = hashlib.sha256(f"{source_id}\0{workspace}".encode()).hexdigest()
     return f"workspace:v1:{digest}"
 
 

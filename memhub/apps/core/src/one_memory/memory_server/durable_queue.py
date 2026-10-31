@@ -24,17 +24,25 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from one_memory.background_work import in_the_background
+from one_memory.conversation_processing import TURN_IDLE_FLUSH_SECONDS, turn_batches
 from one_memory.database_access import main_database
 from one_memory.diagnostic_log import diagnostic_event
 from one_memory.imports.models import EvidenceOrigin, EvidenceRecord
 from one_memory.imports.storage import EvidenceStore
-from one_memory.memory_server.contracts import WriteRequest
+from one_memory.memory_server.contracts import (
+    BatchIdentity,
+    WriteRequest,
+    internal_session_id_for,
+)
 from one_memory.memory_server.data_safety import MIN_FREE_BYTES  # noqa: F401 - re-exported
-from one_memory.memory_server.migrations import memory_write_jobs_sqlite_schema
+from one_memory.memory_server.migrations import (
+    memory_write_jobs_sqlite_schema,
+    memory_write_jobs_target_sqlite_schema,
+)
 from one_memory.memory_server.queue import build_reclaim_sqlite_statements
 from one_memory.memory_server.registry import WriteRecord
 from one_memory.memory_tasks import (
@@ -44,6 +52,7 @@ from one_memory.memory_tasks import (
 from one_memory.memory_tasks import (
     POLICY_STOPPED_CODES as _TASK_POLICY_STOPPED_CODES,
 )
+from one_memory.sdk_migration_log import error_chain_text
 from one_memory.service_levels import ServiceLevel, service_level_context
 
 logger = logging.getLogger(__name__)
@@ -62,8 +71,8 @@ _TYPE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 def safe_error_code(error: BaseException) -> str:
     """Reduce an exception to a storable code, never its message text.
 
-    A recognised code (the message *is* the code, as `HyMemoryBridgeError`
-    and the permission guard raise them) is kept so callers can classify it.
+    A recognised code (the message *is* a stable domain code) is kept so
+    callers can classify it.
     Everything else collapses to its exception type, which is a fixed
     identifier rather than content.
     """
@@ -232,21 +241,23 @@ PERMISSION_REQUIRED_CODES = frozenset(
     }
 )
 
-#: Model-side codes `process_records` raises *before* it can open the bridge
-#: (no active profile, missing credential, secure storage down). They prove
-#: nothing was sent, so the write parks instead of being lost. Transport codes
-#: that can arrive after a request was in flight stay `unknown`.
+#: Model-side codes the SDK write coordinator raises before it can lease a
+#: client (no active profile, missing credential, secure storage down, or the
+#: client failed to construct). They prove nothing was sent, so the write
+#: parks instead of being lost. Transport codes that can arrive after a
+#: request was in flight stay `unknown`.
 MODEL_NOT_READY_CODES = frozenset(
     {
         "model_profile_not_active",
         "model_secret_unavailable",
         "secure_storage_unavailable",
+        "hy_memory_client_unavailable",
     }
 )
 
-#: Deterministic, pre-bridge refusals: the frozen input no longer matches
+#: Deterministic, pre-SDK refusals: the frozen input no longer matches
 #: current Evidence, or a turn exceeds the model's input window. Both are
-#: raised while validating the records, before any bridge or HY call, so
+#: raised while validating the records, before any SDK call, so
 #: nothing was sent and retrying the same intent changes nothing — a terminal
 #: `failed`, not `unknown` (which would wrongly imply a possibly-applied
 #: write) and not a retry (which would fail identically).
@@ -284,6 +295,23 @@ _VALID_JOB_STATES = frozenset(
 #: A row in one of these states can never be moved back to a live one.
 _TERMINAL_WRITE_STATES = frozenset({COMPLETED, FAILED, DEAD, CANCELLED})
 
+#: The legacy task rows a write job can be linked to. The SDK cutover drops
+#: them (`target_schema.LEGACY_TABLES_IN_DROP_ORDER`, inputs before tasks), so
+#: the job-only paths must not assume any of them.
+_LEGACY_TASK_LINK_TABLES = ("memory_tasks", "memory_task_inputs", "memory_write_job_evidence")
+
+
+def _legacy_task_links_present(connection: sqlite3.Connection) -> bool:
+    present = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN (?,?,?)",
+            _LEGACY_TASK_LINK_TABLES,
+        )
+    }
+    return present == set(_LEGACY_TASK_LINK_TABLES)
+
+
 #: Columns a current schema declares but an older `memory_write_jobs` may lack.
 #: `CREATE TABLE IF NOT EXISTS` is a no-op for an existing table, so without
 #: this an upgraded install would keep an older queue that every claim/lease
@@ -303,10 +331,18 @@ LEGACY_MEMORY_WRITE_JOB_COLUMNS = (
     ("last_error", "TEXT"),
     ("event_at", "TEXT"),
     ("time_quality", "TEXT NOT NULL DEFAULT 'approximate'"),
+    ("sdk_raw_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+    ("sdk_memory_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
 )
 
 _FIFO_BLOCKING_STATES = (PENDING, RUNNING, WAITING_FOR_PERMISSION, WAITING_FOR_MODEL)
 EVENT_TIME_WINDOW = timedelta(minutes=10)
+#: Sources whose jobs are a person adding a memory by hand ("添加记忆"), not
+#: history. History is digested strictly old to new through the event-time
+#: window; a note is stamped "now", so inside that window it waited behind the
+#: whole unprocessed history. These jobs are claimed ahead of the window,
+#: still one at a time per source and in order within their session.
+DIRECT_WRITE_SOURCES = frozenset({"one-memory-manual"})
 
 
 @dataclass(frozen=True)
@@ -318,6 +354,15 @@ class DurableWriteRecord:
     created_at: str
     updated_at: str
     detail: str = ""
+    sdk_raw_ids: tuple[str, ...] = ()
+    sdk_memory_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class DurableSdkReceipt:
+    job_id: str
+    raw_ids: tuple[str, ...]
+    memory_ids: tuple[str, ...]
 
 
 class ReconcileSchemaUnavailableError(RuntimeError):
@@ -340,12 +385,10 @@ class UnknownWriteJob:
 
     `request_id` is the durable queue's idempotency key. It identifies the row
     for queue inspection and is the value `DurableWriteQueue.get()` accepts.
-    It is **not** the HY request id: `MemoryProcessingSupervisor` derives the
-    HY handle from the task it creates, so an inquiry implementation must
-    obtain that task-layer handle separately rather than passing this value to
-    HY. This is discovery only: it does not decide whether HY has the write,
-    and it deliberately exposes no transition method that could turn
-    `unknown` back into retryable work.
+    It is the public SDK request id used for exact outcome inquiry. This is
+    discovery only: it does not decide whether HY has the write, and it
+    deliberately exposes no transition method that could turn `unknown` back
+    into retryable work.
     """
 
     job_id: str
@@ -459,6 +502,7 @@ class DurableWriteQueue:
         min_free_bytes: int = 0,
         evidence: EvidenceStore | None = None,
         initialize: bool = True,
+        sdk_authority: bool = False,
     ) -> None:
         self.database_path = database_path
         #: Optional Evidence authority. When supplied, `submit` enforces the
@@ -475,6 +519,7 @@ class DurableWriteQueue:
         #: keeps existing callers/tests unchanged; the Runtime passes the shared
         #: `data_safety.MIN_FREE_BYTES` (or a config value) to enforce it.
         self.min_free_bytes = min_free_bytes
+        self.sdk_authority = sdk_authority
         #: Read-only surfaces open the queue with ``initialize=False``: they
         #: must not run schema DDL or reclaim expired leases, or a GET would
         #: be a write. Default ``True`` keeps composition/drain behavior.
@@ -485,14 +530,20 @@ class DurableWriteQueue:
             # First create the base table if absent. Then widen an older table
             # before replaying indexes that reference the new columns; a bare
             # CREATE INDEX would fail on a pre-priority queue.
-            create_table = memory_write_jobs_sqlite_schema()[0]
+            schema = (
+                memory_write_jobs_target_sqlite_schema()
+                if sdk_authority
+                else memory_write_jobs_sqlite_schema()
+            )
+            create_table = schema[0]
             connection.execute(create_table)
             self._add_legacy_columns(connection)
             self._rebuild_wrongly_shaped_claim_index(connection)
-            for statement in memory_write_jobs_sqlite_schema()[1:]:
+            for statement in schema[1:]:
                 connection.execute(statement)
-            self._backfill_legacy_references(connection)
-            self._backfill_legacy_event_times(connection)
+            if not sdk_authority:
+                self._backfill_legacy_references(connection)
+                self._backfill_legacy_event_times(connection)
         # A process that died while holding a lease cannot run its own
         # recovery. Opening the queue is the first safe point to recover any
         # rows it left behind, before any new worker claims them.
@@ -722,8 +773,7 @@ class DurableWriteQueue:
                 stored_payload = str(existing["payload_json"])
                 priority_replay = _matches_payload_except_priority(stored_payload, payload)
                 legacy_reaped_match = bool(
-                    already_settled
-                    and _matches_reaped_legacy_payload(stored_payload, payload)
+                    already_settled and _matches_reaped_legacy_payload(stored_payload, payload)
                 )
                 if (
                     not _matches_stored_payload(stored_payload, payload)
@@ -831,10 +881,11 @@ class DurableWriteQueue:
                     now,
                 ),
             )
-            connection.executemany(
-                "INSERT INTO memory_write_job_evidence (job_id, evidence_id) VALUES (?,?)",
-                ((job_id, str(evidence_id)) for evidence_id in request.evidence_ids),
-            )
+            if not self.sdk_authority:
+                connection.executemany(
+                    "INSERT INTO memory_write_job_evidence (job_id, evidence_id) VALUES (?,?)",
+                    ((job_id, str(evidence_id)) for evidence_id in request.evidence_ids),
+                )
         diagnostic_event(
             level="info",
             component="memory.write_queue",
@@ -855,6 +906,336 @@ class DurableWriteQueue:
             created_at=now,
             updated_at=now,
         )
+
+    def stage_sdk_input(
+        self,
+        record: EvidenceRecord,
+        *,
+        file_key: str,
+        priority: str,
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Append input to its conversation's assembling queue row.
+
+        The row is not claimable. `finalize_sdk_file` turns what is complete
+        into write jobs (`turn_batches`) and keeps the rest here for the next
+        increment; `flush_idle_assemblies` writes a live row's rest once the
+        conversation has been quiet. `updated_at` moves only when a record is
+        new or revised, so a re-read does not keep a quiet conversation open.
+        No Evidence table is involved.
+        """
+        assembly_key = (
+            f"assembly:{record.user_id}:{record.source_id}:"
+            f"{hashlib.sha256(file_key.encode()).hexdigest()}:"
+            f"{hashlib.sha256(record.conversation_id.encode()).hexdigest()}"
+        )
+        session_key = internal_session_id_for(record.conversation_id, record.source_id)
+        written = connection.execute(
+            "SELECT 1 FROM memory_write_jobs AS job, json_each(job.evidence_ids_json) AS ref "
+            "WHERE job.session_key=? AND job.state!='assembling' AND ref.value=? LIMIT 1",
+            (session_key, record.evidence_id),
+        ).fetchone()
+        if written is not None:
+            # A re-read of a record a job already holds: staging it again
+            # would regroup it with later turns into a second job.
+            return
+        row = connection.execute(
+            "SELECT job_id,payload_json,priority FROM memory_write_jobs "
+            "WHERE idempotency_key=? AND state='assembling'",
+            (assembly_key,),
+        ).fetchone()
+        records = []
+        if row is not None:
+            payload = json.loads(str(row["payload_json"]))
+            records = list(payload.get("input_records") or [])
+        dumped = record.model_dump(mode="json")
+        index = next(
+            (
+                position
+                for position, item in enumerate(records)
+                if item.get("evidence_id") == record.evidence_id
+            ),
+            None,
+        )
+        changed = index is None or records[index] != dumped
+        if index is None:
+            records.append(dumped)
+        elif changed:
+            # A revision replaces the carried copy in place.
+            records[index] = dumped
+        now = datetime.now(UTC).isoformat()
+        payload_json = json.dumps(
+            {
+                "schema_version": 1,
+                "file_key": file_key,
+                "input_records": records,
+            },
+            sort_keys=True,
+        )
+        if row is not None:
+            merged_priority = "live" if "live" in (row["priority"], priority) else "normal"
+            if not changed and merged_priority == row["priority"]:
+                return
+            connection.execute(
+                "UPDATE memory_write_jobs SET payload_json=?,priority=?,"
+                "updated_at=CASE WHEN ? THEN ? ELSE updated_at END WHERE job_id=?",
+                (payload_json, merged_priority, int(changed), now, str(row["job_id"])),
+            )
+            return
+        queue_seq = int(
+            connection.execute(
+                "SELECT COALESCE(MAX(queue_seq),0)+1 FROM memory_write_jobs"
+            ).fetchone()[0]
+        )
+        connection.execute(
+            "INSERT INTO memory_write_jobs ("
+            "job_id,queue_seq,session_key,source_key,batch_id,idempotency_key,"
+            "payload_json,evidence_ids_json,state,priority,attempts,max_attempts,"
+            "lease_owner,lease_expires_at,hy_invoked,last_error,event_at,time_quality,"
+            "created_at,updated_at,sdk_raw_ids_json,sdk_memory_ids_json"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                str(uuid4()),
+                queue_seq,
+                session_key,
+                record.source_id,
+                assembly_key,
+                assembly_key,
+                payload_json,
+                "[]",
+                "assembling",
+                priority,
+                0,
+                3,
+                None,
+                None,
+                0,
+                None,
+                (record.created_at or record.imported_at).isoformat(),
+                "exact" if record.created_at else "approximate",
+                now,
+                now,
+                "[]",
+                "[]",
+            ),
+        )
+
+    def finalize_sdk_file(
+        self,
+        *,
+        user_id: str,
+        source_id: str,
+        file_key: str,
+        connection: sqlite3.Connection,
+        flush: bool = True,
+    ) -> tuple[str, ...]:
+        """Write what one file's assembling rows hold that the turn rule completes.
+
+        `flush` (history at end of file) completes the last turn and writes a
+        short batch; without it (live polling) those stay in the row.
+        """
+        rows = connection.execute(
+            "SELECT * FROM memory_write_jobs WHERE state='assembling' "
+            "AND source_key=? ORDER BY queue_seq",
+            (source_id,),
+        ).fetchall()
+        finalized: list[str] = []
+        for row in rows:
+            payload = json.loads(str(row["payload_json"]))
+            if payload.get("file_key") != file_key:
+                continue
+            finalized.extend(
+                self._write_assembled_turns(connection, row, user_id=user_id, flush=flush)
+            )
+        return tuple(finalized)
+
+    def assemble_live_records(
+        self,
+        records: tuple[EvidenceRecord, ...],
+        *,
+        file_key: str,
+    ) -> tuple[str, ...]:
+        """Stage live records and write what is complete, in one transaction.
+
+        For live capture outside the import runner (host hooks): the same
+        assembling rows, turn rule and idle flush as live file polling.
+        """
+        if not records:
+            return ()
+        first = records[0]
+        with (
+            main_database(self.database_path).write(row_factory=sqlite3.Row) as connection,
+            connection,
+        ):
+            for record in records:
+                self.stage_sdk_input(
+                    record, file_key=file_key, priority="live", connection=connection
+                )
+            return self.finalize_sdk_file(
+                user_id=first.user_id,
+                source_id=first.source_id,
+                file_key=file_key,
+                connection=connection,
+                flush=False,
+            )
+
+    def flush_idle_assemblies(self, *, now: datetime | None = None) -> tuple[str, ...]:
+        """Write the rest of every live conversation quiet for 10 minutes.
+
+        Its last turn counts as complete and a batch short of 5 turns is
+        written. History rows are left alone: their end of file flushes them.
+        """
+        current = now or datetime.now(UTC)
+        cutoff = (current - timedelta(seconds=TURN_IDLE_FLUSH_SECONDS)).isoformat()
+        query = (
+            "SELECT * FROM memory_write_jobs WHERE state='assembling' AND priority='live' "
+            "AND updated_at<=? ORDER BY queue_seq"
+        )
+        # A read first: most ticks find nothing and must not take the writer.
+        with main_database(self.database_path).read(row_factory=sqlite3.Row) as connection:
+            if connection.execute(query, (cutoff,)).fetchone() is None:
+                return ()
+        finalized: list[str] = []
+        with (
+            main_database(self.database_path).write(row_factory=sqlite3.Row) as connection,
+            connection,
+        ):
+            for row in connection.execute(query, (cutoff,)).fetchall():
+                finalized.extend(self._write_assembled_turns(connection, row, flush=True))
+        return tuple(finalized)
+
+    def _write_assembled_turns(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        flush: bool,
+        user_id: str | None = None,
+    ) -> list[str]:
+        """Turn one assembling row's complete batches into jobs; keep the carry."""
+        payload = json.loads(str(row["payload_json"]))
+        records = tuple(
+            EvidenceRecord.model_validate(item)
+            for item in payload.get("input_records") or []
+            if user_id is None or item.get("user_id") == user_id
+        )
+        grouped = turn_batches(records, flush=flush)
+        priority: Literal["live", "normal"] = "live" if str(row["priority"]) == "live" else "normal"
+        job_ids = [
+            self._insert_turn_batch(connection, batch, priority=priority)
+            for batch in grouped.batches
+        ]
+        if not grouped.carry:
+            connection.execute(
+                "DELETE FROM memory_write_jobs WHERE job_id=?", (str(row["job_id"]),)
+            )
+        elif grouped.batches or len(grouped.carry) != len(records):
+            # `updated_at` stays: the idle clock counts new messages only.
+            connection.execute(
+                "UPDATE memory_write_jobs SET payload_json=? WHERE job_id=?",
+                (
+                    json.dumps(
+                        {
+                            **payload,
+                            "input_records": [
+                                record.model_dump(mode="json") for record in grouped.carry
+                            ],
+                        },
+                        sort_keys=True,
+                    ),
+                    str(row["job_id"]),
+                ),
+            )
+        return job_ids
+
+    def _insert_turn_batch(
+        self,
+        connection: sqlite3.Connection,
+        records: tuple[EvidenceRecord, ...],
+        *,
+        priority: Literal["live", "normal"],
+    ) -> str:
+        """One pending job for one batch of whole turns, keyed by its content.
+
+        Same records, same key: a re-read returns the job already written.
+        """
+        first = records[0]
+        session_id = internal_session_id_for(first.conversation_id, first.source_id)
+        material = ":".join(f"{item.evidence_id}:{item.content_hash}" for item in records)
+        request_id = f"turn:v2:{hashlib.sha256(material.encode()).hexdigest()}"
+        existing = connection.execute(
+            "SELECT job_id FROM memory_write_jobs WHERE idempotency_key=?",
+            (request_id,),
+        ).fetchone()
+        if existing is not None:
+            return str(existing["job_id"])
+        request = WriteRequest(
+            internal_session_id=session_id,
+            source_id=first.source_id,
+            batch_identity=BatchIdentity(
+                internal_session_id=session_id,
+                first_round=1,
+                last_round=1,
+            ),
+            evidence_ids=[item.evidence_id for item in records],
+            input_records=records,
+            idempotency_key=request_id,
+            priority=priority,
+        )
+        # The batch's time is its first user message's, as for every other job.
+        event_at, time_quality = self._event_time_for_request(request)
+        now = datetime.now(UTC)
+        job_id = str(uuid4())
+        queue_seq = int(
+            connection.execute(
+                "SELECT COALESCE(MAX(queue_seq),0)+1 FROM memory_write_jobs"
+            ).fetchone()[0]
+        )
+        event = event_at or now
+        if event.tzinfo is None:
+            event = event.replace(tzinfo=UTC)
+        connection.execute(
+            "INSERT INTO memory_write_jobs ("
+            "job_id,queue_seq,session_key,source_key,batch_id,idempotency_key,"
+            "payload_json,evidence_ids_json,state,priority,attempts,max_attempts,"
+            "lease_owner,lease_expires_at,hy_invoked,last_error,event_at,time_quality,"
+            "created_at,updated_at,sdk_raw_ids_json,sdk_memory_ids_json"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                job_id,
+                queue_seq,
+                session_id,
+                first.source_id,
+                request.batch_identity.batch_id,
+                request_id,
+                json.dumps(
+                    request.model_dump(mode="json", exclude={"event_at", "time_quality"}),
+                    sort_keys=True,
+                ),
+                json.dumps(list(request.evidence_ids)),
+                PENDING,
+                priority,
+                0,
+                3,
+                None,
+                None,
+                0,
+                None,
+                event.astimezone(UTC).isoformat(),
+                time_quality,
+                now.isoformat(),
+                now.isoformat(),
+                "[]",
+                "[]",
+            ),
+        )
+        if not self.sdk_authority:
+            # Legacy catch-up reads coverage from these references.
+            connection.executemany(
+                "INSERT INTO memory_write_job_evidence (job_id, evidence_id) VALUES (?,?)",
+                ((job_id, evidence_id) for evidence_id in request.evidence_ids),
+            )
+        return job_id
 
     def _freeze_request_inputs(self, request: WriteRequest) -> WriteRequest:
         if request.input_records or self.evidence is None:
@@ -1006,14 +1387,12 @@ class DurableWriteQueue:
                 )
             has_versions = (
                 connection.execute(
-                    "SELECT 1 FROM sqlite_master "
-                    "WHERE type='table' AND name='evidence_versions'"
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='evidence_versions'"
                 ).fetchone()
                 is not None
             )
             evidence_columns = {
-                str(row[1])
-                for row in connection.execute("PRAGMA table_info(evidence)").fetchall()
+                str(row[1]) for row in connection.execute("PRAGMA table_info(evidence)").fetchall()
             }
             if {"revision", "content_hash", "updated_at"} <= evidence_columns:
                 revision_time = (
@@ -1100,7 +1479,8 @@ class DurableWriteQueue:
         with main_database(self.database_path).read(row_factory=sqlite3.Row) as connection:
             _require_queue_schema(connection)
             row = connection.execute(
-                "SELECT job_id, state, created_at, updated_at, last_error "
+                "SELECT job_id, state, created_at, updated_at, last_error, "
+                "sdk_raw_ids_json,sdk_memory_ids_json "
                 "FROM memory_write_jobs WHERE idempotency_key=?",
                 (request_id,),
             ).fetchone()
@@ -1114,6 +1494,8 @@ class DurableWriteQueue:
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
             detail=str(row["last_error"] or ""),
+            sdk_raw_ids=tuple(json.loads(str(row["sdk_raw_ids_json"]))),
+            sdk_memory_ids=tuple(json.loads(str(row["sdk_memory_ids_json"]))),
         )
 
     def payload_for(self, job_id: str) -> WriteRequest | None:
@@ -1135,6 +1517,21 @@ class DurableWriteQueue:
             return None
         return WriteRequest.model_validate_json(payload)
 
+    def sdk_receipt(self, job_id: str) -> DurableSdkReceipt | None:
+        with main_database(self.database_path).read(row_factory=sqlite3.Row) as connection:
+            row = connection.execute(
+                "SELECT state,sdk_raw_ids_json,sdk_memory_ids_json "
+                "FROM memory_write_jobs WHERE job_id=?",
+                (job_id,),
+            ).fetchone()
+        if row is None or str(row["state"]) != COMPLETED:
+            return None
+        return DurableSdkReceipt(
+            job_id=job_id,
+            raw_ids=tuple(json.loads(str(row["sdk_raw_ids_json"]))),
+            memory_ids=tuple(json.loads(str(row["sdk_memory_ids_json"]))),
+        )
+
     def settle(
         self,
         job_id: str,
@@ -1143,6 +1540,8 @@ class DurableWriteQueue:
         error_code: str | None = None,
         hy_invoked: bool | None = None,
         owner: str | None = None,
+        sdk_raw_ids: tuple[str, ...] | None = None,
+        sdk_memory_ids: tuple[str, ...] | None = None,
     ) -> None:
         """Record a terminal outcome, and whether HY was reached.
 
@@ -1171,6 +1570,13 @@ class DurableWriteQueue:
         lease lapsed and the row was re-claimed elsewhere cannot settle a job
         it no longer owns and overwrite the new owner's outcome.
         """
+        if (sdk_raw_ids is not None or sdk_memory_ids is not None) and state != COMPLETED:
+            raise ValueError("SDK ids may only be attached to a completed job")
+        if any(
+            not isinstance(value, str) or not value
+            for value in (*(sdk_raw_ids or ()), *(sdk_memory_ids or ()))
+        ):
+            raise ValueError("SDK receipt ids must be non-empty strings")
         with main_database(self.database_path).write() as connection, connection:
             now = datetime.now(UTC).isoformat()
             current = connection.execute(
@@ -1221,17 +1627,34 @@ class DurableWriteQueue:
                     "AND lease_expires_at IS NOT NULL AND lease_expires_at>=?"
                 )
                 params = (owner, now)
+            receipt_sql = ""
+            receipt_values: tuple[Any, ...] = ()
+            if sdk_raw_ids is not None or sdk_memory_ids is not None:
+                receipt_sql = ", sdk_raw_ids_json=?, sdk_memory_ids_json=?"
+                receipt_values = (
+                    json.dumps(list(dict.fromkeys(sdk_raw_ids or ()))),
+                    json.dumps(list(dict.fromkeys(sdk_memory_ids or ()))),
+                )
             if hy_invoked is None:
                 updated = connection.execute(
                     "UPDATE memory_write_jobs SET state=?, lease_owner=NULL, "
-                    f"lease_expires_at=NULL, last_error=?, updated_at=? {where}",
-                    (state, error_code, now, job_id, *params),
+                    f"lease_expires_at=NULL, last_error=?{receipt_sql}, updated_at=? {where}",
+                    (state, error_code, *receipt_values, now, job_id, *params),
                 )
             else:
                 updated = connection.execute(
                     "UPDATE memory_write_jobs SET state=?, lease_owner=NULL, "
-                    f"lease_expires_at=NULL, last_error=?, hy_invoked=?, updated_at=? {where}",
-                    (state, error_code, 1 if hy_invoked else 0, now, job_id, *params),
+                    f"lease_expires_at=NULL, last_error=?, hy_invoked=?"
+                    f"{receipt_sql}, updated_at=? {where}",
+                    (
+                        state,
+                        error_code,
+                        1 if hy_invoked else 0,
+                        *receipt_values,
+                        now,
+                        job_id,
+                        *params,
+                    ),
                 )
             if owner is not None and updated.rowcount != 1:
                 # Defensive: the guard above should already have caught this,
@@ -1352,10 +1775,38 @@ class DurableWriteQueue:
         return state
 
     def clear_terminal_payloads(self, *, limit: int = 512) -> int:
-        """Deprecated compatibility hook; durable inputs are immutable audit data."""
+        """Replace terminal raw inputs with an intent digest."""
         if type(limit) is not int or limit < 1:
             raise ValueError("limit must be positive")
-        return 0
+        terminal = tuple(sorted(_TERMINAL_WRITE_STATES))
+        placeholders = ",".join("?" for _ in terminal)
+        changed = 0
+        with main_database(self.database_path).write(
+            autocommit=True, row_factory=sqlite3.Row
+        ) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = tuple(
+                connection.execute(
+                    "SELECT job_id,payload_json FROM memory_write_jobs "
+                    f"WHERE state IN ({placeholders}) "
+                    f"AND payload_json NOT LIKE '%\"{REAPED_PAYLOAD_MARKER}\"%' "
+                    "ORDER BY queue_seq LIMIT ?",
+                    (*terminal, limit),
+                )
+            )
+            for row in rows:
+                payload = str(row["payload_json"])
+                marker = json.dumps(
+                    {REAPED_PAYLOAD_MARKER: hashlib.sha256(payload.encode()).hexdigest()},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                changed += connection.execute(
+                    "UPDATE memory_write_jobs SET payload_json=? WHERE job_id=? AND payload_json=?",
+                    (marker, str(row["job_id"]), payload),
+                ).rowcount
+            connection.execute("COMMIT")
+        return changed
 
     def readmit_parked(self, *, states: tuple[str, ...] = PARKED_STATES) -> int:
         """Move parked jobs back to `pending` for a fresh claim.
@@ -1480,8 +1931,8 @@ class DurableWriteQueue:
         """Retire an `unknown` job after an inquiry, never by guessing.
 
         `unknown` means HY may already hold the write; the only safe way out is
-        to ask by request id (`hy_capabilities` measured that the SDK supports
-        this) and then record what the inquiry found. `found=True` closes it as
+        to call the public SDK `get_write_outcome(request_id)` and then record
+        what the inquiry found. `found=True` closes it as
         `completed`; `found=False` gives up and marks it `dead`. The state
         machine's legal transitions are the authority, so this refuses any
         change that `job_state.next_state` would reject — in particular it can
@@ -1551,21 +2002,24 @@ class DurableWriteQueue:
                 or str(row["last_error"]) in NON_RETRYABLE_POST_WRITE_CODES
             ):
                 return 0
-            connection.execute(
-                """
-                UPDATE memory_tasks
-                SET status='pending', runner_token=NULL, attempts=0,
-                    last_error_code='model_content_manual_retry_requested', updated_at=?
-                WHERE status='unknown' AND task_id IN (
-                    SELECT inputs.task_id
-                    FROM memory_task_inputs AS inputs, json_each(inputs.refs_json) AS ref
-                    JOIN memory_write_job_evidence AS linked
-                      ON linked.evidence_id=json_extract(ref.value, '$.evidence_id')
-                    WHERE linked.job_id=?
+            # After the SDK cutover the legacy task tables are gone and the
+            # job is the only row to reset.
+            if not self.sdk_authority and _legacy_task_links_present(connection):
+                connection.execute(
+                    """
+                    UPDATE memory_tasks
+                    SET status='pending', runner_token=NULL, attempts=0,
+                        last_error_code='model_content_manual_retry_requested', updated_at=?
+                    WHERE status='unknown' AND task_id IN (
+                        SELECT inputs.task_id
+                        FROM memory_task_inputs AS inputs, json_each(inputs.refs_json) AS ref
+                        JOIN memory_write_job_evidence AS linked
+                          ON linked.evidence_id=json_extract(ref.value, '$.evidence_id')
+                        WHERE linked.job_id=?
+                    )
+                    """,
+                    (now, job_id),
                 )
-                """,
-                (now, job_id),
-            )
             changed = connection.execute(
                 """
                 UPDATE memory_write_jobs
@@ -1667,9 +2121,7 @@ class DurableWriteQueue:
                 f"WHERE state=? AND job_id IN ({placeholders})",
                 (PENDING, now, UNKNOWN, *job_ids),
             )
-            if connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_tasks'"
-            ).fetchone():
+            if _legacy_task_links_present(connection):
                 connection.execute(
                     f"UPDATE memory_tasks SET status=?, runner_token=NULL, "
                     f"last_error_code='model_content_reconciled_absent_retry', updated_at=? "
@@ -1727,9 +2179,7 @@ class DurableWriteQueue:
                 f"WHERE state=? AND attempts=1 AND job_id IN ({placeholders})",
                 (PENDING, now, UNKNOWN, *job_ids),
             )
-            if connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_tasks'"
-            ).fetchone():
+            if _legacy_task_links_present(connection):
                 connection.execute(
                     f"UPDATE memory_tasks SET status=?, runner_token=NULL, "
                     f"last_error_code='model_content_unknown_auto_retry', updated_at=? "
@@ -1746,6 +2196,14 @@ class DurableWriteQueue:
     def resolve_unknown_from_linked_output(self, job_id: str) -> bool:
         """Close an unknown durable row when local governance output proves success."""
         with main_database(self.database_path).read(row_factory=sqlite3.Row) as connection:
+            if not (
+                _legacy_task_links_present(connection)
+                and connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_task_outputs'"
+                ).fetchone()
+            ):
+                # No legacy governance output survives the SDK cutover.
+                return False
             row = connection.execute(
                 """
                 SELECT 1
@@ -1853,11 +2311,13 @@ class DurableWriteRegistry:
         *,
         evidence: EvidenceStore | None = None,
         initialize: bool = True,
+        sdk_authority: bool = False,
     ) -> None:
         self.queue = DurableWriteQueue(
             database_path,
             evidence=evidence,
             initialize=initialize,
+            sdk_authority=sdk_authority,
         )
 
     @staticmethod
@@ -1893,6 +2353,8 @@ class DurableWriteRegistry:
             created_at=record.created_at,
             updated_at=record.updated_at,
             detail=detail,
+            raw_ids=record.sdk_raw_ids,
+            memory_ids=record.sdk_memory_ids,
         )
 
     def submit(
@@ -1975,12 +2437,11 @@ async def execute_job(
     admit_hy_invocation: Callable[[str, Callable[[], Awaitable[bool]]], Awaitable[bool]]
     | None = None,
 ) -> None:
-    """Run one durable job through the existing authorized processing path.
+    """Run one durable job through the SDK-authority processor.
 
-    The executor does not call HY directly: `process_records` owns the
-    permission guard, the runner and governance. `hy_invoked` is recorded
-    before that call, so a crash mid-write is later reclaimed to `unknown`
-    instead of being retried blindly.
+    ``process_sdk_job`` owns the one public SDK write. ``hy_invoked`` is
+    recorded immediately before that call, so a crash mid-write is later
+    reclaimed to ``unknown`` instead of being retried blindly.
     """
     # Every store call here is synchronous SQLite work on the single writer or
     # a reader; made from the loop it would block health checks and the API for
@@ -2053,10 +2514,13 @@ async def execute_job(
     try:
         level = ServiceLevel.REALTIME if request.priority == "live" else ServiceLevel.BACKGROUND
         with service_level_context(level):
-            await supervisor.process_records(
+            sdk_result = await supervisor.process_sdk_job(
                 records,
+                request_id=request.idempotency_key,
                 before_hy_invocation=mark_hy_invocation,
             )
+            raw_ids = sdk_result.raw_ids
+            memory_ids = sdk_result.memory_ids
     except Exception as error:  # noqa: BLE001 - classified below
         # Never persist the raw message: it may be a provider response or the
         # user's own text, and `last_error` is shown over HTTP as `detail`.
@@ -2071,7 +2535,7 @@ async def execute_job(
         ):
             await in_the_background(queue.release_unstarted, job_id, owner=owner)
             return
-        # The task layer classifies these before any bridge is opened, so HY
+        # The write coordinator classifies these before any SDK client is leased, so HY
         # was provably not called. They must not read as `failed`:
         # - authorization stop -> cancelled (the user turned it off);
         # - no permission yet -> waiting_for_permission (parked, re-admitted
@@ -2122,11 +2586,42 @@ async def execute_job(
         if code == "model_profile_not_active":
             logger.debug("durable_write_job_parked job_id=%s error_code=%s", job_id, code)
         elif state in PARKED_STATES:
-            logger.info("durable_write_job_parked job_id=%s error_code=%s", job_id, code)
+            logger.info(
+                "durable_write_job_parked job_id=%s error_code=%s chain=%s",
+                job_id,
+                code,
+                error_chain_text(error),
+            )
         else:
-            logger.error("durable_write_job_failed job_id=%s error_code=%s", job_id, code)
+            # Where it failed, as `file:line:function` frames of the exception
+            # chain, never its message: `error_code=AttributeError` alone
+            # named no location.
+            logger.error(
+                "durable_write_job_failed job_id=%s error_code=%s chain=%s",
+                job_id,
+                code,
+                error_chain_text(error),
+            )
         return
-    await in_the_background(queue.settle, job_id, state=COMPLETED, owner=owner)
+    await in_the_background(
+        queue.settle,
+        job_id,
+        state=COMPLETED,
+        owner=owner,
+        sdk_raw_ids=raw_ids,
+        sdk_memory_ids=memory_ids,
+    )
+    release = getattr(evidence, "release_sdk_staging", None)
+    durable_receipt = await in_the_background(queue.sdk_receipt, job_id)
+    if (
+        callable(release)
+        and durable_receipt is not None
+        and (durable_receipt.raw_ids or durable_receipt.memory_ids)
+    ):
+        await in_the_background(
+            release,
+            tuple(record.evidence_id for record in records),
+        )
 
 
 class DurableWriteDrain:
@@ -2188,10 +2683,14 @@ class DurableWriteDrain:
         #: sustained backlog must not keep finished rows' request bodies in the
         #: business database indefinitely. Its own gate so neither interval can
         #: starve the other.
+        self._last_payload_reap: datetime | None = None
         #: `waiting_for_model` re-admission is also time-based recoverability:
         #: a model outage clears on its own, and a queue that never goes idle
         #: must still re-admit the write once the wait has elapsed.
         self._last_model_readmit: datetime | None = None
+        #: A live conversation quiet for 10 minutes has its last turn and short
+        #: batch written (`flush_idle_assemblies`); checked on the same timer.
+        self._last_assembly_flush: datetime | None = None
         #: Idle polls do not need to hit the single writer every 50ms. A
         #: 1m Evidence table makes a miss expensive enough that the tail
         #: call-event write can be behind it; back off only while idle and
@@ -2299,6 +2798,39 @@ class DurableWriteDrain:
                 placeholders = ",".join("?" for _ in enabled_sources)
                 source_clause = f"AND candidate.source_key IN ({placeholders}) "
                 source_params = tuple(sorted(enabled_sources))
+            direct_sources = ",".join("?" for _ in DIRECT_WRITE_SOURCES)
+            # Same eligibility as the window claim below (free lease, no
+            # running job of its source, nothing earlier in its session), but
+            # not bound to the window: a note must not wait for history.
+            direct_rows = connection.execute(
+                "SELECT candidate.job_id,candidate.source_key "
+                "FROM memory_write_jobs AS candidate "
+                "WHERE candidate.state=? "
+                "AND (candidate.lease_expires_at IS NULL OR candidate.lease_expires_at < ?) "
+                + source_clause
+                + f"AND candidate.source_key IN ({direct_sources}) "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM memory_write_jobs AS held "
+                "WHERE held.source_key=candidate.source_key AND held.state=? "
+                "AND held.lease_owner IS NOT NULL AND held.lease_expires_at>=?) "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM memory_write_jobs AS earlier "
+                "WHERE earlier.session_key=candidate.session_key "
+                f"AND earlier.state IN ({blocking}) "
+                "AND (earlier.event_at<candidate.event_at OR "
+                "(earlier.event_at=candidate.event_at "
+                "AND earlier.queue_seq<candidate.queue_seq))) "
+                "ORDER BY candidate.queue_seq",
+                (
+                    PENDING,
+                    now.isoformat(),
+                    *source_params,
+                    *sorted(DIRECT_WRITE_SOURCES),
+                    RUNNING,
+                    now.isoformat(),
+                    *_FIFO_BLOCKING_STATES,
+                ),
+            ).fetchall()
             window = connection.execute(
                 "SELECT window_anchor,window_end FROM memory_write_schedule_state WHERE singleton=1"
             ).fetchone()
@@ -2352,6 +2884,7 @@ class DurableWriteDrain:
                 if active is None:
                     connection.execute("DELETE FROM memory_write_schedule_state WHERE singleton=1")
                     window = None
+            anchor: Any = None
             if window is None:
                 anchor = connection.execute(
                     "SELECT candidate.event_at "
@@ -2380,8 +2913,10 @@ class DurableWriteDrain:
                         *_FIFO_BLOCKING_STATES,
                     ),
                 ).fetchone()
-                if anchor is None:
+                if anchor is None and not direct_rows:
                     return ()
+            has_window = window is not None or anchor is not None
+            if window is None and anchor is not None:
                 anchor_at = datetime.fromisoformat(str(anchor[0]))
                 if anchor_at.tzinfo is None:
                     anchor_at = anchor_at.replace(tzinfo=UTC)
@@ -2393,39 +2928,41 @@ class DurableWriteDrain:
                     "VALUES (1,?,?,?)",
                     (anchor_text, end_text, now.isoformat()),
                 )
-            rows = connection.execute(
-                "SELECT candidate.job_id,candidate.source_key "
-                "FROM memory_write_jobs AS candidate "
-                "WHERE candidate.state=? "
-                "AND (candidate.lease_expires_at IS NULL OR candidate.lease_expires_at < ?) "
-                + source_clause
-                + "AND candidate.event_at>=? AND candidate.event_at<? "
-                "AND NOT EXISTS ("
-                "SELECT 1 FROM memory_write_jobs AS held "
-                "WHERE held.source_key=candidate.source_key AND held.state=? "
-                "AND held.lease_owner IS NOT NULL AND held.lease_expires_at>=?) "
-                "AND NOT EXISTS ("
-                "SELECT 1 FROM memory_write_jobs AS earlier "
-                "WHERE earlier.session_key=candidate.session_key "
-                f"AND earlier.state IN ({blocking}) "
-                "AND (earlier.event_at<candidate.event_at OR "
-                "(earlier.event_at=candidate.event_at "
-                "AND earlier.queue_seq<candidate.queue_seq))) "
-                "ORDER BY candidate.event_at,candidate.queue_seq",
-                (
-                    PENDING,
-                    now.isoformat(),
-                    *source_params,
-                    anchor_text,
-                    end_text,
-                    RUNNING,
-                    now.isoformat(),
-                    *_FIFO_BLOCKING_STATES,
-                ),
-            ).fetchall()
+            rows: list[Any] = []
+            if has_window:
+                rows = connection.execute(
+                    "SELECT candidate.job_id,candidate.source_key "
+                    "FROM memory_write_jobs AS candidate "
+                    "WHERE candidate.state=? "
+                    "AND (candidate.lease_expires_at IS NULL OR candidate.lease_expires_at < ?) "
+                    + source_clause
+                    + "AND candidate.event_at>=? AND candidate.event_at<? "
+                    "AND NOT EXISTS ("
+                    "SELECT 1 FROM memory_write_jobs AS held "
+                    "WHERE held.source_key=candidate.source_key AND held.state=? "
+                    "AND held.lease_owner IS NOT NULL AND held.lease_expires_at>=?) "
+                    "AND NOT EXISTS ("
+                    "SELECT 1 FROM memory_write_jobs AS earlier "
+                    "WHERE earlier.session_key=candidate.session_key "
+                    f"AND earlier.state IN ({blocking}) "
+                    "AND (earlier.event_at<candidate.event_at OR "
+                    "(earlier.event_at=candidate.event_at "
+                    "AND earlier.queue_seq<candidate.queue_seq))) "
+                    "ORDER BY candidate.event_at,candidate.queue_seq",
+                    (
+                        PENDING,
+                        now.isoformat(),
+                        *source_params,
+                        anchor_text,
+                        end_text,
+                        RUNNING,
+                        now.isoformat(),
+                        *_FIFO_BLOCKING_STATES,
+                    ),
+                ).fetchall()
             selected: list[str] = []
             selected_sources: set[str] = set()
-            for row in rows:
+            for row in (*direct_rows, *rows):
                 source_key = str(row["source_key"])
                 if source_key in selected_sources:
                     continue
@@ -2663,6 +3200,15 @@ class DurableWriteDrain:
                         self.queue.reclaim_expired,
                         operation_name="reclaim_expired",
                     )
+                if (
+                    self._last_payload_reap is None
+                    or tick_started - self._last_payload_reap >= self._reap_interval
+                ):
+                    self._last_payload_reap = tick_started
+                    await self._run_idle_maintenance(
+                        self.queue.clear_terminal_payloads,
+                        operation_name="clear_terminal_payloads",
+                    )
                 # A model outage clears on its own, so `waiting_for_model` jobs
                 # are re-admitted on a timer. That must not depend on idleness: a
                 # queue busy for longer than the wait window would otherwise keep
@@ -2676,6 +3222,15 @@ class DurableWriteDrain:
                     await self._run_idle_maintenance(
                         self.queue.readmit_model_waiters,
                         operation_name="readmit_model_waiters",
+                    )
+                if (
+                    self._last_assembly_flush is None
+                    or tick_started - self._last_assembly_flush >= self._reap_interval
+                ):
+                    self._last_assembly_flush = tick_started
+                    await self._run_idle_maintenance(
+                        self.queue.flush_idle_assemblies,
+                        operation_name="flush_idle_assemblies",
                     )
                 if self.reconcile_unknown is not None and (
                     self._last_unknown_reconcile is None

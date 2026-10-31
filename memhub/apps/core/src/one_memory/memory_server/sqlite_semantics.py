@@ -63,6 +63,8 @@ EXEMPT_PATHS = frozenset(
         "memory_server/migrations.py",
         "memory_server/sqlite_semantics.py",
         "memory_tasks.py",
+        "sdk_data_plane_migration.py",
+        "target_schema.py",
         # D93 A: the visibility cache is SQLite-only by construction. It is a
         # derived table with triggers on the six tables the read check reads —
         # all of them MemHub's own SQLite — so there is nothing here to push

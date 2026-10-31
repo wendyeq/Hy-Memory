@@ -18,6 +18,7 @@ CodingWriter - 写入端协调器
 import logging
 import time
 import uuid
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from ..agent.llm_provider import LLMProvider
@@ -50,6 +51,7 @@ class CodingWriter:
         embed_service: EmbedService,
         fact_reconciler: Optional[WorkingFactReconciler] = None,
         cache: Any = None,
+        variant: str = "working",
     ):
         self.store = store
         self.extractor = extractor
@@ -58,6 +60,11 @@ class CodingWriter:
         self.embed_service = embed_service
         self.fact_reconciler = fact_reconciler or WorkingFactReconciler(
             store, embed_service, llm_provider
+        )
+        self.variant = (
+            "coding"
+            if str(variant or "").strip().lower() == "coding"
+            else "working"
         )
         # cache 仅用于把 request_id 串给各阶段（各阶段自己打点）；writer 不集中打点。
         self.cache = cache
@@ -73,9 +80,11 @@ class CodingWriter:
         session_id: Optional[str] = None,
         request_id: Optional[str] = None,
         source: str = "default",
+        memory_at: Optional[datetime] = None,
     ) -> Dict[str, Any]:
         """
-        working/coding 段写入端到端。返回响应 dict（兼容 client.add 返回结构）：
+        working/coding 段写入端到端。memory_at 是对话时间，记到这次写出的经验和
+        事实上；不传则用收到请求的时间（与 chat 链路一致）。返回响应 dict（兼容 client.add 返回结构）：
             {
                 "success": True,
                 "scene": "productivity",
@@ -95,6 +104,8 @@ class CodingWriter:
         """
         request_id = request_id or str(uuid.uuid4())
         t0 = time.perf_counter()
+        if memory_at is None:
+            memory_at = datetime.now()
 
         if not messages:
             return self._empty_response(request_id, t0)
@@ -166,6 +177,7 @@ class CodingWriter:
         # extractor 只负责内容；调用来源由 SDK 入口注入，不能交给 LLM 生成。
         for draft in drafts:
             draft.source = source
+            draft.memory_at = memory_at
 
         # 3. 经验层 reconcile + 持久化
         ops: List[ReconcileOp] = (
@@ -191,6 +203,7 @@ class CodingWriter:
                 workspace_id=workspace_id,
                 branch=branch,
                 source=source,
+                memory_at=memory_at,
             )
 
         experience_ids = [op.target_experience_id for op in ops
@@ -217,6 +230,7 @@ class CodingWriter:
         return {
             "success": True,
             "scene": "productivity",
+            "variant": self.variant,
             "request_id": request_id,
             "elapsed_ms": round((time.perf_counter() - t0) * 1000, 2),
             "ops": [op.to_dict() for op in ops],
@@ -278,11 +292,11 @@ class CodingWriter:
                         f"[coding-write] crosslink fact {f.fact_id} failed: {e}"
                     )
 
-    @staticmethod
-    def _empty_response(request_id: str, t0: float) -> Dict[str, Any]:
+    def _empty_response(self, request_id: str, t0: float) -> Dict[str, Any]:
         return {
             "success": True,
             "scene": "productivity",
+            "variant": self.variant,
             "request_id": request_id,
             "elapsed_ms": round((time.perf_counter() - t0) * 1000, 2),
             "ops": [],

@@ -9,6 +9,31 @@ import {
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { App } from "./App";
+import { LANGUAGE_STORAGE_KEY, LanguageProvider } from "./gui-language";
+
+it("localizes shared navigation and footer in Spanish", async () => {
+  localStorage.setItem(LANGUAGE_STORAGE_KEY, "es");
+  render(
+    <LanguageProvider>
+      <App />
+    </LanguageProvider>,
+  );
+  const nav = await screen.findByRole("navigation", {
+    name: "Navegación principal",
+  });
+  expect(
+    within(nav)
+      .getAllByRole("button")
+      .map((button) => button.textContent),
+  ).toEqual(["Aplicaciones", "Memorias", "Configuración"]);
+  expect(within(nav).getByRole("button", { name: "Configuración" }).title).toBe(
+    "Configuración",
+  );
+  expect(screen.getAllByText("Almacenamiento local").length).toBeGreaterThan(0);
+  expect(
+    screen.getByRole("link", { name: "Saltar al contenido principal" }),
+  ).toBeTruthy();
+});
 
 const memoryProps = vi.hoisted(() => vi.fn());
 
@@ -38,9 +63,7 @@ vi.mock("./ModelSettings", () => ({
   ModelSettings: () => <p>模型设置内容</p>,
 }));
 vi.mock("./ImportProgressStrip", () => ({ ImportProgressStrip: () => null }));
-vi.mock("./MatterWorkspace", () => ({ MatterWorkspace: () => null }));
 vi.mock("./HealthPanel", () => ({ HealthPanel: () => null }));
-vi.mock("./FirstUseGuide", () => ({ FirstUseGuide: () => null }));
 vi.mock("./OnboardingFlow", () => ({ OnboardingFlow: () => null }));
 
 beforeEach(() => {

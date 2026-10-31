@@ -2,8 +2,10 @@
 
 import asyncio
 import json
+import os
 import sqlite3
 from contextlib import closing
+from datetime import UTC, datetime, timedelta
 from io import StringIO
 from pathlib import Path
 
@@ -20,6 +22,7 @@ from one_memory.memory_server.durable_queue import (
     DurableWriteQueue,
     execute_job,
 )
+from one_memory.sdk_write_processor import SdkWriteReceipt
 
 
 def _grant(tmp_path, source_id: str, *, sync: bool) -> EvidenceStore:
@@ -105,7 +108,15 @@ def test_same_message_id_from_the_file_does_not_duplicate(tmp_path) -> None:
     assert store.count() == 1
 
 
+def _quiet_for_ten_minutes(database: Path, store: EvidenceStore) -> tuple[str, ...]:
+    """What Core's drain does once a live conversation has been quiet."""
+    return DurableWriteQueue(database, evidence=store).flush_idle_assemblies(
+        now=datetime.now(UTC) + timedelta(minutes=11)
+    )
+
+
 def test_hook_submits_complete_turn_to_the_live_durable_lane(tmp_path) -> None:
+    """The turn rule holds the turn until the next user message or 10 quiet minutes."""
     store = _grant(tmp_path, "workbuddy", sync=True)
     database = tmp_path / "one-memory.sqlite3"
 
@@ -131,9 +142,12 @@ def test_hook_submits_complete_turn_to_the_live_durable_lane(tmp_path) -> None:
     )
 
     with closing(sqlite3.connect(database)) as db:
+        assert db.execute("SELECT state FROM memory_write_jobs").fetchall() == [("assembling",)]
+    assert len(_quiet_for_ten_minutes(database, store)) == 1
+    with closing(sqlite3.connect(database)) as db:
         row = db.execute(
             "SELECT priority,evidence_ids_json FROM memory_write_jobs "
-            "WHERE idempotency_key LIKE 'turn:v1:%'"
+            "WHERE idempotency_key LIKE 'turn:v2:%'"
         ).fetchone()
     assert row[0] == "live"
     assert len(json.loads(row[1])) == 2
@@ -157,6 +171,41 @@ def test_hook_submits_complete_turn_to_the_live_durable_lane(tmp_path) -> None:
     with closing(sqlite3.connect(database)) as db:
         assert db.execute("SELECT COUNT(*) FROM memory_write_jobs").fetchone() == (1,)
         assert db.execute("SELECT COUNT(*) FROM evidence").fetchone() == (2,)
+
+
+def test_hook_writes_five_turns_once_the_next_user_message_arrives(tmp_path) -> None:
+    store = _grant(tmp_path, "workbuddy", sync=True)
+    database = tmp_path / "one-memory.sqlite3"
+
+    def say(event: str, field: str, message_id: str, text: str) -> None:
+        assert capture_hook(
+            "workbuddy",
+            {
+                "hook_event_name": event,
+                "session_id": "sess-five",
+                "message_id": message_id,
+                field: text,
+            },
+            database,
+        )
+
+    for index in range(5):
+        say("UserPromptSubmit", "prompt", f"u{index}", f"第 {index} 个偏好")
+        say("Stop", "last_assistant_message", f"a{index}", f"记住第 {index} 个")
+    with closing(sqlite3.connect(database)) as db:
+        assert db.execute("SELECT state FROM memory_write_jobs").fetchall() == [("assembling",)]
+
+    say("UserPromptSubmit", "prompt", "u5", "第 5 个偏好")
+
+    with closing(sqlite3.connect(database)) as db:
+        rows = db.execute(
+            "SELECT state,evidence_ids_json FROM memory_write_jobs ORDER BY queue_seq"
+        ).fetchall()
+    assert [(state, len(json.loads(ids))) for state, ids in rows] == [
+        ("assembling", 0),
+        ("pending", 10),
+    ]
+    assert store.count() == 11
 
 
 def test_file_adopts_the_hook_row_when_the_text_is_unique(tmp_path) -> None:
@@ -209,6 +258,7 @@ def test_hook_job_completes_after_file_identity_adoption(tmp_path) -> None:
         },
         database,
     )
+    assert len(_quiet_for_ten_minutes(database, store)) == 1
     for message_id, role, author, text in (
         ("file-user", "user", WrittenBy.PERSON, "我喜欢蓝莓"),
         ("file-assistant", "assistant", WrittenBy.AGENT, "我会记住你喜欢蓝莓"),
@@ -233,14 +283,14 @@ def test_hook_job_completes_after_file_identity_adoption(tmp_path) -> None:
         ).fetchone()
 
     class IdentityCheckingSupervisor:
-        async def process_records(
+        async def process_sdk_job(
             self,
             records,
             *,
+            request_id,
             before_hy_invocation,
-            source_admitted,
         ):
-            assert source_admitted is True
+            assert request_id
             with closing(sqlite3.connect(database)) as connection:
                 connection.execute("BEGIN")
                 for record in records:
@@ -249,7 +299,7 @@ def test_hook_job_completes_after_file_identity_adoption(tmp_path) -> None:
                     assert ingest_journal.matches_current(connection, current)
                 connection.rollback()
             await before_hy_invocation()
-            return ()
+            return SdkWriteReceipt()
 
     drain = DurableWriteDrain(queue, execute=lambda _job: None)
     assert drain.claim(limit=1) == (job_id,)
@@ -558,6 +608,30 @@ def test_capture_failure_stays_silent(tmp_path, monkeypatch) -> None:
     )
     assert cli.run(["capture", "workbuddy"], output=output) == 0
     assert output.getvalue() == ""
+
+
+def test_capture_is_a_silent_noop_during_sdk_migration(tmp_path, monkeypatch) -> None:
+    database = tmp_path / "one-memory.sqlite3"
+    marker = tmp_path / ".sdk-migration-capture-fence.json"
+    marker.write_text(json.dumps({"schema_version": 1, "pid": os.getpid()}))
+    monkeypatch.setattr("one_memory.live_capture.database_path", lambda: database)
+    monkeypatch.setattr(
+        "sys.stdin",
+        StringIO(
+            json.dumps(
+                {
+                    "hook_event_name": "beforeSubmitPrompt",
+                    "conversation_id": "session",
+                    "prompt": "not persisted during migration",
+                }
+            )
+        ),
+    )
+    output = StringIO()
+
+    assert cli.run(["capture", "cursor"], output=output) == 0
+    assert output.getvalue() == ""
+    assert not database.exists()
 
 
 def test_codex_harness_preamble_is_not_a_user_message(tmp_path) -> None:

@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "one-memory"
-version = "1.0.4"
+version = "1.0.5"
 description = "MemHub local-first memory core"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -12,8 +12,9 @@ dependencies = [
     "fastapi>=0.141.1",
     "filelock>=3.32.4",
     # Public SDK version validated against MemHub's permission and recall contracts.
-    "hy-memory==2.0.4",
-    # Retrieval's derived vector index directly consumes these locked versions.
+    "hy-memory==2.0.8",
+    # chromadb arrives through the HY SDK; locked here so an unrelated upgrade
+    # cannot move the SDK's store. Built-in embedding consumes numpy directly.
     "chromadb==1.5.9",
     "numpy==2.5.2",
     "httpx>=0.28.1",

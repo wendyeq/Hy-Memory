@@ -1,7 +1,7 @@
 """A3-01: the HTTP entry to the unified write path.
 
-`POST /api/v1/memory-writes` accepts a write and returns a request id;
-`GET /api/v1/memory-writes/{id}` reports its outcome.
+`POST /api/v2/memory-writes` accepts OpenAI-style messages and returns a
+request id; `GET /api/v2/memory-writes/{id}` reports its outcome.
 
 Two rules shape this endpoint, both consequences of A0-03's measurement that HY
 has no idempotency key:
@@ -19,12 +19,24 @@ does the writing. That separation is D52.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any, Literal, cast
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
-from one_memory.memory_server.contracts import BatchIdentity, WriteRequest
+from one_memory.imports.models import (
+    EvidenceInput,
+    EvidenceOrigin,
+    OriginMetadata,
+    WrittenBy,
+    materialize_write_input,
+)
+from one_memory.memory_server.contracts import (
+    BatchIdentity,
+    WriteRequest,
+    internal_session_id_for,
+)
 from one_memory.memory_server.durable_queue import (
     DurableQueueSchemaUnavailableError,
     DurableWriteRegistry,
@@ -33,23 +45,32 @@ from one_memory.memory_server.registry import WriteRegistry, WriteState
 from one_memory.memory_server.submit import WriteConflictError
 
 
-class MemoryWriteInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    internal_session_id: str = Field(min_length=1, max_length=128)
-    first_round: int = Field(ge=1)
-    last_round: int = Field(ge=1)
-    evidence_ids: list[str] = Field(min_length=1)
-    priority: Literal["live", "normal"] = "normal"
-    idempotency_key: str | None = Field(default=None, max_length=256)
-
-
 class MemoryWriteReceipt(BaseModel):
     request_id: str
     state: WriteState
     created_at: str
     updated_at: str
     detail: str = ""
+    raw_ids: tuple[str, ...] = ()
+    memory_ids: tuple[str, ...] = ()
+
+
+class OpenAIMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: Literal["user", "assistant", "tool"]
+    content: str = Field(min_length=1, max_length=12_000)
+
+
+class SdkMemoryWriteInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str = Field(min_length=1, max_length=256)
+    session_id: str = Field(min_length=1, max_length=512)
+    source_id: str = Field(default="memhub-cli", min_length=1, max_length=128)
+    messages: list[OpenAIMessage] = Field(min_length=1, max_length=200)
+    memory_at: datetime | None = None
+    priority: Literal["live", "normal"] = "normal"
 
 
 def _registry(
@@ -74,44 +95,88 @@ def _registry(
         # makes `submit` reject ids the business database does not contain,
         # instead of deferring that to the drain as a late `failed` job.
         evidence = getattr(request.app.state, "memory_write_evidence_store", None)
-        registry = DurableWriteRegistry(database_path, evidence=evidence)
+        authority = getattr(request.app.state, "memory_authority", None)
+        if getattr(authority, "value", authority) == "sdk":
+            registry = DurableWriteRegistry(
+                database_path,
+                evidence=None,
+                sdk_authority=True,
+            )
+        else:
+            registry = DurableWriteRegistry(database_path, evidence=evidence)
         request.app.state.memory_write_registry = registry
     if registry is None:
         raise HTTPException(503, "memory write registry unavailable")
     return cast(WriteRegistry | DurableWriteRegistry, registry)
 
 
-def router(dependencies: list[Any] | None = None) -> APIRouter:
+def sdk_router(dependencies: list[Any] | None = None) -> APIRouter:
     instance = APIRouter(
-        prefix="/api/v1/memory-writes",
+        prefix="/api/v2/memory-writes",
         tags=["memory-writes"],
         dependencies=dependencies or [],
     )
 
     @instance.post("", response_model=MemoryWriteReceipt, status_code=202)
-    def submit(payload: MemoryWriteInput, request: Request) -> MemoryWriteReceipt:
-        registry = _registry(request)
-        batch = BatchIdentity(
-            internal_session_id=payload.internal_session_id,
-            first_round=payload.first_round,
-            last_round=payload.last_round,
+    def submit_messages(
+        payload: SdkMemoryWriteInput,
+        request: Request,
+    ) -> MemoryWriteReceipt:
+        if not any(message.role == "user" for message in payload.messages):
+            raise HTTPException(422, "messages_require_user_turn")
+        observed_at = payload.memory_at or datetime(1970, 1, 1, tzinfo=UTC)
+        written_by = {
+            "user": WrittenBy.PERSON,
+            "assistant": WrittenBy.AGENT,
+            "tool": WrittenBy.TOOL,
+        }
+        records = tuple(
+            materialize_write_input(
+                EvidenceInput(
+                    source_id=payload.source_id,
+                    conversation_id=payload.session_id,
+                    message_id=f"{payload.request_id}:{index}",
+                    role=message.role,
+                    written_by=written_by[message.role],
+                    created_at=payload.memory_at,
+                    verbatim=message.content,
+                    origin_meta={
+                        EvidenceOrigin.MANUAL_IMPORT: OriginMetadata(
+                            raw_meta={
+                                "input_mode": "openai_messages",
+                                "request_id": payload.request_id,
+                                "message_index": index,
+                            }
+                        )
+                    },
+                ),
+                observed_at=observed_at,
+            )
+            for index, message in enumerate(payload.messages)
         )
-        request_contract = WriteRequest(
-            internal_session_id=payload.internal_session_id,
-            batch_identity=batch,
-            evidence_ids=payload.evidence_ids,
-            idempotency_key=payload.idempotency_key or batch.batch_id,
+        internal_session_id = internal_session_id_for(
+            payload.session_id,
+            payload.source_id,
+        )
+        contract = WriteRequest(
+            internal_session_id=internal_session_id,
+            source_id=payload.source_id,
+            batch_identity=BatchIdentity(
+                internal_session_id=internal_session_id,
+                first_round=1,
+                last_round=len(records),
+            ),
+            evidence_ids=[record.evidence_id for record in records],
+            input_records=records,
+            idempotency_key=payload.request_id,
             priority=payload.priority,
+            event_at=payload.memory_at,
+            time_quality="exact" if payload.memory_at is not None else "approximate",
         )
         try:
-            record, enqueued = registry.submit(request_contract)
-        except WriteConflictError as error:
+            record, enqueued = _registry(request).submit(contract)
+        except (WriteConflictError, ValueError) as error:
             raise HTTPException(409, str(error)) from error
-        except LookupError as error:
-            # Evidence-first: the write points at Evidence the business
-            # database does not hold. Rejecting it here is a caller error, not
-            # a server fault, and it must not create a queue row.
-            raise HTTPException(422, str(error)) from error
         return MemoryWriteReceipt(
             request_id=record.request_id,
             state=record.state,
@@ -135,6 +200,8 @@ def router(dependencies: list[Any] | None = None) -> APIRouter:
             created_at=record.created_at,
             updated_at=record.updated_at,
             detail=record.detail,
+            raw_ids=record.raw_ids,
+            memory_ids=record.memory_ids,
         )
 
     return instance

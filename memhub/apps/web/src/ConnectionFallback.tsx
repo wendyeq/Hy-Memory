@@ -1,21 +1,160 @@
 import { Copy, RefreshCw } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { copyText } from "./copy-text";
+import { useGuiLanguage } from "./gui-language";
 
-type Material = { mcp: string; shell: string | null; prompt: string };
-type Mode = keyof Material;
+type Material = { displayName: string; expiresAt: string; skill: string };
+type ConnectionMaterial = {
+  mcp: string;
+  shell: string | null;
+  prompt: string;
+};
+type MaterialBridge = {
+  getConnectionMaterial(): Promise<ConnectionMaterial>;
+};
 
-export function ConnectionFallback() {
+export function ConnectionFallback({
+  defaultExpanded = false,
+}: {
+  defaultExpanded?: boolean;
+} = {}) {
+  const { locale, t } = useGuiLanguage();
+  const [expanded, setExpanded] = useState(defaultExpanded);
+  const [displayName, setDisplayName] = useState("");
   const [material, setMaterial] = useState<Material | null>(null);
-  const [mode, setMode] = useState<Mode>("prompt");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(false);
   const [notice, setNotice] = useState("");
-  const available = !!window.oneMemory?.getConnectionMaterial;
+  const available = !!window.oneMemory?.createCustomHarnessSkill;
+  const materialBridge = window.oneMemory as
+    | (Window["oneMemory"] & Partial<MaterialBridge>)
+    | undefined;
+
+  async function generate() {
+    const bridge = window.oneMemory;
+    const name = displayName.trim();
+    if (!bridge?.createCustomHarnessSkill || loading || !name) return;
+    setLoading(true);
+    setError(false);
+    setNotice("");
+    try {
+      setMaterial(await bridge.createCustomHarnessSkill(name));
+    } catch {
+      setError(true);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <details
+      className="connection-fallback"
+      open={expanded}
+      onToggle={(event) => setExpanded(event.currentTarget.open)}
+    >
+      <summary>{t("connectionFallback.title")}</summary>
+      {materialBridge?.getConnectionMaterial ? (
+        <ConnectionMaterialFallback
+          bridge={materialBridge as Window["oneMemory"] & MaterialBridge}
+        />
+      ) : !available ? (
+        <p>{t("connectionFallback.desktopOnly")}</p>
+      ) : (
+        <>
+          <p className="connection-boundary">
+            {t("connectionFallback.description")}
+          </p>
+          <label className="custom-harness-name">
+            {t("connectionFallback.name")}
+            <input
+              value={displayName}
+              maxLength={80}
+              placeholder={t("connectionFallback.namePlaceholder")}
+              onChange={(event) => {
+                setDisplayName(event.target.value);
+                setMaterial(null);
+                setError(false);
+                setNotice("");
+              }}
+            />
+          </label>
+          <button
+            type="button"
+            disabled={loading || !displayName.trim()}
+            onClick={() => void generate()}
+          >
+            {loading
+              ? t("connectionFallback.generating")
+              : t("connectionFallback.generate")}
+          </button>
+          {error && (
+            <p role="alert">
+              {t("connectionFallback.generateFailed")}
+              <button
+                type="button"
+                className="quiet"
+                onClick={() => void generate()}
+              >
+                <RefreshCw size={15} aria-hidden="true" />
+                {t("connectionFallback.retry")}
+              </button>
+            </p>
+          )}
+          {material && (
+            <>
+              <p>
+                {t("connectionFallback.generated", {
+                  name: material.displayName,
+                  time: new Intl.DateTimeFormat(locale, {
+                    hour: "2-digit",
+                    minute: "2-digit",
+                    second: "2-digit",
+                  }).format(new Date(material.expiresAt)),
+                })}
+              </p>
+              <textarea
+                aria-label={t("connectionFallback.skillLabel")}
+                readOnly
+                value={material.skill}
+                spellCheck={false}
+              />
+              <button
+                type="button"
+                className="secondary"
+                onClick={async () => {
+                  try {
+                    await copyText(material.skill);
+                    setNotice(t("connectionFallback.copied"));
+                  } catch {
+                    setNotice(t("connectionFallback.copyFailed"));
+                  }
+                }}
+              >
+                <Copy size={15} aria-hidden="true" />
+                {t("connectionFallback.copy")}
+              </button>
+            </>
+          )}
+          {notice && <p role="status">{notice}</p>}
+        </>
+      )}
+    </details>
+  );
+}
+
+function ConnectionMaterialFallback({
+  bridge,
+}: {
+  bridge: Window["oneMemory"] & MaterialBridge;
+}) {
+  const { locale, t } = useGuiLanguage();
+  const [material, setMaterial] = useState<ConnectionMaterial | null>(null);
+  const [tab, setTab] = useState<"prompt" | "mcp" | "shell">("prompt");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(false);
+  const [notice, setNotice] = useState("");
 
   async function load() {
-    const bridge = window.oneMemory;
-    if (!bridge?.getConnectionMaterial || loading) return;
     setLoading(true);
     setError(false);
     try {
@@ -27,101 +166,118 @@ export function ConnectionFallback() {
     }
   }
 
+  useEffect(() => {
+    let current = true;
+    void bridge.getConnectionMaterial().then(
+      (value) => {
+        if (!current) return;
+        setMaterial(value);
+        setLoading(false);
+      },
+      () => {
+        if (!current) return;
+        setError(true);
+        setLoading(false);
+      },
+    );
+    // The material is a snapshot. Language changes re-render its presentation
+    // without reading paths or snippets again.
+    return () => {
+      current = false;
+    };
+  }, [bridge]);
+
+  if (loading && !material)
+    return <p role="status">{t("connectionFallback.loading")}</p>;
+  if (error && !material)
+    return (
+      <p role="alert">
+        {t("connectionFallback.loadFailed")}
+        <button type="button" className="quiet" onClick={() => void load()}>
+          <RefreshCw size={15} aria-hidden="true" />
+          {t("connectionFallback.retry")}
+        </button>
+      </p>
+    );
+  if (!material) return null;
+
+  const shellBlock = material.shell
+    ? t("connectionFallback.promptShell", { shell: material.shell })
+    : "";
+  const prompt =
+    locale === "zh-CN"
+      ? material.prompt
+      : t("connectionFallback.promptTemplate", {
+          mcp: material.mcp,
+          shellBlock,
+        });
+  const value =
+    tab === "prompt"
+      ? prompt
+      : tab === "mcp"
+        ? material.mcp
+        : (material.shell ?? "");
+  const copyLabel =
+    tab === "prompt"
+      ? t("connectionFallback.copyPrompt")
+      : tab === "mcp"
+        ? t("connectionFallback.copyConfig")
+        : t("connectionFallback.copyCommand");
+
   return (
-    <details
-      className="connection-fallback"
-      onToggle={(event) => {
-        if (event.currentTarget.open && !material && !loading && !error)
-          void load();
-      }}
-    >
-      <summary>连接其他工具</summary>
-      {!available ? (
-        <p>本机连接材料仅在桌面 App 中可用。</p>
-      ) : (
-        <>
-          <p className="connection-boundary">
-            仅本机 MCP / 命令工具。纯网页聊天不支持直接连接本机。
-          </p>
-          <p>列表内工具请用上方一键安装，此处仅供未列出的工具。</p>
-          {loading && <p role="status">正在读取本机连接配置…</p>}
-          {error && (
-            <p role="alert">
-              未能读取连接配置。
-              <button
-                type="button"
-                className="quiet"
-                onClick={() => void load()}
-              >
-                <RefreshCw size={15} aria-hidden="true" />
-                重试
-              </button>
-            </p>
-          )}
-          {material && (
-            <>
-              <div
-                role="tablist"
-                aria-label="连接材料格式"
-                className="connection-modes"
-              >
-                {(
-                  [
-                    ["prompt", "连接提示词"],
-                    ["mcp", "MCP 配置"],
-                    ["shell", "命令"],
-                  ] as const
-                ).map(([id, label]) => (
-                  <button
-                    key={id}
-                    type="button"
-                    role="tab"
-                    aria-selected={mode === id}
-                    disabled={material[id] === null}
-                    onClick={() => {
-                      setMode(id);
-                      setNotice("");
-                    }}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-              <textarea
-                aria-label="本机连接材料"
-                readOnly
-                value={material[mode] ?? ""}
-                spellCheck={false}
-              />
-              <p>
-                包含本机路径，不含记忆和密钥。片段会运行本机 MemHub
-                连接程序；粘贴前请确认，MemHub 需保持运行。
-              </p>
-              <button
-                type="button"
-                className="secondary"
-                onClick={async () => {
-                  try {
-                    await copyText(material[mode] ?? "");
-                    setNotice("已复制，尚未建立连接。");
-                  } catch {
-                    setNotice("复制失败，可在上方选中文本复制。");
-                  }
-                }}
-              >
-                <Copy size={15} aria-hidden="true" />
-                复制
-                {mode === "prompt"
-                  ? "提示词"
-                  : mode === "mcp"
-                    ? "配置"
-                    : "命令"}
-              </button>
-              {notice && <p role="status">{notice}</p>}
-            </>
-          )}
-        </>
-      )}
-    </details>
+    <>
+      <p className="connection-boundary">
+        {t("connectionFallback.localDescription")}
+      </p>
+      <fieldset>
+        <legend>{t("connectionFallback.format")}</legend>
+        <div role="tablist">
+          {(
+            [
+              ["prompt", t("connectionFallback.promptTab")],
+              ["mcp", t("connectionFallback.mcpTab")],
+              ["shell", t("connectionFallback.commandTab")],
+            ] as const
+          ).map(([value, label]) => (
+            <button
+              key={value}
+              type="button"
+              role="tab"
+              aria-selected={tab === value}
+              disabled={value === "shell" && !material.shell}
+              onClick={() => {
+                setTab(value);
+                setNotice("");
+              }}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      </fieldset>
+      <textarea
+        aria-label={t("connectionFallback.materialLabel")}
+        readOnly
+        value={value}
+        spellCheck={false}
+      />
+      <p>{t("connectionFallback.materialBoundary")}</p>
+      <button
+        type="button"
+        className="secondary"
+        onClick={async () => {
+          try {
+            await copyText(value);
+            setNotice(t("connectionFallback.materialCopied"));
+          } catch {
+            setNotice(t("connectionFallback.copyFailed"));
+          }
+        }}
+      >
+        <Copy size={15} aria-hidden="true" />
+        {copyLabel}
+      </button>
+      {notice && <p role="status">{notice}</p>}
+    </>
   );
 }

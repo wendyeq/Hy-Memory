@@ -81,9 +81,10 @@ def test_backfill_puts_history_on_write_jobs_without_scheduling_memory_tasks(tmp
         task_table = connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_tasks'"
         ).fetchone()
-        assert task_table is None or connection.execute(
-            "SELECT COUNT(*) FROM memory_tasks"
-        ).fetchone()[0] == 0
+        assert (
+            task_table is None
+            or connection.execute("SELECT COUNT(*) FROM memory_tasks").fetchone()[0] == 0
+        )
 
 
 def test_source_pause_skips_history_until_the_source_is_reenabled(tmp_path) -> None:
@@ -111,9 +112,7 @@ def test_the_manual_source_is_admitted_by_grant_without_a_toggle(tmp_path) -> No
     app = SimpleNamespace(
         state=SimpleNamespace(
             config_store=config,
-            model_profile_store=SimpleNamespace(
-                active_identity=lambda: ("profile", 1)
-            ),
+            model_profile_store=SimpleNamespace(active_identity=lambda: ("profile", 1)),
             source_grant_store=SimpleNamespace(
                 receipt=lambda **_kwargs: SimpleNamespace(revoked_at=None)
             ),
@@ -125,6 +124,28 @@ def test_the_manual_source_is_admitted_by_grant_without_a_toggle(tmp_path) -> No
 
     assert _sedimentation_claim_enabled(app, "one-memory-manual") is True
     config.set_sedimentation_enabled(False)
+    assert _sedimentation_claim_enabled(app, "one-memory-manual") is False
+
+
+def test_the_manual_source_is_allowed_without_a_grant_row_until_revoked(tmp_path) -> None:
+    """The SDK add path writes no grant row, and intake admits the record.
+
+    Claim must answer the same: a missing row is allowed, an explicit
+    revocation is not.
+    """
+    receipt: list[object] = [None]
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            config_store=ConfigStore(tmp_path),
+            model_profile_store=SimpleNamespace(active_identity=lambda: ("profile", 1)),
+            source_grant_store=SimpleNamespace(receipt=lambda **_kwargs: receipt[0]),
+        )
+    )
+
+    assert _source_writes_on(app, "one-memory-manual") is True
+    assert _sedimentation_claim_enabled(app, "one-memory-manual") is True
+    receipt[0] = SimpleNamespace(revoked_at="2026-10-27")
+    assert _source_writes_on(app, "one-memory-manual") is False
     assert _sedimentation_claim_enabled(app, "one-memory-manual") is False
 
 

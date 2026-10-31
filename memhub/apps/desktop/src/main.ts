@@ -6,9 +6,10 @@ import {
   checkSkillDrift,
   planRecallRepoint,
   readInstallSelfCheck,
-  renderConnectionMaterial,
+  renderCustomHarnessSkill,
   verifyRecallInstall,
 } from "@one-memory/host-bridge/installer";
+import { type GuiLocale, translate } from "@one-memory/i18n";
 import {
   claimRuntimeServiceForApp,
   claimRuntimeServiceForCli,
@@ -24,11 +25,14 @@ import {
   installUserService,
   RecallBrokerSupervisor,
   RuntimeSupervisor,
+  readInstalledRuntimeSource,
   readPublishedCorePort,
   readRuntimeServiceOwner,
+  readSdkMigrationBlock,
   removeRuntimeServiceOwner,
   runtimeInstallLayout,
   runtimeServiceEnableMarkerPath,
+  type SdkMigrationSource,
   stopRuntimeProcess,
   waitForRuntimeProcess,
   writeRuntimeServiceOwner,
@@ -92,10 +96,16 @@ import {
   resolvePackagedCommit,
 } from "./isolated-runtime";
 import {
+  LanguagePreferences,
+  preferredSystemLanguage,
+} from "./language-preferences";
+import { installLanguagePreferencesIpc } from "./language-preferences-ipc";
+import {
   disableLegacyLoginItem,
   wasOpenedByLegacyLoginItem,
 } from "./login-item";
 import { readLoginPreference, setLoginPreference } from "./login-preference";
+import { showMigrationFailureDialog } from "./migration-failure-dialog";
 import { isAllowedNavigation } from "./navigation-policy";
 import { installDenyAllPermissionPolicy } from "./permissions";
 import { isHostPresent, recallHosts } from "./recall-hosts";
@@ -106,10 +116,17 @@ import {
   installBundledCliIfNeeded,
   installServiceWithDisabledFallback,
   isInstalledApplicationsApp,
+  requireCurrentRuntimeAtLeast,
   stableRuntimeErrorCode,
+  stableRuntimeFailureDetail,
   startStableRuntimeRepair,
+  startupFailureCause,
 } from "./stable-runtime";
 import { STARTUP_SCREEN_URL, startupScreenHtml } from "./startup-screen";
+import {
+  requireCompletedStartupSdkMigration,
+  runStartupSdkMigration,
+} from "./startup-sdk-migration";
 import { resolveTrialProfile } from "./trial-profile";
 import { createWindowOptions } from "./window-options";
 
@@ -124,6 +141,9 @@ let runtimeSupervisor: RuntimeSupervisor | null = null;
 let runtimeDataDir: string | null = null;
 let preserveManagedRuntimeOnQuit = false;
 let disposeTray: (() => void) | null = null;
+let disposeApplicationMenu: (() => void) | null = null;
+let languagePreferences: LanguagePreferences | null = null;
+let disposeLanguagePreferences: (() => void) | null = null;
 const displayWindows = new Set<BrowserWindow>();
 let disposeDisplayPreferences: (() => void) | null = null;
 let disposeSourceDirectoryPicker: (() => void) | null = null;
@@ -145,6 +165,7 @@ installEarlyStartupErrorHandler({
     process.env.ONE_MEMORY_DATA_DIR?.trim() ||
     path.join(app.getPath("home"), ".one-memory"),
   stderr: process.stderr,
+  readLocale: () => languagePreferences?.read().locale ?? "zh-CN",
   showError: (title, message) => dialog.showErrorBox(title, message),
   exit: (code) => app.exit(code),
 });
@@ -273,7 +294,16 @@ let appProtocolInstalled = false;
 function installPackagedWebProtocol(): void {
   if (!app.isPackaged || appProtocolInstalled) return;
   installAppProtocol(path.join(process.resourcesPath, "web"), {
-    startupScreen: startupScreenHtml,
+    // Preferences are open by now: beforeNativeUi runs before this window.
+    startupScreen: () => {
+      let locale: GuiLocale = "zh-CN";
+      try {
+        locale = languagePreferences?.read().locale ?? "zh-CN";
+      } catch {
+        // An unreadable preference keeps the Chinese placeholder.
+      }
+      return startupScreenHtml(locale);
+    },
   });
   appProtocolInstalled = true;
 }
@@ -525,6 +555,11 @@ async function initialize(isQuitting: () => boolean): Promise<void> {
         "apps/core/.venv/bin",
         process.platform === "win32" ? "one-memory.exe" : "one-memory",
       ),
+    hermesProviderSource: path.join(
+      path.dirname(stable?.mcpEntryPath ?? path.join(hostBridgeDir, "mcp.cjs")),
+      "hermes-provider",
+      "hy_memory",
+    ),
     dataDir,
   };
   const standaloneRuntime =
@@ -712,7 +747,6 @@ async function initialize(isQuitting: () => boolean): Promise<void> {
       resourcesPath: process.resourcesPath,
       platform: process.platform,
     }),
-    readerEnabled: process.platform !== "win32",
     dataDir,
     attempts: app.isPackaged ? 300 : 50,
     delayMs: app.isPackaged ? 250 : 200,
@@ -788,12 +822,31 @@ async function initialize(isQuitting: () => boolean): Promise<void> {
       return { opened: true as const, reason: null };
     },
   );
-  ipcMain.handle("one-memory:connection-material", (event) => {
-    assertAllowedRenderer(event.senderFrame?.url);
-    if (hostRuntimeSelection?.state === "blocked")
-      throw new Error(hostRuntimeSelection.code);
-    return renderConnectionMaterial(recallRuntime);
-  });
+  ipcMain.handle(
+    "one-memory:create-custom-harness-skill",
+    async (event, displayName: unknown) => {
+      assertAllowedRenderer(event.senderFrame?.url);
+      if (hostRuntimeSelection?.state === "blocked")
+        throw new Error(hostRuntimeSelection.code);
+      if (
+        typeof displayName !== "string" ||
+        displayName !== displayName.trim() ||
+        displayName.length < 1 ||
+        displayName.length > 80 ||
+        /[\0\r\n]/.test(displayName)
+      )
+        throw new Error("custom_harness_name_invalid");
+      const pairing = connectionClient?.createPairing
+        ? await connectionClient.createPairing(displayName)
+        : await localPermissions?.createCustomPairing(displayName);
+      if (!pairing) throw new Error("host_pairing_unavailable");
+      return {
+        displayName: pairing.displayName,
+        expiresAt: pairing.expiresAt,
+        skill: renderCustomHarnessSkill(recallRuntime, pairing),
+      };
+    },
+  );
   ipcMain.handle("one-memory:get-login-preference", (event) => {
     assertAllowedRenderer(event.senderFrame?.url);
     return readLoginPreference(dataDir, process.platform, appManagedRuntime);
@@ -1025,7 +1078,63 @@ async function initialize(isQuitting: () => boolean): Promise<void> {
   );
   installPackagedWebProtocol();
 
+  // The Runtime this launch replaced, when it moved `current`: the migration
+  // log (and so the issue a person files) names the version upgraded from.
+  let upgradeSource: SdkMigrationSource | null = null;
+  const migrateAtStartup = async (core: {
+    command: string;
+    args: string[];
+    cwd?: string;
+  }) => {
+    const migration = await runStartupSdkMigration({
+      dataDir,
+      core,
+      caller: "desktop",
+      sourceRuntime: upgradeSource,
+      runtimeBuild:
+        packagedBuildNumber === undefined
+          ? typeof app.getVersion === "function"
+            ? app.getVersion()
+            : "0.0.0"
+          : String(packagedBuildNumber),
+    });
+    await diagnostics.log({
+      level: migration.state === "deferred" ? "warn" : "info",
+      component: "desktop.sdk_migration",
+      event: "sdk_migration.startup",
+      outcome:
+        migration.state === "cutover" || migration.state === "complete"
+          ? "succeeded"
+          : migration.state === "deferred"
+            ? "blocked"
+            : "skipped",
+      ...(migration.code === undefined ? {} : { error_code: migration.code }),
+      details: { runtime_state: migration.state },
+    });
+    requireCompletedStartupSdkMigration(migration);
+  };
+
   try {
+    if (languagePreferences) {
+      disposeLanguagePreferences = installLanguagePreferencesIpc({
+        ipc: ipcMain,
+        preferences: languagePreferences,
+        requireTrustedWindow,
+        broadcast: (snapshot) => {
+          for (const window of displayWindows) {
+            try {
+              assertTrustedWindow(window);
+              window.webContents.mainFrame.send(
+                "one-memory:language-preference-changed",
+                snapshot,
+              );
+            } catch {
+              // Navigation/destruction races must never leak to another document.
+            }
+          }
+        },
+      });
+    }
     disposeDisplayPreferences = installDisplayPreferences();
     disposeSourceDirectoryPicker = installSourceDirectoryPicker();
     if (appManagedRuntime) {
@@ -1059,30 +1168,74 @@ async function initialize(isQuitting: () => boolean): Promise<void> {
       const previousOwner = owner;
       let runtimeChanged = false;
       let transientRuntime = false;
-      if (owner?.owner !== "cli") {
-        const installed = await installPackagedRuntime({
-          resourcesPath: process.resourcesPath,
-          executablePath: process.execPath,
-          installRoot,
-          platform: "darwin",
-          arch: process.arch,
-          ...(packagedBuildNumber === undefined
-            ? {}
-            : { buildNumber: packagedBuildNumber }),
-          ...(packagedCommit === undefined
-            ? {}
-            : { gitCommit: packagedCommit }),
-          // Only the packaged Desktop path opts into a valid same-build,
-          // different-commit takeover. CLI installs remain strict.
-          replaceSameBuild: true,
-          serviceEnableMarker: runtimeServiceEnableMarkerPath(dataDir),
+      // Install whoever owns the service. Owner decides who starts and stops
+      // it, not which build runs: skipping the install for a CLI owner (also
+      // the App's own guess when its receipt is missing) left an upgraded App
+      // on the previous Runtime and, with `current` gone, on none at all.
+      {
+        let installed: Awaited<
+          ReturnType<typeof installPackagedRuntime>
+        > | null = null;
+        try {
+          installed = await installPackagedRuntime({
+            resourcesPath: process.resourcesPath,
+            executablePath: process.execPath,
+            installRoot,
+            platform: "darwin",
+            arch: process.arch,
+            ...(packagedBuildNumber === undefined
+              ? {}
+              : { buildNumber: packagedBuildNumber }),
+            ...(packagedCommit === undefined
+              ? {}
+              : { gitCommit: packagedCommit }),
+            // Only the packaged Desktop path opts into a valid same-build,
+            // different-commit takeover. CLI installs remain strict.
+            replaceSameBuild: true,
+            serviceEnableMarker: runtimeServiceEnableMarkerPath(dataDir),
+          });
+        } catch (error) {
+          // `memhub upgrade` may already have installed a newer build.
+          if (
+            !(
+              owner?.owner === "cli" &&
+              error instanceof Error &&
+              error.message === "distribution_downgrade_refused"
+            )
+          )
+            throw error;
+        }
+        if (installed !== null) {
+          runtimeChanged = !installed.reused_current;
+          if (runtimeChanged) {
+            upgradeSource = await readInstalledRuntimeSource(
+              installRoot,
+              installed.previous_current_target,
+            );
+          }
+          await installBundledCliIfNeeded({
+            home: app.getPath("home"),
+            installRoot,
+            platform: "darwin",
+          });
+        }
+        await requireCurrentRuntimeAtLeast(installRoot, packagedBuildNumber);
+      }
+      if (
+        !desktopBackgroundLaunch &&
+        !desktopTestIsolation &&
+        process.env.NODE_ENV !== "test"
+      ) {
+        await migrateAtStartup({
+          command: stable?.captureCommand ?? layout.coreCommand,
+          args: [],
         });
-        runtimeChanged = !installed.reused_current;
-        await installBundledCliIfNeeded({
-          home: app.getPath("home"),
-          installRoot,
-          platform: "darwin",
-        });
+      } else if (desktopBackgroundLaunch) {
+        // A login launch does not migrate, and the service exits on a home a
+        // failed migration froze: say so now instead of waiting for a
+        // Runtime that will not come. Opening MemHub retries the migration.
+        const frozen = await readSdkMigrationBlock(dataDir);
+        if (frozen?.frozen !== undefined) throw new Error(frozen.code);
       }
       const alreadyRunning = runtimeChanged
         ? false
@@ -1143,6 +1296,20 @@ async function initialize(isQuitting: () => boolean): Promise<void> {
       }
       preserveManagedRuntimeOnQuit = !transientRuntime;
     } else if (standaloneRuntime) {
+      if (
+        !desktopBackgroundLaunch &&
+        !desktopTestIsolation &&
+        process.env.NODE_ENV !== "test"
+      ) {
+        await migrateAtStartup(
+          resolveCoreLaunch({
+            packaged: app.isPackaged,
+            appPath: app.getAppPath(),
+            resourcesPath: process.resourcesPath,
+            platform: process.platform,
+          }),
+        );
+      }
       await ensureRuntimeProcess({
         dataDir,
         launch: runtimeLaunch(),
@@ -1202,6 +1369,24 @@ async function initialize(isQuitting: () => boolean): Promise<void> {
     });
     await runtimeSupervisor.start();
     if (isQuitting()) return;
+    // A standalone Runtime refreshes the hosts it installed as it starts, so
+    // an upgrade through the App or `memhub upgrade` is covered there. An
+    // embedded one is this process: do the same here, now it is up. Only a
+    // packaged build, so a source checkout never repoints real hosts at itself.
+    if (localPermissions && app.isPackaged) {
+      void localPermissions
+        .refreshInstalledHosts(
+          hosts.map((host) => host.layout),
+          {
+            build:
+              packagedBuildNumber === undefined
+                ? undefined
+                : String(packagedBuildNumber),
+            diagnostics: hostDiagnostics,
+          },
+        )
+        .catch(() => undefined);
+    }
     if (
       app.isPackaged &&
       process.platform === "darwin" &&
@@ -1218,10 +1403,20 @@ async function initialize(isQuitting: () => boolean): Promise<void> {
       });
       void dialog.showMessageBox({
         type: "warning",
-        message: "请先将 MemHub 拖到“应用程序”文件夹",
-        detail:
-          "从“应用程序”重新打开后，MemHub 才会接入其他应用并安装命令行工具。",
-        buttons: ["知道了"],
+        message: translate(
+          languagePreferences?.read().locale ?? "zh-CN",
+          "nativeMoveTitle",
+        ),
+        detail: translate(
+          languagePreferences?.read().locale ?? "zh-CN",
+          "nativeMoveDetail",
+        ),
+        buttons: [
+          translate(
+            languagePreferences?.read().locale ?? "zh-CN",
+            "nativeAcknowledge",
+          ),
+        ],
       });
     } else if (
       trialProfile === null &&
@@ -1352,6 +1547,9 @@ async function initialize(isQuitting: () => boolean): Promise<void> {
       outcome: "failed",
       error_code: stableRuntimeErrorCode(error),
       ...diagnosticError(error),
+      // The code alone is often `desktop_start_failed`; the cause is what
+      // support needs. Home is shortened and the text bounded.
+      details: { cause: startupFailureCause(error, app.getPath("home")) },
     });
     throw error;
   }
@@ -1378,22 +1576,31 @@ async function sha256File(target: string): Promise<string> {
 }
 
 const desktopVersion = desktopVersionOutput(process.argv, packagedVersion);
+const desktopBackgroundLaunch =
+  legacyLoginLaunch || process.argv.includes("--background");
 if (desktopVersion !== null) {
   process.stdout.write(desktopVersion, () => app.exit(0));
 } else
   startDesktopLifecycle({
     app,
     platform: process.platform,
-    background: legacyLoginLaunch || process.argv.includes("--background"),
+    background: desktopBackgroundLaunch,
     prepare: prepareProtocol,
+    beforeNativeUi: async () => {
+      languagePreferences = await LanguagePreferences.open(
+        app.getPath("userData"),
+        preferredSystemLanguage(app),
+      );
+    },
     initialize,
     createWindow,
     showStartupWindow: createStartupWindow,
     revealStartupWindow,
     getWindows: () => [...displayWindows],
     installTray: (open) => {
-      installApplicationMenu({
+      disposeApplicationMenu = installApplicationMenu({
         productName: app.getName(),
+        language: languagePreferences ?? undefined,
         buildMenu: (template) => Menu.buildFromTemplate(template),
         setMenu: (menu) => Menu.setApplicationMenu(menu),
         exportLogs: async () => {
@@ -1405,6 +1612,7 @@ if (desktopVersion !== null) {
       });
       disposeTray = installBackgroundTray({
         app,
+        language: languagePreferences ?? undefined,
         platform: process.platform,
         resourcesPath: process.resourcesPath,
         appPath: app.getAppPath(),
@@ -1449,6 +1657,9 @@ if (desktopVersion !== null) {
         ...(coreSupervisor ? { instance_id: coreSupervisor.instanceId } : {}),
       });
       // An admitted native effect must settle and journal before Runtime detach.
+      disposeLanguagePreferences?.();
+      disposeLanguagePreferences = null;
+      await languagePreferences?.drain();
       await connectionSetup?.drain();
       // BUG-12: stopping the supervisor only releases this process's handles. In
       // a packaged build the Runtime is its own process and was left running
@@ -1497,6 +1708,10 @@ if (desktopVersion !== null) {
       });
     },
     dispose: () => {
+      disposeLanguagePreferences?.();
+      disposeLanguagePreferences = null;
+      disposeApplicationMenu?.();
+      disposeApplicationMenu = null;
       connectionSetup?.dispose();
       disposeDiagnostics?.();
       disposeDiagnostics = null;
@@ -1517,9 +1732,44 @@ if (desktopVersion !== null) {
         "MemHub desktop failed",
         error instanceof Error ? error.name : "UnknownError",
       );
+      // An unfinished upgrade gets its own dialog: MemHub never runs on a
+      // half-migrated home, so the person is handed the log to report it.
+      if (
+        showMigrationFailureDialog({
+          error,
+          dataDir: runtimeDataDir,
+          locale: languagePreferences?.read().locale ?? "zh-CN",
+          dependencies: {
+            showMessageBoxSync: (options) => dialog.showMessageBoxSync(options),
+            showItemInFolder: (target) => shell.showItemInFolder(target),
+            openExternal: (url) => shell.openExternal(url),
+          },
+          environment: {
+            appVersion:
+              typeof app.getVersion === "function" ? app.getVersion() : null,
+            buildNumber: packagedBuildNumber ?? null,
+            osName:
+              process.platform === "darwin"
+                ? "macOS"
+                : process.platform === "win32"
+                  ? "Windows"
+                  : "Linux",
+            osVersion:
+              typeof process.getSystemVersion === "function"
+                ? process.getSystemVersion()
+                : null,
+            arch: process.arch,
+            home: app.getPath("home"),
+          },
+        })
+      )
+        return;
       dialog.showErrorBox(
-        "MemHub 无法启动",
-        error instanceof Error ? error.message : "desktop_unavailable",
+        translate(
+          languagePreferences?.read().locale ?? "zh-CN",
+          "nativeErrorTitle",
+        ),
+        stableRuntimeFailureDetail(error),
       );
     },
   });

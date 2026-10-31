@@ -6,16 +6,16 @@ import {
 } from "node:http";
 import type { AddressInfo } from "node:net";
 import type {
-  AskMemoryRequest,
-  AskMemoryResponse,
   ContextSearchRequest,
-  ContextSearchResponse,
-  ConversationSearchResponse,
   RecallReceipt,
   RecallRequest,
+  SdkContextSearchResponse,
 } from "@one-memory/contracts";
 import axios from "axios";
-import type { CallEventDeliveryRequest } from "./broker-client.js";
+import {
+  type CallEventDeliveryRequest,
+  isMemoryAddBrokerRequest,
+} from "./broker-client.js";
 import {
   authorizeContext,
   contextResponseInvalidField,
@@ -40,16 +40,20 @@ import {
 const LOOPBACK_HOST = "127.0.0.1";
 const DEFAULT_PORT = 18_765;
 const MAX_BODY_BYTES = 64 * 1024;
+/** 12,000 characters, each of which JSON may escape to six bytes. */
+const MAX_MEMORY_ADD_BODY_BYTES = 128 * 1024;
 const CONNECTION_DIAGNOSTIC_SUMMARY_MS = 5 * 60 * 1000;
 const DELIVERY_BINDING_TTL_MS = 60_000;
 const CALL_EVENT_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const HOST_SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9_:-]{0,127}$/;
+const PAIRING_FAILURE_WINDOW_MS = 60_000;
+const MAX_PAIRING_FAILURES_PER_WINDOW = 10;
 
 export interface ConnectionControlRequest {
   schema_version: 1;
   instance_id: string;
-  action: "capability" | "preview" | "execute" | "receipt" | "host";
+  action: "capability" | "preview" | "execute" | "receipt" | "host" | "pairing";
   input: Record<string, unknown>;
 }
 
@@ -59,9 +63,6 @@ export interface RecallBrokerOptions {
   discoveryPath: string;
   instanceId: string;
   preferredPort?: number;
-  /** Reader process base URL. When set, recall/context reads try it first
-   *  and fall back to Core on failure or timeout. */
-  readerBaseUrl?: string | null;
   now?: () => number;
   /** Production must supply a store. Omission retains legacy standalone mode
    * only; this option does not replace Core scope/source/content enforcement. */
@@ -108,54 +109,11 @@ export class RecallBroker {
     }
   >();
 
-  private readerCircuitOpenUntil = 0;
+  private pairingFailureWindowStartedAt = 0;
+  private pairingFailureCount = 0;
 
   constructor(options: RecallBrokerOptions) {
     this.options = Object.freeze({ ...options });
-  }
-
-  private readerAvailable(): boolean {
-    return (
-      Boolean(this.options.readerBaseUrl) &&
-      Date.now() >= this.readerCircuitOpenUntil
-    );
-  }
-
-  private openReaderCircuit(): void {
-    this.readerCircuitOpenUntil = Date.now() + 30_000;
-  }
-
-  /** Try a read against the Reader process; fall back to Core on any failure. */
-  private async readViaReader<T>(
-    path: string,
-    body: unknown,
-    headers: Record<string, string>,
-    timeout_ms: number,
-    fallback: () => Promise<T>,
-    signal?: AbortSignal,
-  ): Promise<T> {
-    signal?.throwIfAborted();
-    if (!this.readerAvailable()) return fallback();
-    try {
-      const response = await axios.post<T>(
-        `${this.options.readerBaseUrl}${path}`,
-        body,
-        {
-          headers,
-          proxy: false,
-          maxRedirects: 0,
-          timeout: Math.min(timeout_ms, 1_500),
-          signal,
-        },
-      );
-      return response.data;
-    } catch (error) {
-      // Caller cancellation is not a Reader failure and must not dispatch a
-      // second request through Core after the first request was aborted.
-      if (signal?.aborted) throw error;
-      this.openReaderCircuit();
-      return fallback();
-    }
   }
 
   get port(): number {
@@ -335,6 +293,10 @@ export class RecallBroker {
       await this.controlConnections(request, response);
       return;
     }
+    if (request.url === "/pair") {
+      await this.exchangePairing(request, response);
+      return;
+    }
     if (request.url === "/source-changed") {
       await this.notifySourceChanged(request, response);
       return;
@@ -355,6 +317,10 @@ export class RecallBroker {
     }
     if (request.url === "/context") {
       await this.proxyContext(request, response);
+      return;
+    }
+    if (request.url === "/memories") {
+      await this.proxyMemoryAdd(request, response);
       return;
     }
     if (request.url === "/diagnostics/trace") {
@@ -399,65 +365,8 @@ export class RecallBroker {
       }
       return;
     }
-    if (request.url === "/boundary/peek" || request.url === "/boundary/ack") {
-      await this.proxyBoundary(request, response);
-      return;
-    }
     if (request.url === "/call-events/delivery") {
       await this.proxyDelivery(request, response);
-      return;
-    }
-    if (request.url === "/ask") {
-      await this.proxyAsk(request, response);
-      return;
-    }
-    if (request.url === "/conversations") {
-      await this.proxyConversations(request, response);
-      return;
-    }
-    if (request.url === "/matters") {
-      try {
-        const body = await readJsonBody(request);
-        if (
-          !body ||
-          typeof body !== "object" ||
-          Array.isArray(body) ||
-          Object.keys(body).some((key) => key !== "query") ||
-          !("query" in body) ||
-          typeof body.query !== "string" ||
-          body.query.trim().length < 1 ||
-          body.query.length > 512
-        ) {
-          sendJson(response, 400, { error: "invalid matter query" });
-          return;
-        }
-        const authorized = await this.authorizeHost(
-          request,
-          "om_matters",
-          "all-apps",
-        );
-        const result = await axios.post(
-          `${this.options.coreBaseUrl}/api/v1/matters/context/search`,
-          body,
-          {
-            headers: authorized.headers,
-            proxy: false,
-            maxRedirects: 0,
-            timeout: 15_000,
-          },
-        );
-        await authorized.verifyBeforeRelease();
-        sendJson(response, 200, result.data);
-      } catch (error) {
-        if (sendAuthorizationError(response, error)) return;
-        if (error instanceof BodyReadError) {
-          sendJson(response, error.status, { error: error.message });
-          return;
-        }
-        sendJson(response, 502, {
-          error: "MemHub matter context is unavailable",
-        });
-      }
       return;
     }
     sendJson(response, 404, { error: "not found" });
@@ -501,6 +410,76 @@ export class RecallBroker {
     } catch (error) {
       if (sendAuthorizationError(response, error)) return;
       sendJson(response, 500, { error: "host_grant_store_unavailable" });
+    }
+  }
+
+  private async exchangePairing(
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    const store = this.options.hostGrantStore;
+    if (store === undefined) {
+      sendJson(response, 404, { error: "host_pairing_unavailable" });
+      return;
+    }
+    if (
+      request.headers.origin !== undefined ||
+      Object.keys(request.headers).some((key) =>
+        key.startsWith("sec-fetch-"),
+      ) ||
+      request.headers["content-type"]?.split(";", 1)[0]?.trim() !==
+        "application/json"
+    ) {
+      sendJson(response, 415, { error: "host_pairing_invalid" });
+      return;
+    }
+    const now = Date.now();
+    if (now - this.pairingFailureWindowStartedAt >= PAIRING_FAILURE_WINDOW_MS) {
+      this.pairingFailureWindowStartedAt = now;
+      this.pairingFailureCount = 0;
+    }
+    if (this.pairingFailureCount >= MAX_PAIRING_FAILURES_PER_WINDOW) {
+      sendJson(response, 429, { error: "host_pairing_rate_limited" });
+      return;
+    }
+    try {
+      const body = await readJsonBody(request, 10_000);
+      if (
+        !body ||
+        typeof body !== "object" ||
+        Array.isArray(body) ||
+        Object.keys(body).length !== 1 ||
+        !("code" in body) ||
+        typeof body.code !== "string" ||
+        !/^\d{6}$/.test(body.code)
+      ) {
+        this.pairingFailureCount++;
+        sendJson(response, 400, { error: "host_pairing_invalid" });
+        return;
+      }
+      const issued = await store.exchangePairing(body.code);
+      this.pairingFailureCount = 0;
+      sendJson(response, 200, {
+        schema_version: 1,
+        host_id: issued.receipt.hostId,
+        installation_id: issued.receipt.installationId,
+        credential_type: "bearer",
+        credential: issued.secret,
+      });
+    } catch (error) {
+      this.pairingFailureCount++;
+      if (
+        error instanceof HostGrantError &&
+        error.code === "host_pairing_invalid"
+      ) {
+        sendJson(response, 401, { error: "host_pairing_invalid" });
+        return;
+      }
+      if (error instanceof BodyReadError) {
+        sendJson(response, error.status, { error: "host_pairing_invalid" });
+        return;
+      }
+      sendJson(response, 500, { error: "host_pairing_unavailable" });
     }
   }
 
@@ -555,9 +534,14 @@ export class RecallBroker {
         !("instance_id" in body) ||
         body.instance_id !== this.options.instanceId ||
         !("action" in body) ||
-        !["capability", "preview", "execute", "receipt", "host"].includes(
-          String(body.action),
-        ) ||
+        ![
+          "capability",
+          "preview",
+          "execute",
+          "receipt",
+          "host",
+          "pairing",
+        ].includes(String(body.action)) ||
         !("input" in body) ||
         !body.input ||
         typeof body.input !== "object" ||
@@ -618,20 +602,10 @@ export class RecallBroker {
           event: "connection_control.exception",
           outcome: "failed",
           instance_id: this.options.instanceId,
-          details: {
-            action: action ?? "invalid",
-            code,
-            error_type:
-              error instanceof Error ? error.constructor.name : typeof error,
-            message:
-              error instanceof Error
-                ? error.message.slice(0, 256)
-                : String(error).slice(0, 256),
-            stack_origin:
-              error instanceof Error && error.stack
-                ? (error.stack.split("\n").at(1)?.trim() ?? "").slice(0, 256)
-                : null,
-          },
+          error_code: code,
+          error_type:
+            error instanceof Error ? error.constructor.name : typeof error,
+          details: { action: action ?? "invalid" },
         });
       }
       const fingerprint = `error:${code}`;
@@ -735,31 +709,18 @@ export class RecallBroker {
         return;
       }
       const authorized = await this.authorizeHost(request, body, "all-apps");
-      const result = {
-        data: await this.readViaReader<unknown>(
-          "/api/v1/context/search",
-          body,
-          authorized.headers,
-          (body.timeout_ms ?? 2000) + 1000,
-          async () => {
-            const r = await axios.post(
-              `${this.options.coreBaseUrl}/api/v1/context/search`,
-              body,
-              {
-                headers: authorized.headers,
-                proxy: false,
-                maxRedirects: 0,
-                timeout: (body.timeout_ms ?? 2000) + 1000,
-                maxContentLength: 2 * 1024 * 1024,
-                signal: abort.signal,
-              },
-            );
-            await authorized.verifyBeforeRelease();
-            return r.data;
-          },
-          abort.signal,
-        ),
-      };
+      const result = await axios.post(
+        `${this.options.coreBaseUrl}/api/v2/context/search`,
+        body,
+        {
+          headers: authorized.headers,
+          proxy: false,
+          maxRedirects: 0,
+          timeout: (body.timeout_ms ?? 2000) + 1000,
+          maxContentLength: 2 * 1024 * 1024,
+          signal: abort.signal,
+        },
+      );
       const invalidField = contextResponseInvalidField(result.data);
       const identity = authorized.identity;
       const responseFailure =
@@ -784,8 +745,10 @@ export class RecallBroker {
         throw new Error("invalid_context_response");
       }
       if (!identity) throw new Error("invalid_context_response");
-      const contextResult = result.data as ContextSearchResponse;
+      const contextResult = result.data as SdkContextSearchResponse;
       await authorized.verifyBeforeRelease();
+      // Core records an external context search under its request id, so a
+      // WorkBuddy injection can later report that this result was delivered.
       if (
         identity.hostId === "workbuddy" &&
         CALL_EVENT_ID.test(contextResult.request_id)
@@ -810,42 +773,6 @@ export class RecallBroker {
       sendJson(response, 502, { error: "context_unavailable" });
     } finally {
       response.off("close", onClose);
-    }
-  }
-
-  private async proxyBoundary(
-    request: IncomingMessage,
-    response: ServerResponse,
-  ): Promise<void> {
-    try {
-      const body = await readJsonBody(request);
-      const authorized = await this.authorizeHost(
-        request,
-        "om_recall",
-        "all-apps",
-      );
-      if (authorized.identity?.hostId !== "workbuddy")
-        throw new HostGrantError("host_grant_scope_denied");
-      const endpoint = request.url === "/boundary/ack" ? "ack" : "peek";
-      const result = await axios.post(
-        `${this.options.coreBaseUrl}/api/v1/boundary/${endpoint}`,
-        body,
-        {
-          headers: authorized.headers,
-          proxy: false,
-          maxRedirects: 0,
-          timeout: 700,
-        },
-      );
-      await authorized.verifyBeforeRelease();
-      sendJson(response, 200, result.data);
-    } catch (error) {
-      if (sendAuthorizationError(response, error)) return;
-      if (error instanceof BodyReadError) {
-        sendJson(response, error.status, { error: error.message });
-        return;
-      }
-      sendJson(response, 502, { error: "boundary_unavailable" });
     }
   }
 
@@ -1023,27 +950,18 @@ export class RecallBroker {
           },
         });
       });
-      const coreResponse = await this.readViaReader<RecallReceipt>(
-        "/api/v1/recall",
+      const result = await axios.post<RecallReceipt>(
+        `${this.options.coreBaseUrl}/api/v1/recall`,
         body,
-        authorized.headers,
-        15_000,
-        async () => {
-          const result = await axios.post<RecallReceipt>(
-            `${this.options.coreBaseUrl}/api/v1/recall`,
-            body,
-            {
-              headers: authorized.headers,
-              proxy: false,
-              maxRedirects: 0,
-              timeout: 15_000,
-            },
-          );
-          await authorized.verifyBeforeRelease();
-          return result.data;
+        {
+          headers: authorized.headers,
+          proxy: false,
+          maxRedirects: 0,
+          timeout: 15_000,
         },
       );
-      sendJson(response, 200, coreResponse);
+      await authorized.verifyBeforeRelease();
+      sendJson(response, 200, result.data);
     } catch (error) {
       if (sendAuthorizationError(response, error)) return;
       if (error instanceof BodyReadError) {
@@ -1056,90 +974,99 @@ export class RecallBroker {
     }
   }
 
-  /** Search the original conversations, not the memories drawn from them.
+  /** The installation behind a request: authenticated, never tool-authorized.
    *
-   * An agent asked to pick a task back up needs what was actually said in the
-   * other app. Recall cannot supply that: it returns governed memories, which
-   * are conclusions, and a conclusion is not enough to resume work from.
-   *
-   * Read-only, and reads nothing that was not already imported. */
-  private async proxyConversations(
+   * Hand-added memories are not grant-governed, but only an installation MemHub
+   * paired may write one. Without a grant store there is no identity, so no
+   * write. */
+  private async authenticateHost(
     request: IncomingMessage,
-    response: ServerResponse,
-  ): Promise<void> {
+  ): Promise<VerifiedHostIdentity> {
+    const store = this.options.hostGrantStore;
+    if (store === undefined)
+      throw new HostGrantError("host_grant_store_unavailable");
+    const authorization = request.headers.authorization;
+    const authorizationCount = request.rawHeaders.filter(
+      (value, index) =>
+        index % 2 === 0 && value.toLowerCase() === "authorization",
+    ).length;
+    if (
+      authorizationCount !== 1 ||
+      typeof authorization !== "string" ||
+      !/^Bearer omhg_v1_[A-Za-z0-9_-]{43}$/i.test(authorization)
+    ) {
+      throw new HostGrantError("host_grant_authentication_failed");
+    }
     try {
-      const body = await readJsonBody(request);
-      if (!isConversationSearchRequest(body)) {
-        sendJson(response, 400, { error: "invalid conversation request" });
-        return;
-      }
-      const authorized = await this.authorizeHost(
-        request,
-        "om_conversations",
-        "all-apps",
-      );
-      const coreResponse = await axios.get<ConversationSearchResponse>(
-        `${this.options.coreBaseUrl}/api/v1/conversations/search`,
-        {
-          params: { query: body.query, limit: body.limit ?? 20 },
-          headers: authorized.headers,
-          proxy: false,
-          maxRedirects: 0,
-          timeout: 15_000,
-        },
-      );
-      await authorized.verifyBeforeRelease();
-      sendJson(response, 200, coreResponse.data);
+      return await store.authenticate(authorization.slice(7));
     } catch (error) {
-      if (sendAuthorizationError(response, error)) return;
-      if (error instanceof BodyReadError) {
-        sendJson(response, error.status, { error: error.message });
-        return;
-      }
-      sendJson(response, 502, {
-        error: "MemHub Core conversation search is unavailable",
-      });
+      if (error instanceof HostGrantError) throw error;
+      throw new HostGrantError("host_grant_store_unavailable");
     }
   }
 
-  private async proxyAsk(
+  /** Core's memory-add entry, as a trusted local caller.
+   *
+   * Core refuses `POST /api/v2/memories` to requests that carry the external
+   * read envelope, and writes are not grant-governed. */
+  private coreWriteHeaders(request: IncomingMessage): Record<string, string> {
+    return {
+      Authorization: `Bearer ${this.options.coreApiToken}`,
+      "Content-Type": "application/json",
+      "x-one-memory-trace-id": requestTraceId(request),
+    };
+  }
+
+  /** One hand-added memory, the same entry as the app's 添加记忆.
+   *
+   * The body is exactly `{request_id, text}`: a host cannot choose a scope or
+   * a source. The memory is filed cross-app, as a hand-added memory. */
+  private async proxyMemoryAdd(
     request: IncomingMessage,
     response: ServerResponse,
   ): Promise<void> {
     try {
-      const body = await readJsonBody(request);
-      if (!isAskRequest(body)) {
-        sendJson(response, 400, { error: "invalid ask request" });
+      await this.authenticateHost(request);
+      const body = await readJsonBody(
+        request,
+        undefined,
+        MAX_MEMORY_ADD_BODY_BYTES,
+      );
+      if (!isMemoryAddBrokerRequest(body)) {
+        sendJson(response, 400, { error: "memory_add_invalid" });
         return;
       }
-      const authorized = await this.authorizeHost(
-        request,
-        "om_ask",
-        body.scope ?? "all-apps",
-      );
-      // Ask may call a generation model; keep the broker timeout aligned with
-      // the web client's 120s budget rather than the short recall budget.
-      const coreResponse = await axios.post<AskMemoryResponse>(
-        `${this.options.coreBaseUrl}/api/v1/memories/ask`,
-        body,
+      const result = await axios.post<unknown>(
+        `${this.options.coreBaseUrl}/api/v2/memories`,
+        { request_id: body.request_id, text: body.text, scope: "all-apps" },
         {
-          headers: authorized.headers,
+          headers: this.coreWriteHeaders(request),
           proxy: false,
           maxRedirects: 0,
-          timeout: 120_000,
+          timeout: 15_000,
+          validateStatus: () => true,
         },
       );
-      await authorized.verifyBeforeRelease();
-      sendJson(response, 200, coreResponse.data);
+      if (result.status === 200 || result.status === 201) {
+        sendJson(response, result.status, result.data);
+        return;
+      }
+      if (result.status === 409) {
+        sendJson(response, 409, { error: "memory_add_conflict" });
+        return;
+      }
+      if (result.status === 422) {
+        sendJson(response, 422, { error: "memory_add_invalid" });
+        return;
+      }
+      sendJson(response, 502, { error: "MemHub memory write is unavailable" });
     } catch (error) {
       if (sendAuthorizationError(response, error)) return;
       if (error instanceof BodyReadError) {
         sendJson(response, error.status, { error: error.message });
         return;
       }
-      sendJson(response, 502, {
-        error: "MemHub Core ask is unavailable",
-      });
+      sendJson(response, 502, { error: "MemHub memory write is unavailable" });
     }
   }
 
@@ -1319,9 +1246,7 @@ function brokerOperation(url: string | undefined): string | null {
       "/recall": "recall",
       "/context": "context",
       "/call-events/delivery": "call_event_delivery",
-      "/ask": "ask",
-      "/conversations": "conversations",
-      "/matters": "matters",
+      "/memories": "memory_add",
       "/source-changed": "source_notification",
       "/control/connections": "connection_control",
     }[url ?? ""] ?? null
@@ -1354,50 +1279,6 @@ function sendAuthorizationError(
     return true;
   }
   return false;
-}
-
-/** Same shape Core's query string takes, so nothing here can widen it. */
-export interface ConversationSearchQuery {
-  query: string;
-  limit?: number;
-}
-
-function isConversationSearchRequest(
-  value: unknown,
-): value is ConversationSearchQuery {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const request = value as Record<string, unknown>;
-  const allowed = new Set(["query", "limit"]);
-  if (Object.keys(request).some((key) => !allowed.has(key))) return false;
-  return (
-    typeof request.query === "string" &&
-    request.query.length >= 1 &&
-    request.query.length <= 512 &&
-    (request.limit === undefined ||
-      (Number.isInteger(request.limit) &&
-        (request.limit as number) >= 1 &&
-        (request.limit as number) <= 50))
-  );
-}
-
-function isAskRequest(value: unknown): value is AskMemoryRequest {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const request = value as Record<string, unknown>;
-  const allowed = new Set(["question", "scope", "workspace_path"]);
-  if (Object.keys(request).some((key) => !allowed.has(key))) return false;
-  return (
-    typeof request.question === "string" &&
-    request.question.length >= 1 &&
-    request.question.length <= 2_000 &&
-    (request.scope === undefined ||
-      (typeof request.scope === "string" &&
-        request.scope.length >= 1 &&
-        request.scope.length <= 512)) &&
-    (request.workspace_path === undefined ||
-      (typeof request.workspace_path === "string" &&
-        request.workspace_path.length >= 1 &&
-        request.workspace_path.length <= 4_096))
-  );
 }
 
 function isRecallRequest(value: unknown): value is RecallRequest {
@@ -1451,6 +1332,7 @@ class BodyReadError extends Error {
 async function readJsonBody(
   request: IncomingMessage,
   deadlineMs?: number,
+  maxBytes = MAX_BODY_BYTES,
 ): Promise<unknown> {
   const deadline =
     deadlineMs === undefined
@@ -1465,7 +1347,7 @@ async function readJsonBody(
     for await (const chunk of request) {
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       bytes += buffer.length;
-      if (bytes > MAX_BODY_BYTES) {
+      if (bytes > maxBytes) {
         throw new BodyReadError(413, "request body is too large");
       }
       chunks.push(buffer);

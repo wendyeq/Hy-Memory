@@ -66,7 +66,6 @@ describe("Linux runtime scripts", () => {
       '"stop"',
       '"init"',
       '"scan"',
-      '"recall"',
       '"uninstall"',
     ]) {
       assert.match(script, new RegExp(command));
@@ -88,9 +87,11 @@ describe("Linux runtime scripts", () => {
       script,
       /Exit 1 is a valid transient receipt[\s\S]{0,300}\[0, 1, 3\]/,
     );
-    assert.match(script, /append_recalled/);
+    assert.match(script, /initial_queued/);
+    assert.match(script, /append_queued/);
+    assert.match(script, /FROM memory_write_jobs/);
     assert.match(script, /idempotent_upgrade_instance_id_changed/);
-    assert.match(script, /post_upgrade_recalled/);
+    assert.match(script, /post_upgrade_queued/);
     assert.match(script, /uninstall_preserved_data/);
     assert.match(script, /is-enabled/);
     assert.match(script, /is-active/);
@@ -117,9 +118,19 @@ describe("Linux runtime scripts", () => {
       workflow,
       /verify-release-version\.mjs[\s\S]*--channel stable/,
     );
+    assert.match(workflow, /shopt -s globstar nullglob/);
+    assert.match(workflow, /archives=\(release-assets\/\*\*\/"\$name"\)/);
+    assert.match(
+      workflow,
+      /cp -- "\$\{archives\[0\]\}" "publish-assets\/\$name"/,
+    );
     assert.match(workflow, /sha256sum -c/);
     assert.match(workflow, /--json isDraft[\s\S]*--jq \.isDraft/);
     assert.match(workflow, /gh release create[\s\S]*--draft/);
     assert.match(workflow, /gh release upload[\s\S]*--clobber/);
+    assert.match(
+      workflow,
+      /publish-assets\/memhub-runtime-v\*-linux-\*\.tar\.gz/,
+    );
   });
 });

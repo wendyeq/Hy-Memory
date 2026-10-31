@@ -10,12 +10,14 @@ import {
   unlink,
 } from "node:fs/promises";
 import path from "node:path";
+import { isHostId } from "@one-memory/contracts";
 import {
   createClaudeCodeRemovalTarget,
   createClaudeCodeTarget,
   HostGrantError,
   type HostGrantReceipt,
   HostGrantStore,
+  type HostPairingReceipt,
   type HostReadTool,
   isPluginCacheBookkeeping,
   readHostCredentialFile,
@@ -39,6 +41,7 @@ import {
   repairInstalledRecallCommands,
   verifyRecallInstall,
 } from "@one-memory/host-bridge/installer";
+import type { DiagnosticInput, DiagnosticSink } from "./diagnostic-log.js";
 import {
   hasSyncHookArtifacts,
   loadSyncHookAssets,
@@ -94,7 +97,21 @@ interface InstallationBinding {
 }
 
 const CREDENTIAL_ENV = "ONE_MEMORY_HOST_CREDENTIAL_FILE";
+/** The build whose host refresh last completed, beside the grants. */
+const HOST_REFRESH_FILE = "host-refresh.json";
 const locks = new Map<string, Promise<void>>();
+
+/** What one pass of `refreshInstalledHosts` did, by host id. */
+export interface HostRefreshReport {
+  /** `already_refreshed` when this build had already completed a pass. */
+  state: "refreshed" | "already_refreshed";
+  checked: number;
+  /** Hosts whose installed command or discovery path was moved. */
+  repointed: string[];
+  /** Hosts whose stale skill, hooks, plugin files or MCP entry were rewritten. */
+  synced: string[];
+  failed: string[];
+}
 
 export const LOCAL_EXPERIENCE_UNAVAILABLE = "体验版暂不支持";
 
@@ -153,6 +170,10 @@ export class HostPermissions {
     };
   }
 
+  createCustomPairing(displayName: string): Promise<HostPairingReceipt> {
+    return this.hostGrantStore.createPairing({ displayName });
+  }
+
   /** Whether the host's entry was installed from this data directory.
    *
    * Several data directories can share one set of hosts (the daily app, a
@@ -195,11 +216,20 @@ export class HostPermissions {
    * touching authorization. A skill the user edited is left for the detail page.
    */
   async syncStaleInstalls(layouts: RecallHostLayout[]): Promise<string[]> {
+    return (await this.syncStale(layouts)).synced;
+  }
+
+  private async syncStale(
+    layouts: RecallHostLayout[],
+  ): Promise<{ synced: string[]; failed: string[] }> {
     const synced: string[] = [];
+    const failed: string[] = [];
     for (const layout of layouts) {
       try {
         await this.withHostLock(layout, async () => {
-          await this.requireLinked(layout);
+          // Not linked from this data directory is not ours to sync, and not
+          // a failure either.
+          if (!(await this.isLinked(layout))) return;
           const sync = await planSkillSync(layout, this.runtimeFor(layout));
           if (sync === null || sync.requiresConfirmation) return;
           const preview = await previewRecallInstall(sync.plan);
@@ -209,9 +239,128 @@ export class HostPermissions {
         });
       } catch {
         // One host that cannot be synced must not stop the runtime starting.
+        failed.push(layout.hostId);
       }
     }
-    return synced;
+    return { synced, failed };
+  }
+
+  /** Refresh every host this directory installed, once per build.
+   *
+   * An upgrade changes the call rules, hooks and MCP entry we would write, but
+   * nothing rewrote the copies hosts already had, so they kept telling the
+   * model to call tools that were gone. This runs the same repoint and stale
+   * sync the detail page offers, without asking, for files that are still
+   * exactly ours; an edited skill stays for the user to confirm.
+   *
+   * The build it last completed for is recorded beside the grants, so later
+   * launches of the same build cost one file read. A run in which any host
+   * failed is not recorded, so the next launch tries again. With no build to
+   * name (a source checkout) it runs every time and records nothing.
+   */
+  async refreshInstalledHosts(
+    layouts: RecallHostLayout[],
+    options: { build?: string; diagnostics?: DiagnosticSink } = {},
+  ): Promise<HostRefreshReport> {
+    const log = (input: DiagnosticInput) =>
+      options.diagnostics?.log(input).catch(() => undefined);
+    const build = options.build?.trim() || undefined;
+    if (build !== undefined && (await this.readRefreshedBuild()) === build) {
+      await log({
+        level: "info",
+        component: "host.refresh",
+        event: "host_refresh.skipped",
+        outcome: "skipped",
+        details: { reason: "already_refreshed", count: layouts.length },
+      });
+      return {
+        state: "already_refreshed",
+        checked: layouts.length,
+        repointed: [],
+        synced: [],
+        failed: [],
+      };
+    }
+    const started = Date.now();
+    const repointed: string[] = [];
+    const failed: string[] = [];
+    for (const layout of layouts) {
+      try {
+        repointed.push(...(await this.repairInstalledCommands([layout])));
+      } catch {
+        failed.push(layout.hostId);
+      }
+    }
+    const stale = await this.syncStale(layouts);
+    failed.push(...stale.failed.filter((hostId) => !failed.includes(hostId)));
+    for (const hostId of new Set([...repointed, ...stale.synced])) {
+      await log({
+        level: "info",
+        component: "host.refresh",
+        event: "host_refresh.host_updated",
+        outcome: "succeeded",
+        details: { source_id: hostId },
+      });
+    }
+    for (const hostId of failed) {
+      await log({
+        level: "warn",
+        component: "host.refresh",
+        event: "host_refresh.host_failed",
+        outcome: "failed",
+        error_code: "host_refresh_failed",
+        details: { source_id: hostId },
+      });
+    }
+    if (build !== undefined && failed.length === 0) {
+      await this.writeRefreshedBuild(build).catch(() => undefined);
+    }
+    await log({
+      level: failed.length === 0 ? "info" : "warn",
+      component: "host.refresh",
+      event: "host_refresh.completed",
+      outcome: failed.length === 0 ? "succeeded" : "degraded",
+      duration_ms: Date.now() - started,
+      details: {
+        count: layouts.length,
+        updated_count: new Set([...repointed, ...stale.synced]).size,
+        error_count: failed.length,
+      },
+    });
+    return {
+      state: "refreshed",
+      checked: layouts.length,
+      repointed,
+      synced: stale.synced,
+      failed,
+    };
+  }
+
+  private async readRefreshedBuild(): Promise<string | null> {
+    try {
+      return await storageGuard(async () => {
+        const file = path.join(this.directory, HOST_REFRESH_FILE);
+        if ((await optionalStat(file)) === null) return null;
+        const value: unknown = JSON.parse(await privateRead(file));
+        return isObject(value) &&
+          value.schemaVersion === 1 &&
+          typeof value.build === "string"
+          ? value.build
+          : null;
+      });
+    } catch {
+      // Unreadable reads as never refreshed: the refresh is idempotent.
+      return null;
+    }
+  }
+
+  private async writeRefreshedBuild(build: string): Promise<void> {
+    await storageGuard(() =>
+      privateWrite(
+        path.join(this.directory, HOST_REFRESH_FILE),
+        `${JSON.stringify({ schemaVersion: 1, build })}\n`,
+      ),
+    );
   }
 
   /** Same repair for one host. Does not revoke or reissue its authorization. */
@@ -936,6 +1085,16 @@ export class HostPermissions {
       throw new Error("host_permission_installation_incomplete");
   }
 
+  /** `requireLinked` as a question, for sweeps that skip hosts not ours. */
+  private async isLinked(layout: RecallHostLayout): Promise<boolean> {
+    if (!supported(layout)) return false;
+    const current = await this.inspect(layout, false);
+    return (
+      (current.state === "approved" || current.state === "install-only") &&
+      current.reason === null
+    );
+  }
+
   /** Turning off a host with nothing of ours on it is an empty removal, not a
    * failure; one whose state cannot be settled is an empty removal carrying
    * what to look at, which uninstall refuses. Only what is ours for certain
@@ -1055,10 +1214,19 @@ function status(
   };
 }
 
+/** Whether a layout can hold a revocable credential.
+ *
+ * The id grammar lives in `@one-memory/contracts` so that this layer, the
+ * grant store and the CLI cannot drift: a host id `host list` prints has to be
+ * one `host install` accepts. Profile scoping is what DeepSeek Harness needs —
+ * it configures recall per profile (`deepseek-harness:desktop`) — and the
+ * installation directory is a digest of the whole id, so the colon never
+ * becomes a path component.
+ */
 function supported(layout: RecallHostLayout): boolean {
   return (
     (layout.channel === "mcp" || layout.channel === "cli") &&
-    /^[a-z][a-z0-9-]{0,63}$/.test(layout.hostId) &&
+    isHostId(layout.hostId) &&
     layout.hostId !== "openclaw"
   );
 }
