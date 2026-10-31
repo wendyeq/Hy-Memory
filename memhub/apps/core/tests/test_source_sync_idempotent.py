@@ -2,8 +2,6 @@
 
 import asyncio
 import json
-import os
-import sqlite3
 
 from httpx import ASGITransport, AsyncClient
 from pydantic import SecretStr
@@ -140,7 +138,6 @@ def test_resume_backfills_content_that_arrived_while_paused(tmp_path, monkeypatc
             )
             assert paused.json()["sync_enabled"] is False
             write_turn(root, "while-paused")
-            _set_mtime(root / "while-paused.jsonl", _paused_ns(tmp_path) + 5_000_000_000)
             existing = {job.job_id for job in app.state.import_job_store.list_jobs()}
 
             resumed = await client.post(
@@ -164,11 +161,10 @@ def test_resume_backfills_content_that_arrived_while_paused(tmp_path, monkeypatc
 
 
 def test_resume_leaves_an_old_uncursored_file_at_eof(tmp_path, monkeypatch):
-    """A file that already existed at pause, with no cursor, is not imported.
+    """A file that already existed when sync was turned off is not imported.
 
-    Reading every never-cursored file from byte 0 would be a history import
-    under the sync operation. The pause time recorded when sync is turned off
-    keeps those older files at EOF. A file created after that time is still read.
+    Turning sync off anchors files that have no cursor yet. A file created
+    after that stays without a cursor, and resume reads only that file.
     """
 
     async def scenario():
@@ -213,10 +209,7 @@ def test_resume_leaves_an_old_uncursored_file_at_eof(tmp_path, monkeypatch):
                 json={"enabled": False},
             )
             assert paused.status_code == 200
-            paused_ns = _paused_ns(tmp_path)
-            _set_mtime(root / "old-untracked.jsonl", paused_ns - 5_000_000_000)
             write_turn(root, "while-paused")
-            _set_mtime(root / "while-paused.jsonl", paused_ns + 5_000_000_000)
             resumed = await client.post(
                 "/api/v1/sources/claude-code/sync-permission",
                 json={"enabled": True},
@@ -234,15 +227,3 @@ def test_resume_leaves_an_old_uncursored_file_at_eof(tmp_path, monkeypatch):
             ] == []
 
     asyncio.run(scenario())
-
-
-def _paused_ns(tmp_path) -> int:
-    database = tmp_path / "data" / "one-memory.sqlite3"
-    with sqlite3.connect(database) as connection:
-        row = connection.execute("SELECT paused_at FROM source_sync_pause").fetchone()
-    assert row is not None
-    return int(row[0])
-
-
-def _set_mtime(path, mtime_ns: int) -> None:
-    os.utime(path, ns=(mtime_ns, mtime_ns))

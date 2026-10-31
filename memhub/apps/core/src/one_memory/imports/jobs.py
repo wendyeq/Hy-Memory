@@ -27,23 +27,6 @@ logger = logging.getLogger("one_memory.imports.jobs")
 
 JOB_SCHEMA = import_jobs_ddl("sqlite")
 MAX_LIVE_BACKLOG_BYTES = 256 * 1024
-# ``st_mtime_ns`` can lag a sample taken on the same filesystem in the same
-# moment. Files older than the pause sample by at least this much stay at EOF.
-_PAUSE_MTIME_SLACK_NS = 1_000_000_000
-
-
-def _sync_paused_ns(connection: sqlite3.Connection, *, user_id: str, source_id: str) -> int | None:
-    row = connection.execute(
-        """
-        SELECT paused_at FROM source_sync_pause
-        WHERE user_id = ? AND source_id = ?
-        """,
-        (user_id, source_id),
-    ).fetchone()
-    if row is None:
-        return None
-    raw = str(row["paused_at"])
-    return int(raw) if raw.isdigit() else None
 
 
 class ImportStatus(StrEnum):
@@ -292,16 +275,6 @@ class ImportJobStore:
             connection.execute(
                 "ALTER TABLE source_cursors ADD COLUMN read_to_end INTEGER NOT NULL DEFAULT 0"
             )
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS source_sync_pause (
-                user_id TEXT NOT NULL,
-                source_id TEXT NOT NULL,
-                paused_at TEXT NOT NULL,
-                PRIMARY KEY (user_id, source_id)
-            )
-            """
-        )
         for table in ("source_cursors", "live_source_cursors"):
             connection.execute(
                 f"""
@@ -1059,21 +1032,6 @@ class ImportJobStore:
         listed = files or {}
         now = datetime.now(UTC).isoformat()
         with self._connect(writing=True) as connection:
-            paused_ns = _sync_paused_ns(connection, user_id=user_id, source_id=source_id)
-
-            def anchor_missing(key: str) -> bool:
-                if baseline_missing_files:
-                    return True
-                # config.json has no pause clock. Without one, every missing
-                # file is anchored. A sync must not read that corpus from
-                # byte 0. A recorded pause keeps only older files at EOF.
-                if paused_ns is None:
-                    return True
-                listed_file = listed.get(key)
-                if listed_file is None:
-                    return True
-                return listed_file.modified_ns + _PAUSE_MTIME_SLACK_NS <= paused_ns
-
             live_rows = connection.execute(
                 "SELECT file_key,file_identity,checkpoint,checkpoint_anchor,observed_size "
                 "FROM live_source_cursors WHERE user_id=? AND source_id=?",
@@ -1118,10 +1076,6 @@ class ImportJobStore:
                         ):
                             continue
                         selected[key] = history_cursors[key]
-                if not baseline_missing_files:
-                    selected = {
-                        key: cursor for key, cursor in selected.items() if anchor_missing(key)
-                    }
                 for cursor in selected.values():
                     self._upsert_cursor(connection, owner, cursor, now)
             else:
@@ -1137,7 +1091,7 @@ class ImportJobStore:
                 live_by_key = {str(row["file_key"]): row for row in live_rows}
                 for key, cursor in baselines.items():
                     live = live_by_key.get(key)
-                    if live is None and not anchor_missing(key):
+                    if live is None and not baseline_missing_files:
                         continue
                     rebased = live is None or _stored_live_offset_must_rebase(
                         live, cursor, listed.get(key)
@@ -1159,19 +1113,6 @@ class ImportJobStore:
             source_id=source_id,
             operation="sync",
         )
-
-    def mark_sync_paused(self, *, user_id: str, source_id: str, paused_ns: int) -> None:
-        """Remember when sync was turned off, in source-filesystem nanoseconds."""
-        with self._connect(writing=True) as connection:
-            connection.execute(
-                """
-                INSERT INTO source_sync_pause (user_id, source_id, paused_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(user_id, source_id) DO UPDATE SET
-                    paused_at = excluded.paused_at
-                """,
-                (user_id, source_id, str(paused_ns)),
-            )
 
     def reset_source_cursors(self, *, user_id: str, source_id: str) -> int:
         with self._connect(writing=True) as connection:

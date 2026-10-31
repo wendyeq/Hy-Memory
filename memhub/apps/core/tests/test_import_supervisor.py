@@ -378,10 +378,12 @@ def test_cancelling_waiter_does_not_cancel_supervisor_owned_job(tmp_path) -> Non
         job = job_store.create(user_id="local", source_id="fixture")
         supervisor.enqueue(job.job_id)
         waiter = asyncio.create_task(supervisor.wait(job.job_id))
-        for _ in range(20):
+        for _ in range(50):
             if job_store.require(job.job_id).status is ImportStatus.RUNNING:
                 break
-            await asyncio.sleep(0)
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("job did not start")
 
         waiter.cancel()
         with suppress(asyncio.CancelledError):
