@@ -73,6 +73,19 @@ def _write_apply_verify_enabled() -> bool:
 _RECONCILE_LOOP_USER_LOCKS = weakref.WeakKeyDictionary()
 
 
+class ReconcileFailure(str):
+    """reconcile 失败时 `_reconcile_and_store` 返回的 error：仍是错误信息字符串，
+    另带稳定的失败码 `code`（LLM_UNAVAILABLE / EMPTY_RESPONSE / JSON_PARSE_FAILED /
+    RECONCILE_EXCEPTION），供 writer 透传给调用方。"""
+
+    code: str = "RECONCILE_FAILED"
+
+    def __new__(cls, message: str, code: str = "RECONCILE_FAILED"):
+        obj = super().__new__(cls, message)
+        obj.code = code
+        return obj
+
+
 def _reconcile_user_lock(user_id: str) -> asyncio.Lock:
     loop = asyncio.get_running_loop()
     locks = _RECONCILE_LOOP_USER_LOCKS.get(loop)
@@ -279,6 +292,22 @@ class MemoryWriter(WritePipeline):
         if source_ids:
             custom["source_raw_memory_ids"] = source_ids
         return custom
+
+    def _flat_trimmed_raw(self, request: WriteRequest) -> str:
+        """把 request.messages 按 raw 统一规则裁剪后拼成 L1_RAW 文本。
+
+        只裁落库副本；request.messages 不动（本次 extractor 输入仍用完整 messages）。
+        """
+        import copy as _copy
+        from ..utils.raw_trim import trim_raw_messages
+
+        _coding_cfg = getattr(getattr(self, "config", None), "coding", None)
+        _trimmed_req = _copy.copy(request)
+        _trimmed_req.messages = trim_raw_messages(
+            request.messages,
+            tool_max_bytes=getattr(_coding_cfg, "tool_result_max_bytes", None),
+        )
+        return _trimmed_req.get_flat_content()
 
     @staticmethod
     def _attach_client_meta(custom: Dict[str, Any], request: Optional[WriteRequest]) -> None:
@@ -619,6 +648,7 @@ class MemoryWriter(WritePipeline):
         不查 VDB、不做"新写入 vs 库里已有"的对比，避免给 VDB 增加读压力。
         库内存量污染由 recall 侧异步删除逐步清理。best-effort：任何异常都
         回退到"不判重、全写入"，绝不影响 upsert 主流程。
+        `recall.intention_dedup_enabled=False` 时跳过批内判重，全部写入。
         """
         if not intentions:
             return []
@@ -644,7 +674,11 @@ class MemoryWriter(WritePipeline):
         # ============ 批内 dedup（不查 VDB，只对本批 intentions 互斥判重） ============
         keep_mask: List[bool] = [True] * len(intentions)
         try:
-            dropped = self._intention_batch_dedup(intentions, embeddings)
+            dropped = (
+                self._intention_batch_dedup(intentions, embeddings)
+                if getattr(self.config.recall, "intention_dedup_enabled", True)
+                else []
+            )
             for i in dropped:
                 if 0 <= i < len(keep_mask):
                     keep_mask[i] = False
@@ -981,6 +1015,7 @@ class MemoryWriter(WritePipeline):
                         # 这是一次 LLM 调用：prompt / 产出必须能在线上追到，
                         # 否则 badcase 只能看到"摘要内容不对"却拿不到输入
                         trace=self._make_trace_sink(request, "EPISODE_SUMMARY"),
+                        language=request.language,
                     )
                     if nid:
                         logger.info(
@@ -1194,6 +1229,7 @@ class MemoryWriter(WritePipeline):
                     self._make_trace_sink(request, "TOPIC_SUMMARY")
                     if request is not None else None
                 ),
+                language=getattr(request, "language", None),
             )
         except Exception as e:
             logger.warning(f"[topic-summary] failed (non-fatal): {e}")
@@ -1239,15 +1275,6 @@ class MemoryWriter(WritePipeline):
             recon_tokens 含 prompt/completion/total（reconcile 链路 LLM 消耗）
         """
         stored_ids: List[str] = []
-        # Episode：本次写入归属的内部会话 id（跨 write 把"一件事"归到一起）。
-        # 只数 user 侧记忆（与 rolling summary 只数 pending_user_count 一致）——
-        # agent 侧记忆若参与计数会把 episode 提前撑到上限、切得过碎，白付摘要的 token。
-        episode_id = await self._resolve_episode_id(
-            request, _count_user_owned(new_memories_meta)
-        )
-        session_episode_id = self._session_episode_id(request)
-        if session_episode_id:
-            episode_id = session_episode_id
         # 关系图用：收集本次落库的 (node, op)，供 graph 投影建边。
         # 收 op 是为了拿 op.related（LLM 标注的 typed 关系）。
         graph_payload: List[Tuple[Any, Any]] = []
@@ -1270,10 +1297,36 @@ class MemoryWriter(WritePipeline):
             graph_store=getattr(self, "_graph_store", None),
             new_memory_embeddings=precomputed_embeddings,
             source=request.source,
+            language=request.language,
         )
 
         if not recon_result.success:
-            return [], recon_result.error, {"add": 0, "supersede": 0, "update": 0, "total": 0}, {"prompt": 0, "completion": 0, "total": 0}
+            # reconcile 失败：本次一条新记忆都不落库（不做 ADD-all 兜底），由调用方重跑。
+            # episode 状态也还没推进，重跑不会把同一批记忆重复计数。
+            error = ReconcileFailure(
+                recon_result.error or "reconcile failed",
+                code=recon_result.error_code or "RECONCILE_FAILED",
+            )
+            logger.warning(
+                f"TRACE_PERF [{req_id}] S1_RECONCILE_FAILED "
+                f"code={error.code} candidates={len(new_memory_texts)} stored=0"
+            )
+            return [], error, {"add": 0, "supersede": 0, "update": 0, "total": 0}, {
+                "prompt": recon_result.prompt_tokens,
+                "completion": recon_result.completion_tokens,
+                "total": recon_result.total_tokens,
+            }
+
+        # Episode：本次写入归属的内部会话 id（跨 write 把"一件事"归到一起）。
+        # 只数 user 侧记忆（与 rolling summary 只数 pending_user_count 一致）——
+        # agent 侧记忆若参与计数会把 episode 提前撑到上限、切得过碎，白付摘要的 token。
+        # 放在 reconcile 成功之后：失败的写入不能推进 episode 计数。
+        episode_id = await self._resolve_episode_id(
+            request, _count_user_owned(new_memories_meta)
+        )
+        session_episode_id = self._session_episode_id(request)
+        if session_episode_id:
+            episode_id = session_episode_id
 
         # 分类统计
         _op_counts = {}
@@ -1284,16 +1337,7 @@ class MemoryWriter(WritePipeline):
         logger.info(
             f"TRACE_PERF [{req_id}] S1_RECONCILE_DONE "
             f"ops={len(recon_result.ops)} candidates={len(new_memory_texts)} | {_op_counts_str}"
-            + (f" | DEGRADED({recon_result.degraded_reason})"
-               if getattr(recon_result, "degraded", False) else "")
         )
-        if getattr(recon_result, "degraded", False):
-            # 走了 ADD-all 兜底：内容保住了，但没做去重/演化判定。必须可观测，
-            # 否则线上只会看到"记忆变多了"而不知道为什么。
-            logger.warning(
-                f"[write] reconcile degraded → ADD-all "
-                f"({recon_result.degraded_reason}), {len(recon_result.ops)} memories stored as-is"
-            )
         # 逐条 op 详情由 reconciler 的 "[reconciler] ops detail" 单条 JSON list 输出，
         # 这里不再逐条打印（避免重复刷屏）。
 
@@ -2483,12 +2527,10 @@ class MemoryWriter(WritePipeline):
             response.extra["extract_tokens"] = {"prompt": 0, "completion": 0, "total": 0}
 
             if recon_error is not None:
-                response.success = False
-                response.error_code = 502
-                response.error_message = f"[RECONCILE_FAILED] {recon_error}"
-                response.extra["agent_status"] = "failed"
-                response.extra["agent_error"] = recon_error
-                response.extra["agent_nodes"] = 0
+                # 与 write() 一致：reconcile 失败不落任何记忆，报失败供调用方重跑。
+                self._mark_reconcile_failure(response, recon_error)
+                response.extra["agent_mode"] = "extracted"
+                logger.warning(f"[write_extracted] reconcile failed: {recon_error}")
                 return response
 
             response.success = True
@@ -2554,9 +2596,14 @@ class MemoryWriter(WritePipeline):
         try:
             # 参数校验
             content = request.content
+            # raw 在写入时就按统一规则裁好（见 utils/raw_trim.py）：工具输出、长
+            # assistant 回复不再原样长期存储；历史拼接直接用存下来的文本，不再二次裁剪。
+            # request.messages 保持原样——本次 extractor 输入仍是完整 messages。
+            _raw_trimmed = False
             if not content and request.has_messages():
-                content = request.get_flat_content()
+                content = self._flat_trimmed_raw(request)
                 request.content = content
+                _raw_trimmed = True
 
             if not content:
                 response.error_code = 400
@@ -2627,6 +2674,9 @@ class MemoryWriter(WritePipeline):
                     vector_store = await self._get_vector_store()
                     layer_enum = MemoryLayer.from_string(suggested_layer)
                     _raw_custom: Dict[str, Any] = {}
+                    if _raw_trimmed:
+                        from ..utils.raw_trim import RAW_TRIMMED_KEY
+                        _raw_custom[RAW_TRIMMED_KEY] = True
                     self._attach_client_meta(_raw_custom, request)
                     mem_node = MemoryNode(
                         user_id=request.user_id,
@@ -2690,6 +2740,7 @@ class MemoryWriter(WritePipeline):
                         vector_store, request.user_id, request.agent_id,
                         exclude_memory_id=memory_id,
                         max_turns=_hist_turns * 2,  # k 轮对话 = k*2 条 message
+                        language=request.language,
                     )
                     _recent_history_ms = (_t_recent_history and (datetime.now() - _t_recent_history).total_seconds() * 1000) or 0.0
                     _recent_history_count = len([line for line in (_history_context or "").splitlines() if line.strip()])
@@ -2770,6 +2821,7 @@ class MemoryWriter(WritePipeline):
                             user_id=request.user_id,
                             agent_id=request.agent_id,
                             session_id=request.session_id or "default_session",
+                            language=request.language,
                         )
                         if finalize is finalize_dynamic_episode_capsules:
                             finalize_kwargs["summary_concurrency"] = getattr(
@@ -2929,13 +2981,18 @@ class MemoryWriter(WritePipeline):
         agent_id: Optional[str] = None,
         exclude_memory_id: str = "",
         max_turns: int = 20,
-        max_chars_assistant: int = 500,
+        max_chars_assistant: Optional[int] = None,
+        language: Optional[str] = None,
     ) -> str:
         """
         获取该用户最近的 L1_RAW 对话记录，按轮次拆分后拼成 history context。
+        language：显式 prompt 语言码，用于渲染名字行；None 时按内容判 zh/en。
 
         每条 L1_RAW 的 content 是多轮对话（[user]: ...\n[assistant]: ...）。
-        拆成单条 message 后，user 消息完整保留，assistant 消息截取前 max_chars_assistant 字符。
+        raw 在写入时已按 utils/raw_trim.py 的规则裁好（custom[RAW_TRIMMED_KEY]），
+        这里拆成单条 message 后直接拼接，不再二次裁剪。该规则之前写入的旧 raw
+        没有这个标记，仍按同一（幂等）规则裁剪后再拼，避免旧的长回复 / 工具输出
+        撑大 prompt。max_chars_assistant 只作用于这些旧 raw，默认同写入规则。
         最终取最近 max_turns 条 message（注意单位是 message 条数，非对话轮数；
         调用方按 k 轮 × 2 传入）。
 
@@ -2977,23 +3034,33 @@ class MemoryWriter(WritePipeline):
             # 避免把正文里形如 "[注]: xxx" 的普通文本误判成消息边界。
             import re as _re
             from .base import parse_user_name_line
-            _KNOWN_ROLES = {"user", "assistant", "system", "tool"}
             # 带方括号的任意 label（含对方真人名字）
             _labeled_prefix = _re.compile(r"^\[([^\]\n]{1,32})\]:\s?")
             # 无方括号的已知 role（历史数据容错，沿用旧正则的 `\[?...\]?` 宽容度）
             _bare_role_prefix = _re.compile(r"^(user|assistant|system|tool):\s?")
 
-            # (label, content) 元组列表；label 为 role 或对方真人名字
-            parsed: List[Tuple[str, str]] = []
+            from ..utils.raw_trim import (
+                DEFAULT_RAW_ASSISTANT_MAX_CHARS,
+                RAW_TRIMMED_KEY,
+                trim_raw_body,
+            )
+            if max_chars_assistant is None:
+                max_chars_assistant = DEFAULT_RAW_ASSISTANT_MAX_CHARS
+            _coding_cfg = getattr(getattr(self, "config", None), "coding", None)
+            _tool_max_bytes = getattr(_coding_cfg, "tool_result_max_bytes", None)
+
+            # (label, content, 是否旧 raw 需兼容裁剪) 元组列表；label 为 role 或对方真人名字
+            parsed: List[Tuple[str, str, bool]] = []
             user_name: str = ""
             for node in nodes:
                 content = node.content or ""
+                _legacy = not bool((node.custom or {}).get(RAW_TRIMMED_KEY))
                 for _line_idx, line in enumerate(content.split("\n")):
                     m = _labeled_prefix.match(line) or _bare_role_prefix.match(line)
                     if m:
                         label = m.group(1)
                         body = line[m.end():]
-                        parsed.append((label, body))
+                        parsed.append((label, body, _legacy))
                         continue
                     # 名字行只可能是每个 node content 的第一行（get_flat_content 插在文首）。
                     # 逐 node 判断而非用 `not parsed`：parsed 跨 node 累积，第二个 node
@@ -3006,36 +3073,41 @@ class MemoryWriter(WritePipeline):
                             continue
                     if parsed:
                         # 续行：拼回上一条 message（保留换行）
-                        prev_label, prev_body = parsed[-1]
-                        parsed[-1] = (prev_label, prev_body + "\n" + line)
+                        prev_label, prev_body, prev_legacy = parsed[-1]
+                        parsed[-1] = (prev_label, prev_body + "\n" + line, prev_legacy)
                     else:
                         # 开头就是无前缀行（异常/老数据）：当成 user 消息兜底
-                        parsed.append(("user", line))
+                        parsed.append(("user", line, _legacy))
 
             # 取最近 max_turns 条 message（按 message 截断，绝不从消息中间切开）
             recent = parsed[-max_turns:] if len(parsed) > max_turns else parsed
             if not recent:
                 return ""
 
-            # 格式化：非 user 侧整条截断（含对方真人），user 完整保留
+            # 格式化：新 raw 直接拼接；旧 raw 按写入同一规则兼容裁剪
             all_messages: List[str] = []
             if user_name:
                 from .base import render_user_name_line
                 from ..utils.lang_detect import is_chinese
 
-                _name_line = render_user_name_line(
-                    user_name,
-                    is_chinese("\n".join(b for _, b in recent)),
+                _name_line = (
+                    render_user_name_line(user_name, language=language)
+                    if language else
+                    render_user_name_line(
+                        user_name,
+                        is_chinese("\n".join(b for _, b, _ in recent)),
+                    )
                 )
                 if _name_line:
                     all_messages.append(_name_line)
-            for label, body in recent:
+            for label, body, legacy in recent:
+                if legacy:
+                    body = trim_raw_body(
+                        label, body,
+                        assistant_max_chars=max_chars_assistant,
+                        tool_max_bytes=_tool_max_bytes,
+                    )
                 body = body.strip()
-                # 截断口径：assistant + 对方真人（非已知 role 的 label）。
-                # user 完整保留；system / tool 沿用历史行为（不截断）。
-                _truncate = label == "assistant" or label not in _KNOWN_ROLES
-                if _truncate and len(body) > max_chars_assistant:
-                    body = body[:max_chars_assistant] + "..."
                 all_messages.append(f"[{label}]: {body}")
 
             return "\n".join(all_messages)
@@ -3267,6 +3339,7 @@ class MemoryWriter(WritePipeline):
                 existing_tags=existing_tags,
                 history_context=history_context,
                 basic_profile_fields=_basic_profile_fields,
+                language=request.language,
             )
             extract_timing["extract_total_ms"] = round(
                 (datetime.now() - _t_extract_total).total_seconds() * 1000, 2
@@ -3476,12 +3549,11 @@ class MemoryWriter(WritePipeline):
                 response.extra["reconcile_ops"] = ops_counts
                 response.extra["reconcile_tokens"] = recon_tokens
                 if recon_error is not None:
+                    # stored_ids 为空：reconcile 失败时一条新记忆都不落库，write()
+                    # 随后回滚 L1_RAW（retry_safe=True），换个 request_id 重跑即可。
                     response.extra["agent_stored_ids"] = stored_ids
-                    self._mark_agent_failure(
-                        response,
-                        error_code="RECONCILE_FAILED",
-                        error_message=recon_error,
-                        agent_nodes=len(stored_ids),
+                    self._mark_reconcile_failure(
+                        response, recon_error, agent_nodes=len(stored_ids),
                     )
                     logger.warning(f"[write] reconcile failed: {recon_error}")
                     return
@@ -3603,6 +3675,29 @@ class MemoryWriter(WritePipeline):
         response.success = False
         response.error_code = 502
         response.error_message = f"[{code}] {message}"
+
+    @classmethod
+    def _mark_reconcile_failure(
+        cls,
+        response: WriteResponse,
+        recon_error: str,
+        *,
+        agent_nodes: int = 0,
+    ) -> None:
+        """reconcile 失败：agent_error_code 恒为 RECONCILE_FAILED，具体原因
+        （LLM_UNAVAILABLE / EMPTY_RESPONSE / JSON_PARSE_FAILED / RECONCILE_EXCEPTION）
+        放在 reconcile_error_code。"""
+        reason = getattr(recon_error, "code", "") or "RECONCILE_FAILED"
+        response.extra["reconcile_error_code"] = reason
+        cls._mark_agent_failure(
+            response,
+            error_code="RECONCILE_FAILED",
+            error_message=(
+                f"{reason}: {recon_error}"
+                if reason != "RECONCILE_FAILED" else str(recon_error)
+            ),
+            agent_nodes=agent_nodes,
+        )
 
     async def _handle_agent_failure(self, request, response, agent_result, tracer_span, extract_timing: Optional[Dict[str, Any]] = None) -> None:
         """处理 agent extract 失败的情况。"""

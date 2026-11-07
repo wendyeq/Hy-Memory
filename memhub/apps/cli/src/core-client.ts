@@ -8,15 +8,30 @@ import axios from "axios";
  */
 const READ_ONLY_PATHS = [
   "/api/v1/call-events",
+  // Read-only: the registry plus a scan of the vector store's collection names.
+  "/api/v1/embedding-spaces",
+  "/api/v1/embedding-switches/current",
   "/api/v1/import-jobs",
   "/api/v1/live-sync",
   "/api/v1/memory-processing",
   "/api/v1/model-profiles",
+  "/api/v1/source-grants",
   "/api/v1/sources",
+  "/api/v2/home-projection",
   "/api/v2/home-summary",
+  "/api/v2/raw",
   "/api/v2/memory-library",
   "/api/v2/user-profile",
+  "/api/v2/user-profile/versions",
+  "/api/v1/settings/memory-mode",
+  "/api/v1/settings/memory-mode/plan",
+  "/api/v1/settings/memory-features",
+  "/api/v1/settings/ui-language",
+  "/api/v2/evolve",
 ] as const;
+/** One evolve run's receipt (`memhub evolve --wait`). */
+const EVOLVE_RUN =
+  /^\/api\/v2\/evolve\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const SDK_MEMORY_DETAIL = /^\/api\/v2\/memories\/[A-Za-z0-9][\w.-]{0,127}$/;
 /** Status of one `POST /api/v2/memories` addition, by its request id. */
 const MEMORY_ADDITION =
@@ -155,9 +170,22 @@ export function createCoreReader(attachment: {
         code: detailCode(response.data, response.status),
       };
     }
-    return { state: "unavailable" as const, code: `http_${response.status}` };
+    return {
+      state: "unavailable" as const,
+      code: unavailableCode(response.data, response.status),
+    };
   };
 }
+
+/** A 503 that names `embedding_unavailable` keeps it: the search could not
+ * embed its query, which needs another fix than "try again later". */
+function unavailableCode(value: unknown, status: number): string {
+  return status === 503 && detailCode(value, status) === EMBEDDING_UNAVAILABLE
+    ? EMBEDDING_UNAVAILABLE
+    : `http_${status}`;
+}
+
+export const EMBEDDING_UNAVAILABLE = "embedding_unavailable";
 
 /** Core's stable `detail` code when it sent one, else the bare status. */
 function detailCode(value: unknown, status: number): string {
@@ -210,7 +238,10 @@ export function createCoreContextQuery(attachment: {
     if (response.status === 404) {
       return { state: "not_found" as const, code: "http_404" };
     }
-    return { state: "unavailable" as const, code: `http_${response.status}` };
+    return {
+      state: "unavailable" as const,
+      code: unavailableCode(response.data, response.status),
+    };
   };
 }
 
@@ -219,6 +250,7 @@ export function isReadOnlyPath(path: string): boolean {
   if (IMPORT_JOB.test(path)) return true;
   if (OPERATION_RECEIPT.test(path)) return true;
   if (MEMORY_ADDITION.test(path)) return true;
+  if (EVOLVE_RUN.test(path)) return true;
   if (!SDK_MEMORY_DETAIL.test(path)) return false;
   const segment = path.slice("/api/v2/memories/".length);
   return !(RESERVED_MEMORY_SEGMENTS as readonly string[]).includes(segment);
@@ -239,6 +271,11 @@ export interface MemoryWriteReceipt {
   detail?: string;
   raw_ids?: string[];
   memory_ids?: string[];
+  /** Stable code of the last failure while the write still waits; null when
+   * none. Optional so older Runtimes stay readable. */
+  error_code?: string | null;
+  /** When Core will try this write again (ISO); null when not scheduled. */
+  next_retry_at?: string | null;
 }
 
 export interface OpenAIMessage {
@@ -310,6 +347,8 @@ export async function submitMemoryWrite(
     messages: readonly OpenAIMessage[];
     memory_at?: string;
     priority?: "live" | "normal";
+    /** Whose memory this is. Omitted for the default user (`local`). */
+    user_id?: string;
   },
 ): Promise<MemoryWriteOutcome> {
   let response: { status: number; data: unknown };
@@ -327,6 +366,9 @@ export async function submitMemoryWrite(
         ...(request.priority === undefined
           ? {}
           : { priority: request.priority }),
+        ...(request.user_id === undefined || request.user_id === "local"
+          ? {}
+          : { user_id: request.user_id }),
       },
       {
         headers: { Authorization: `Bearer ${attachment.apiToken}` },
@@ -469,11 +511,16 @@ export async function deleteModelProfile(
 export async function readMemoryWrite(
   attachment: RuntimeAttachmentLike,
   requestId: string,
+  /** A receipt belongs to the user that submitted it; omit for `local`. */
+  userId?: string,
 ): Promise<MemoryWriteReceipt | null> {
   try {
     const response = await axios.get<MemoryWriteReceipt>(
       `${baseUrlOf(attachment)}/api/v2/memory-writes/${encodeURIComponent(requestId)}`,
       {
+        ...(userId === undefined || userId === "local"
+          ? {}
+          : { params: { user_id: userId } }),
         headers: { Authorization: `Bearer ${attachment.apiToken}` },
         timeout: 10_000,
         proxy: false,

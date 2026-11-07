@@ -68,6 +68,12 @@ const JSON_OPTION: CommandOption = {
   flag: "--json",
   summary: "以 JSON 输出到 stdout，供脚本与 Agent 消费。",
 };
+/** Global to the memory commands: whose memories are read or written. */
+const USER_ID_OPTION: CommandOption = {
+  flag: "--user-id <id>",
+  summary:
+    "读写哪个用户的记忆，默认 local（App 用的就是 local）。1–64 位字母、数字、点、下划线或连字符；其他用户的记忆来自用 sources connect hermes --user-id 接入的 Hermes profile。",
+};
 const WATCH_OPTION: CommandOption = {
   flag: "--watch",
   summary: "串行持续刷新；Ctrl-C 只停止观察，不停止 Runtime。",
@@ -252,14 +258,24 @@ export const COMMANDS: readonly CommandDescriptor[] = [
   {
     name: "sources",
     summary:
-      "列出来源，直接接入来源，或按 request id 查接入回执。connect 不加 --import 只授权（处理保持冻结：不导入历史、不扫描新会话）；加 --import 同时导入历史并开启持续同步，返回 request id。目录来自环境变量覆盖的来源必须加 --confirm-overrides。",
+      "列出来源，直接接入来源，或按 request id 查接入回执。connect 不加 --import 只授权（处理保持冻结：不导入历史、不扫描新会话）；加 --import 同时导入历史并开启持续同步，返回 request id。目录来自环境变量覆盖的来源必须加 --confirm-overrides。Hermes 的每个 profile 是一个独立用户：用 --user-id 和 --root 接入，授权并导入历史（任何层级的 profiles/ 目录都会被排除，各用户互不读取）。--root 不能是 profiles 目录本身，也不能与另一个用户的 Hermes 目录相同或互相包含（~/.hermes 与 ~/.hermes/profiles/<name> 除外）。",
     usage:
-      "memhub sources list [--json]\n            memhub sources connect <id> [<id> ...] [--import] [--confirm-overrides] [--request-id <uuid>] [--json]\n            memhub sources connect --all-detected [--import] [--confirm-overrides] [--json]\n            memhub sources receipt <request-id> [--json]",
+      "memhub sources list [--json]\n            memhub sources connect <id> [<id> ...] [--import] [--confirm-overrides] [--request-id <uuid>] [--json]\n            memhub sources connect hermes --user-id <id> --root <path> [--import] [--request-id <uuid>] [--json]\n            memhub sources connect --all-detected [--import] [--confirm-overrides] [--json]\n            memhub sources receipt <request-id> [--json]",
     options: [
       {
         flag: "--import",
         summary:
           "接入后立即导入历史会话并开启持续同步；不加时只授权，处理保持冻结。",
+      },
+      {
+        flag: "--user-id <id>",
+        summary:
+          "只用于 hermes：这条接入属于哪个用户（默认 local）。和 --root 一起接入一个 Hermes profile，例如 --user-id wife --root ~/.hermes/profiles/wife；用户 ID 不必等于 profile 名，例如 --user-id wife-work --root ~/.hermes/profiles/wife:work。其他来源只能是 local。",
+      },
+      {
+        flag: "--root <path>",
+        summary:
+          "只用于 hermes：读取的根目录（~ 会展开为主目录）。默认是 Hermes 自己的目录 ~/.hermes。",
       },
       {
         flag: "--all-detected",
@@ -345,9 +361,9 @@ export const COMMANDS: readonly CommandDescriptor[] = [
   {
     name: "models",
     summary:
-      "管理生成模型配置。add/test 直接提交并返回操作 ID（异步，用 receipt 查结果）；edit/activate 直接执行；remove 不可逆，需 --yes。<profile-id>/<operation-id> 都是 UUID；脚本模式的凭据只从受控文件读取。",
+      "管理生成模型配置。add/test 直接提交并返回操作 ID（异步，用 receipt 查结果）；edit 直接执行；activate 换了向量模型（模型或维度）时先显示切换计划，需 --yes 确认后重新生成全部向量，switch 查看或取消、spaces 查看或清理旧向量数据；remove 不可逆，需 --yes。<profile-id>/<operation-id> 都是 UUID；脚本模式的凭据只从受控文件读取。",
     usage:
-      "memhub models list [--json]\n            memhub models show <profile-id> [--json]\n            memhub models add --config-file <path> [--api-key-file <path>] [--activate] [--json]\n            memhub models test <profile-id> [--json]\n            memhub models receipt <operation-id> [--json]\n            memhub models edit <profile-id> --config-file <path> [--api-key-file <path>] [--json]\n            memhub models activate <profile-id> [--json]\n            memhub models remove <profile-id> [--yes] [--json]",
+      "memhub models list [--json]\n            memhub models show <profile-id> [--json]\n            memhub models add --config-file <path> [--api-key-file <path>] [--activate [--yes] [--wait|--no-wait]] [--json]\n            memhub models test <profile-id> [--json]\n            memhub models receipt <operation-id> [--json]\n            memhub models edit <profile-id> --config-file <path> [--api-key-file <path>] [--json]\n            memhub models activate <profile-id> [--yes] [--wait|--no-wait] [--json]\n            memhub models switch <status|cancel> [--json]\n            memhub models spaces [--cleanup <space-id> --yes] [--json]\n            memhub models remove <profile-id> [--yes] [--json]",
     alternative_usage: "memhub models setup",
     options: [
       {
@@ -361,7 +377,17 @@ export const COMMANDS: readonly CommandDescriptor[] = [
       },
       {
         flag: "--activate",
-        summary: "add 成功后把新配置设为当前使用。",
+        summary:
+          "add 成功后先探测，再按 activate 的规则设为当前使用（向量模型变化时同样要确认切换）。",
+      },
+      {
+        flag: "--wait | --no-wait",
+        summary:
+          "activate 开始向量模型切换后是否跟随进度；终端里默认跟随，Ctrl-C 只停止显示。",
+      },
+      {
+        flag: "--cleanup <space-id>",
+        summary: "spaces：立即删除一个已停用的向量空间（不可恢复，需 --yes）。",
       },
       DESTRUCTIVE_CONFIRM_OPTION,
       JSON_OPTION,
@@ -371,9 +397,9 @@ export const COMMANDS: readonly CommandDescriptor[] = [
   {
     name: "memories",
     summary:
-      "列出、搜索、查看、添加、修改或物理删除记忆（对话、工作、编码三个场景）。add 和 App 的「添加记忆」是同一个入口；delete 不可逆，需 --yes。",
+      "列出、搜索、查看、添加、修改或物理删除记忆（对话、工作、编码三个场景）。add 和 App 的「添加记忆」是同一个入口；delete 不可逆，需 --yes；要删的记忆已不存在（或不属于该用户）时提示未找到，按已删除处理并退出 0。",
     usage:
-      "memhub memories list [--scene <all|chat|working|coding>] [--source <id>] [--query <text>] [--status <state>] [--offset <n>] [--limit <n>] [--json]\n            memhub memories show <memory-id> [--kind <kind>] [--variant <variant>] [--json]\n            memhub memories add <text> [--request-id <uuid>] [--json]\n            memhub memories add --content-file <path> [--request-id <uuid>] [--json]\n            memhub memories add-status <request-id> [--json]\n            memhub memories update <memory-id> --content-file <path> [--kind <kind>] [--variant <variant>] [--task <text>] [--json]\n            memhub memories delete <memory-id> [--kind <kind>] [--variant <variant>] [--yes] [--json]",
+      "memhub memories list [--scene <all|chat|working|coding>] [--source <id>] [--query <text>] [--status <state>] [--offset <n>] [--limit <n>] [--user-id <id>] [--json]\n            memhub memories show <memory-id> [--kind <kind>] [--variant <variant>] [--user-id <id>] [--json]\n            memhub memories add <text> [--request-id <uuid>] [--user-id <id>] [--json]\n            memhub memories add --content-file <path> [--request-id <uuid>] [--user-id <id>] [--json]\n            memhub memories add-status <request-id> [--user-id <id>] [--json]\n            memhub memories update <memory-id> --content-file <path> [--kind <kind>] [--variant <variant>] [--task <text>] [--user-id <id>] [--json]\n            memhub memories delete <memory-id> [--kind <kind>] [--variant <variant>] [--yes] [--user-id <id>] [--json]",
     options: [
       {
         flag: "--scene <all|chat|working|coding>",
@@ -411,15 +437,82 @@ export const COMMANDS: readonly CommandDescriptor[] = [
           "add 的幂等键；用同一个 id 重试只会读回第一次的结果，不会重复添加。不给时自动生成并输出。",
       },
       DESTRUCTIVE_CONFIRM_OPTION,
+      USER_ID_OPTION,
       JSON_OPTION,
     ],
     exit_codes: RUNTIME_EXITS,
   },
   {
     name: "profile",
-    summary: "读取 SDK 组装后的用户长期画像（L0 + 已启用的长期画像补充）。",
-    usage: "memhub profile [--json]",
-    options: [JSON_OPTION],
+    summary:
+      "读取 SDK 组装后的用户长期画像（L0 + 已启用的长期画像补充）；--versions 列出 L0 画像的版本链（最新在前，* 为当前版本）。",
+    usage: "memhub profile [--versions] [--user-id <id>] [--json]",
+    options: [
+      {
+        flag: "--versions",
+        summary:
+          "列出 L0 基本信息的版本链（get_user_basic_info），用于找出覆盖了正确值的错误版本。",
+      },
+      USER_ID_OPTION,
+      JSON_OPTION,
+    ],
+    exit_codes: RUNTIME_EXITS,
+  },
+  {
+    name: "settings",
+    summary:
+      "查看或切换记忆模式（lite / pro / ultra）。lite 不调用模型，只在原始对话里检索；pro 由模型提取记忆（System 1）；ultra 在 pro 之上每晚自动进化（System 2，使用知识图谱）。任何模式都保留全部原始对话。切换不迁移数据：已处理的不会重做，排队中的和新的按新模式处理；需 --yes，不加时只显示计划。环境变量 ONE_MEMORY_GRAPH_STORE 会强制 ultra。settings features 查看或开关 SDK 的可选检索与提取功能（全局设置，默认全部保持 SDK 默认值）：graph_rerank 图谱重排（仅 ultra）、same_series_timeline 同系列时间线（需 graph_rerank）、episode_recall 片段召回（pro / ultra，需先开 session_episodes 写入片段）、session_episodes 片段写入、episode_summary 片段摘要（每个片段一次模型调用）、intention 意图提取（默认开）、intention_dedup 意图判重（默认开；关闭则检索与写入都不判重、不删除意图）、few_shot 提取示例，以及数值 intention_dedup_threshold 意图判重阈值（默认 0.95，可设 0.8–1.0）；set 需 --yes，不加时只显示计划；reset 恢复默认值。settings language 查看或设置界面语言（App 切换语言时会自动设置）：简体中文（zh-Hans）和 system 不指定 SDK 语言，SDK 照旧自动识别中文或英文；其余语言（en、zh-Hant、ja、es、de、pt、fr、ko、ru、id）会让提取等 SDK 提示使用该语言，立即生效。",
+    usage:
+      "memhub settings mode [lite|pro|ultra] [--yes] [--json]\n" +
+      "            memhub settings features [--json]\n" +
+      "            memhub settings features set <name>=<true|false> [...] [--yes] [--json]\n" +
+      "            memhub settings features set intention_dedup_threshold=<0.8-1.0> [--yes] [--json]\n" +
+      "            memhub settings features reset [<name> ...] [--json]\n" +
+      "            memhub settings language [<code>|system] [--json]",
+    options: [
+      {
+        flag: "mode [lite|pro|ultra]",
+        summary: "不带模式只显示当前模式；带模式时先显示切换计划。",
+      },
+      {
+        flag: "features set <name>=<true|false>",
+        summary:
+          "开关一个或多个 SDK 功能；功能在当前模式下不生效时会注明原因（例如 graph_rerank 需要 ultra）。intention_dedup_threshold 取 0.8–1.0 的数值。",
+      },
+      {
+        flag: "features reset [<name> ...]",
+        summary: "把指定功能（不写则全部）恢复为 SDK 默认值。",
+      },
+      {
+        flag: "language [<code>|system]",
+        summary:
+          "不带参数显示界面语言和 SDK 提示语言；带语言代码（en、zh-Hans、zh-Hant、ja、es、de、pt、fr、ko、ru、id）或 system 时设置。",
+      },
+      CONFIRM_OPTION,
+      JSON_OPTION,
+    ],
+    exit_codes: RUNTIME_EXITS,
+  },
+  {
+    name: "evolve",
+    summary:
+      "立即为一个用户运行记忆进化（System 2，仅 ultra 模式）。在后台运行并返回运行 ID；--wait 等待结果。同一用户同时只运行一次；每晚的自动进化由 Runtime 按设置安排。",
+    usage:
+      "memhub evolve [--user-id <id>] [--agent-id <id>] [--max-batches <n>] [--wait] [--json]",
+    options: [
+      USER_ID_OPTION,
+      {
+        flag: "--agent-id <id>",
+        summary:
+          "进化哪个 agent 的记忆，默认 all-apps（MemHub 写入记忆用的 agent）。",
+      },
+      {
+        flag: "--max-batches <n>",
+        summary: "每轮最多处理的批次数（1–1000），默认由 SDK 决定。",
+      },
+      { flag: "--wait", summary: "等待这次进化结束再返回。" },
+      JSON_OPTION,
+    ],
     exit_codes: RUNTIME_EXITS,
   },
   {
@@ -475,7 +568,7 @@ export const COMMANDS: readonly CommandDescriptor[] = [
     summary:
       "从原始对话与已沉淀记忆统一检索上下文；本地只读，不调用模型、不触发补索引。文本输出标明每条是「原始对话摘录」还是「记忆」（JSON 里是 kind: raw|memory）。",
     usage:
-      "memhub recall <query> [--kind <raw|memory>] [--source <id>] [--limit <n>] [--character-budget <n>] [--timeout-ms <n>] [--json]\n            memhub recall --query-file <path> [...]\n            memhub recall --stdin [...]",
+      "memhub recall <query> [--kind <raw|memory>] [--source <id>] [--limit <n>] [--character-budget <n>] [--timeout-ms <n>] [--user-id <id>] [--json]\n            memhub recall --query-file <path> [...]\n            memhub recall --stdin [...]",
     options: [
       {
         flag: "--query-file <path>",
@@ -502,6 +595,7 @@ export const COMMANDS: readonly CommandDescriptor[] = [
         flag: "--timeout-ms <n>",
         summary: "Core 查询时限 50..30000 毫秒，默认 2000。",
       },
+      USER_ID_OPTION,
       JSON_OPTION,
     ],
     exit_codes: RUNTIME_EXITS,
@@ -650,7 +744,7 @@ export const COMMANDS: readonly CommandDescriptor[] = [
     summary:
       "提交一段 OpenAI 格式的对话（messages）到写入队列，异步加工成记忆；或按 request id 查询状态。request id 是幂等键：不给时自动生成并输出，重试请带上同一个。新增一条结论式记忆请用 memories add。",
     usage:
-      "memhub write submit --messages-file <path> --session <id> [--source <id>] [--request-id <id>] [--memory-at <RFC3339>] [--live] [--json]\n            memhub write status <request-id> [--json]",
+      "memhub write submit --messages-file <path> --session <id> [--source <id>] [--request-id <id>] [--memory-at <RFC3339>] [--live] [--user-id <id>] [--json]\n            memhub write status <request-id> [--user-id <id>] [--json]",
     options: [
       {
         flag: "--messages-file <path>",
@@ -666,6 +760,7 @@ export const COMMANDS: readonly CommandDescriptor[] = [
       },
       { flag: "--memory-at <RFC3339>", summary: "对话发生时间，必须带时区。" },
       { flag: "--live", summary: "优先处理。" },
+      USER_ID_OPTION,
       JSON_OPTION,
     ],
     exit_codes: RUNTIME_EXITS,

@@ -11,10 +11,11 @@ import asyncio
 import hashlib
 import os
 import threading
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal, TypedDict, cast
 
 from hy_memory import (  # type: ignore[import-untyped]
     AmbiguousMemoryIdError as AmbiguousMemoryIdError,  # re-export for api.py
@@ -29,14 +30,29 @@ from one_memory.embedding_assets import (
     BUILTIN_EMBEDDING_DIMENSIONS,
     BUILTIN_EMBEDDING_MODEL,
 )
+from one_memory.embedding_spaces import (
+    DEFAULT_GRAPH_DIR,
+    EmbeddingSpace,
+    EmbeddingSpaceError,
+    derived_space,
+    embedding_identity,
+)
 from one_memory.hy_graph_admin import (
     GraphWidthMismatchError,
-    graph_store_enabled,
+    effective_memory_mode,
     inspect_graph_width_mismatch,
 )
 from one_memory.hy_sdk_types import HySdkRuntimeError
 from one_memory.local_embedding import LocalEmbedder
 from one_memory.log_file import confine_hy_sdk_logging
+from one_memory.memory_features import (
+    FEATURES,
+    PARAMETERS,
+    SETTINGS_BY_NAME,
+    FeatureOverrides,
+    SettingValue,
+    feature_overrides,
+)
 from one_memory.model_profiles import (
     ModelProfileSnapshot,
     ProviderKind,
@@ -47,6 +63,10 @@ _RUNTIME_LOCK = threading.RLock()
 BUILTIN_RETRIEVAL_PROFILE_ID = "builtin-retrieval"
 _LOCAL_ONNX_PLACEHOLDER_URL = "http://127.0.0.1/local-onnx"
 DEFAULT_RELEVANCE_FLOOR = 0.35
+
+#: The SDK's memory modes. A mode never changes a collection name: the space
+#: names the collections, the mode only which stores the client opens.
+MemoryMode = Literal["lite", "pro", "ultra"]
 
 
 @dataclass
@@ -170,29 +190,77 @@ class SdkClientHandle:
         api_key: str | None,
         data_dir: Path,
         http_transport_factory: Callable[[], Any] | None = None,
+        space: EmbeddingSpace | None = None,
+        mode: str | None = None,
+        features: FeatureOverrides = (),
+        language: str | None = None,
     ) -> None:
         self._profile = profile
         self._api_key = api_key
         self._data_dir = data_dir
         self._http_transport_factory = http_transport_factory
+        self._space = space
+        #: The SDK mode this handle's client is built with, fixed for its life.
+        self.mode = mode or effective_memory_mode()
+        #: The SDK features set on its config (`memory_features`), fixed likewise.
+        self.features = features
+        #: The SDK prompt language (`ui_language`); None = SDK auto-detect.
+        self.language = language
         self._lease: ClientLease | None = None
+        self._constructing: asyncio.Future[ClientLease] | None = None
         self._lock = asyncio.Lock()
+
+    @property
+    def profile(self) -> ModelProfileSnapshot:
+        return self._profile
+
+    @property
+    def space(self) -> EmbeddingSpace | None:
+        return self._space
+
+    @property
+    def api_key(self) -> str | None:
+        return self._api_key
 
     async def client(self) -> HyMemoryClient:
         if self._lease is not None:
             return self._lease.client
         async with self._lock:
             if self._lease is None:
-                self._lease = await asyncio.to_thread(
-                    acquire_client,
-                    self._profile,
-                    api_key=self._api_key,
-                    data_dir=self._data_dir,
-                    http_transport_factory=self._http_transport_factory,
+                constructing = asyncio.ensure_future(
+                    asyncio.to_thread(
+                        _acquire_for_handle,
+                        self._profile,
+                        self._space,
+                        api_key=self._api_key,
+                        data_dir=self._data_dir,
+                        http_transport_factory=self._http_transport_factory,
+                        mode=self.mode,
+                        features=self.features,
+                        **language_kwargs(self.language),
+                    )
                 )
+                self._constructing = constructing
+                try:
+                    self._lease = await asyncio.shield(constructing)
+                except asyncio.CancelledError:
+                    # The construction thread runs on. Keep what it builds, so
+                    # `close` releases it instead of leaving its runtime open.
+                    constructing.add_done_callback(self._keep)
+                    raise
             return self._lease.client
 
+    def _keep(self, constructing: asyncio.Future[ClientLease]) -> None:
+        if constructing.cancelled() or constructing.exception() is not None:
+            return
+        if self._lease is None:
+            self._lease = constructing.result()
+
     async def close(self) -> None:
+        constructing = self._constructing
+        if constructing is not None and not constructing.done():
+            # A construction a cancelled caller left behind: wait for its lease.
+            await asyncio.gather(constructing, return_exceptions=True)
         async with self._lock:
             lease, self._lease = self._lease, None
         if lease is not None:
@@ -217,6 +285,33 @@ def builtin_retrieval_snapshot() -> ModelProfileSnapshot:
     )
 
 
+def retrieval_view(profile: ModelProfileSnapshot) -> ModelProfileSnapshot:
+    """The read side of `profile`: its embedding space, and no generation.
+
+    Reads must open the collection writes fill (#242), and the collection is
+    named by the embedding only. Generation stays the built-in placeholder, so
+    a read never needs the generation model. A remote embedding still needs
+    the profile's API key, which `build_sdk_config` uses as the embedding key.
+    """
+    provider = profile.embedding_provider_kind or profile.provider_kind
+    endpoint: str | None = None
+    if provider is not ProviderKind.LOCAL_ONNX:
+        endpoint = profile.embedding_base_url
+        if not endpoint:
+            raise HySdkRuntimeError("hy_sdk_model_endpoint_missing")
+    return builtin_retrieval_snapshot().model_copy(
+        update={
+            "profile_id": profile.profile_id,
+            "revision": profile.revision,
+            "embedding_provider_kind": provider,
+            "embedding_model": profile.embedding_model,
+            "embedding_base_url": endpoint,
+            "embedding_dimensions": profile.embedding_dimensions,
+            "has_api_key": profile.has_api_key,
+        }
+    )
+
+
 def sdk_relevance_floor() -> float:
     raw = os.environ.get("ONE_MEMORY_HY_RELEVANCE_FLOOR", "").strip()
     if not raw:
@@ -228,31 +323,105 @@ def sdk_relevance_floor() -> float:
     return min(1.0, max(0.0, value))
 
 
+def sdk_feature_defaults() -> dict[str, SettingValue]:
+    """Each `memory_features` setting's SDK default, as a fresh config has it.
+
+    That is the SDK's code default unless the process environment sets the
+    SDK's own variable (`FeatureSpec.env`), exactly what an unset feature
+    leaves on a client.
+    """
+    config = MemoryConfig()
+    defaults: dict[str, SettingValue] = {
+        spec.name: bool(getattr(getattr(config, spec.section), spec.field)) for spec in FEATURES
+    }
+    for parameter in PARAMETERS:
+        defaults[parameter.name] = float(
+            getattr(getattr(config, parameter.section), parameter.field)
+        )
+    return defaults
+
+
+def apply_sdk_features(
+    config: MemoryConfig,
+    features: Mapping[str, SettingValue] | Iterable[tuple[str, SettingValue]],
+) -> MemoryConfig:
+    """Set each feature a person chose on its `MemoryConfig` field.
+
+    Every exposed feature is a config field the SDK reads from the config at
+    call time, never from `os.environ`, so this is per client and
+    deterministic. Nothing here touches `vector_store`, so the collection
+    identity never depends on a feature.
+    """
+    values = dict(features.items() if isinstance(features, Mapping) else features)
+    for name, value in feature_overrides(values):
+        spec = SETTINGS_BY_NAME[name]
+        setattr(getattr(config, spec.section), spec.field, value)
+    return config
+
+
+class LanguageKwargs(TypedDict, total=False):
+    language: str
+
+
+def language_kwargs(language: str | None) -> LanguageKwargs:
+    """`language=` for a client constructor, only when there is one.
+
+    Without a language every call is the one it was before the setting
+    existed, so stand-ins written for that call keep working.
+    """
+    return {"language": language} if language is not None else {}
+
+
+def apply_sdk_language(config: MemoryConfig, language: str | None) -> MemoryConfig:
+    """Set the SDK prompt language (`MemoryConfig.language`), when there is one.
+
+    None (no language set) sets nothing: the SDK detects zh/en as it always
+    did. Every display language, zh-Hans included, is set explicitly. Like a
+    feature, the language never touches `vector_store`, so the collection
+    identity never depends on it.
+    """
+    if language is not None:
+        config.language = language
+    return config
+
+
 def build_sdk_config(
     profile: ModelProfileSnapshot,
+    space: EmbeddingSpace | None = None,
+    mode: MemoryMode | None = None,
     *,
     api_key: str | None,
     data_dir: Path,
+    features: Mapping[str, SettingValue] | Iterable[tuple[str, SettingValue]] = (),
+    language: str | None = None,
 ) -> MemoryConfig:
-    """Map a model snapshot to SDK models, endpoints, backends, and local paths."""
+    """Map a model snapshot and its embedding space to an SDK configuration.
+
+    `space` names the collections and the graph; the profile only says how to
+    reach the models. A profile whose embedding identity (model and width) is
+    not the space's raises `embedding_space_mismatch` instead of opening new,
+    empty collections. Without `space`, the space the profile opened before
+    the registry existed is used: offline tools on a home with no registry.
+    `mode` never changes a name, and neither do `features`
+    (`memory_features`), which are set on top; with none the config is
+    exactly what it was before the setting existed. So is `language`
+    (`apply_sdk_language`); None leaves the SDK's own zh/en detection.
+    """
+    if mode is not None and mode not in {"lite", "pro", "ultra"}:
+        raise HySdkRuntimeError("hy_sdk_memory_mode_invalid")
     generation_endpoint, generation_key = _generation_access(profile, api_key)
     embedding_provider = profile.embedding_provider_kind or profile.provider_kind
     embedding_service_is_local = embedding_provider is ProviderKind.LOCAL_ONNX
-    embedding_model = profile.embedding_model or (
-        BUILTIN_EMBEDDING_MODEL if embedding_service_is_local else None
-    )
-    if not embedding_model:
-        raise HySdkRuntimeError("hy_sdk_embedding_model_required")
-    dimensions: int | None
+    try:
+        identity = embedding_identity(profile)
+    except EmbeddingSpaceError as error:
+        raise HySdkRuntimeError(error.code) from None
     if embedding_service_is_local:
         embedding_endpoint = None
         embedding_key = None
-        dimensions = profile.embedding_dimensions or BUILTIN_EMBEDDING_DIMENSIONS
     else:
-        embedding_endpoint = _openai_endpoint(
-            embedding_provider,
-            profile.embedding_base_url or profile.base_url,
-        )
+        # Never the generation endpoint: a remote embedding has its own.
+        embedding_endpoint = _openai_endpoint(embedding_provider, profile.embedding_base_url)
         embedding_key = "ollama" if embedding_provider is ProviderKind.OLLAMA else api_key
         if embedding_provider is ProviderKind.OPENAI_COMPATIBLE and not embedding_key:
             raise HySdkRuntimeError("hy_sdk_embedding_api_key_missing")
@@ -261,13 +430,18 @@ def build_sdk_config(
             ProviderKind.OLLAMA,
         }:
             raise HySdkRuntimeError("hy_sdk_embedding_provider_unsupported")
-        dimensions = profile.embedding_dimensions
+    if space is None:
+        space = derived_space(profile)
+    elif space.identity is None or not identity.matches(space.identity):
+        raise HySdkRuntimeError("embedding_space_mismatch")
+    # The width the space was opened with: its names carry it, and a remote
+    # request sends it as `dimensions`. An "auto" space sends none, as before.
+    dimensions = space.name_dims
+    embedding_model = identity.model
 
     root = data_dir.resolve() / "hy-memory" / "governed-v2"
     root.mkdir(parents=True, exist_ok=True)
-    collection = _collection_base(
-        embedding_provider, embedding_endpoint, embedding_model, dimensions
-    )
+    collection = space.collection_base
 
     llm: dict[str, Any] = {
         "provider": "openai",
@@ -282,7 +456,7 @@ def build_sdk_config(
     if thinking_off:
         llm["extra_body"] = thinking_off
 
-    return MemoryConfig.from_dict(
+    config = MemoryConfig.from_dict(
         {
             "llm": llm,
             "embedder": {
@@ -305,7 +479,7 @@ def build_sdk_config(
             },
             "graph_store": {
                 "provider": "kuzu",
-                "db_path": str(root / "graph"),
+                "db_path": str(root / (space.graph_dir or DEFAULT_GRAPH_DIR)),
                 "url": None,
                 "username": None,
                 "password": None,
@@ -319,18 +493,54 @@ def build_sdk_config(
             "coding": {"db_path": str(root / "coding.sqlite3")},
         }
     )
+    return apply_sdk_language(apply_sdk_features(config, features), language)
+
+
+def _acquire_for_handle(
+    profile: ModelProfileSnapshot,
+    space: EmbeddingSpace | None,
+    *,
+    api_key: str | None,
+    data_dir: Path,
+    http_transport_factory: Callable[[], Any] | None,
+    mode: str | None,
+    features: FeatureOverrides = (),
+    language: str | None = None,
+) -> ClientLease:
+    # `acquire_client` is looked up at call time, so a stand-in replaces every
+    # construction. A handle without a space keeps the call it always made.
+    named: dict[str, Any] = {"space": space} if space is not None else {}
+    return acquire_client(
+        profile,
+        api_key=api_key,
+        data_dir=data_dir,
+        http_transport_factory=http_transport_factory,
+        mode=mode,
+        features=features,
+        **named,
+        **language_kwargs(language),
+    )
 
 
 def acquire_client(
     profile: ModelProfileSnapshot,
+    space: EmbeddingSpace | None = None,
     *,
     api_key: str | None,
     data_dir: Path,
     http_transport_factory: Callable[[], Any] | None = None,
+    mode: str | None = None,
+    features: FeatureOverrides = (),
+    language: str | None = None,
 ) -> ClientLease:
     """Construct a public SDK client and return its explicit runtime lease.
 
-    Waits while `hold_stores_offline` holds this home's stores.
+    `space` names the collections (`build_sdk_config`). `mode` is the SDK
+    pipeline mode (lite / pro / ultra) and never changes a name; None keeps
+    the pre-setting default (ultra when `ONE_MEMORY_GRAPH_STORE` is set, else
+    pro). `features` are the `memory_features` set on its config; none keeps
+    every SDK default. `language` is the SDK prompt language; None
+    auto-detects. Waits while `hold_stores_offline` holds this home's stores.
     """
     key = data_dir.resolve()
     with _STORE_GATE:
@@ -338,11 +548,16 @@ def acquire_client(
             _STORE_GATE.wait()
         _OPENING[key] = _OPENING.get(key, 0) + 1
     try:
+        named: dict[str, Any] = {"space": space} if space is not None else {}
         return _acquire_client(
             profile,
             api_key=api_key,
             data_dir=data_dir,
             http_transport_factory=http_transport_factory,
+            mode=mode or effective_memory_mode(),
+            features=features,
+            **named,
+            **language_kwargs(language),
         )
     finally:
         with _STORE_GATE:
@@ -350,6 +565,20 @@ def acquire_client(
             if not _OPENING[key]:
                 del _OPENING[key]
             _STORE_GATE.notify_all()
+
+
+@contextmanager
+def first_store_open(data_dir: Path) -> Iterator[None]:
+    """One opening of this home's stores at a time: Chroma's first open is unlocked.
+
+    The same lock client construction takes, for anything else that opens
+    Chroma beside the Runtime (the re-embed functions).
+    """
+    key = data_dir.resolve()
+    with _STORE_GATE:
+        constructing = _CONSTRUCTING.setdefault(key, threading.Lock())
+    with constructing:
+        yield
 
 
 def hold_stores_offline(data_dir: Path) -> bool:
@@ -377,12 +606,24 @@ def release_stores(data_dir: Path) -> None:
 
 def _acquire_client(
     profile: ModelProfileSnapshot,
+    space: EmbeddingSpace | None = None,
     *,
     api_key: str | None,
     data_dir: Path,
     http_transport_factory: Callable[[], Any] | None,
+    mode: str = "pro",
+    features: FeatureOverrides = (),
+    language: str | None = None,
 ) -> ClientLease:
-    config = build_sdk_config(profile, api_key=api_key, data_dir=data_dir)
+    config = build_sdk_config(
+        profile,
+        space,
+        cast(MemoryMode, mode),
+        api_key=api_key,
+        data_dir=data_dir,
+        features=features,
+        language=language,
+    )
     config.http_transport_factory = http_transport_factory
     mismatch = inspect_graph_width_mismatch(config)
     if mismatch is not None:
@@ -398,7 +639,7 @@ def _acquire_client(
         with constructing:
             client = HyMemoryClient(
                 config=config,
-                mode="ultra" if graph_store_enabled() else "pro",
+                mode=mode,
                 runtime=runtime,
                 embedding_service=embedding_service,
             )
@@ -438,6 +679,33 @@ def _generation_access(
     return endpoint, api_key
 
 
+def embedding_endpoint(profile: ModelProfileSnapshot) -> str | None:
+    """The OpenAI-compatible base URL the SDK embeds through; None when local."""
+    provider = profile.embedding_provider_kind or profile.provider_kind
+    if provider is ProviderKind.LOCAL_ONNX:
+        return None
+    return _openai_endpoint(provider, profile.embedding_base_url)
+
+
+def legacy_collection_base(profile: ModelProfileSnapshot) -> str:
+    """The four-attribute name a profile's space had before the registry.
+
+    Existing homes are registered under exactly this name, so it must never
+    change: provider, embedding endpoint, model and declared width.
+    """
+    provider = profile.embedding_provider_kind or profile.provider_kind
+    local = provider is ProviderKind.LOCAL_ONNX
+    model = profile.embedding_model or (BUILTIN_EMBEDDING_MODEL if local else None)
+    if not model:
+        raise HySdkRuntimeError("hy_sdk_embedding_model_required")
+    if local:
+        return _collection_base(
+            provider, None, model, profile.embedding_dimensions or BUILTIN_EMBEDDING_DIMENSIONS
+        )
+    endpoint = _openai_endpoint(provider, profile.embedding_base_url)
+    return _collection_base(provider, endpoint, model, profile.embedding_dimensions)
+
+
 def _collection_base(
     provider: ProviderKind,
     endpoint: str | None,
@@ -467,7 +735,7 @@ def vector_collection_bases(profile: ModelProfileSnapshot) -> tuple[str, tuple[s
         endpoint, dimensions = None, profile.embedding_dimensions or BUILTIN_EMBEDDING_DIMENSIONS
         legacy_endpoint = "local-onnx"
     else:
-        endpoint = _openai_endpoint(provider, profile.embedding_base_url or profile.base_url)
+        endpoint = _openai_endpoint(provider, profile.embedding_base_url)
         dimensions = profile.embedding_dimensions
         legacy_endpoint = endpoint
     legacy_model = profile.embedding_model or "bge-small-zh-v1.5"

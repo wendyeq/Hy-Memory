@@ -1383,6 +1383,83 @@ async def _050_model_probe_operations_reserved_at(cursor: Any) -> None:
     )
 
 
+def embedding_spaces_ddl() -> str:
+    """The embedding space registry (`embedding_spaces.py`); the main Core SQLite only.
+
+    Unversioned on purpose, like the visibility tables: a migration raises
+    the build's schema version, and a library this build opened would then
+    refuse an older package. The table is additive and created idempotently;
+    an older build ignores it and opens the space its active profile names,
+    which is the registered space on every home that never switched. SQLite
+    only (partial unique indexes): it lives in the main Core database.
+    """
+    return """
+CREATE TABLE IF NOT EXISTS embedding_spaces (
+    space_id TEXT PRIMARY KEY NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('live','building','stray','retired','dropped')),
+    model TEXT,
+    dims INTEGER,
+    name_dims INTEGER,
+    collection_base TEXT NOT NULL,
+    naming TEXT NOT NULL CHECK(naming IN ('legacy','v2','discovered')),
+    graph_dir TEXT,
+    provider_kind TEXT,
+    profile_id TEXT,
+    profile_revision INTEGER,
+    vectors INTEGER,
+    created_at TEXT NOT NULL,
+    live_since TEXT,
+    retired_at TEXT,
+    keep_until TEXT,
+    dropped_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS embedding_spaces_one_live
+    ON embedding_spaces(state) WHERE state = 'live';
+CREATE UNIQUE INDEX IF NOT EXISTS embedding_spaces_one_physical
+    ON embedding_spaces(collection_base, COALESCE(name_dims, 0))
+    WHERE state != 'dropped';
+"""
+
+
+def embedding_switch_jobs_ddl() -> str:
+    """Embedding switch and merge jobs (`embedding_switch.py`); unversioned, as above.
+
+    At most one job is open at a time (the partial unique index), and it
+    lives beside the profiles and the registry so the commit is one
+    transaction over all three.
+    """
+    return """
+CREATE TABLE IF NOT EXISTS embedding_switch_jobs (
+    job_id TEXT PRIMARY KEY NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('switch','merge')),
+    state TEXT NOT NULL CHECK(state IN (
+        'preparing','reembedding','verifying','committing','done','failed','rolled_back'
+    )),
+    source_space_id TEXT NOT NULL,
+    target_space_id TEXT NOT NULL,
+    stray_space_ids TEXT NOT NULL DEFAULT '[]',
+    target_profile_id TEXT,
+    target_revision INTEGER,
+    prior_profile_id TEXT,
+    requested_by TEXT NOT NULL,
+    plan_json TEXT NOT NULL,
+    progress_json TEXT NOT NULL DEFAULT '{}',
+    verification_json TEXT,
+    error_code TEXT,
+    error_detail TEXT,
+    cancel_requested INTEGER NOT NULL DEFAULT 0,
+    owner_pid INTEGER,
+    heartbeat_at TEXT,
+    attempt INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    finished_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS embedding_switch_one_open
+    ON embedding_switch_jobs((1)) WHERE state NOT IN ('done','rolled_back');
+"""
+
+
 def model_profile_seeds_ddl(dialect: str = "mysql") -> str:
     """Which presets have been seeded, so seeding happens once."""
     if dialect == "sqlite":
@@ -3086,6 +3163,137 @@ async def _060_memory_note_requests(cursor: Any) -> None:
         await cursor.execute(statement)
 
 
+def write_job_retries_ddl(dialect: str = "mysql") -> str:
+    """Per-job retry state: which SDK request id is next, and retries spent.
+
+    The SDK replays a request id's first outcome forever, so every re-run of
+    a job needs an id of its own (`sdk_attempt`). `retries` counts automatic
+    retries after failures of the job itself; provider failures spend none.
+    """
+    if dialect == "sqlite":
+        return """
+ALTER TABLE memory_write_jobs
+ADD COLUMN sdk_attempt INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE memory_write_jobs
+ADD COLUMN retries INTEGER NOT NULL DEFAULT 0;
+"""
+    return """
+ALTER TABLE memory_write_jobs
+ADD COLUMN sdk_attempt INT NOT NULL DEFAULT 0;
+ALTER TABLE memory_write_jobs
+ADD COLUMN retries INT NOT NULL DEFAULT 0;
+"""
+
+
+async def _061_write_job_retries(cursor: Any) -> None:
+    for statement in _split_statements(write_job_retries_ddl(_dialect(cursor))):
+        await cursor.execute(statement)
+
+
+ONBOARDING_PROGRESS_MIGRATION_VERSION = 62
+
+
+def onboarding_progress_ddl(dialect: str = "mysql") -> str:
+    """Append resumable onboarding choices without rewriting migration 12."""
+    if dialect == "sqlite":
+        return """
+ALTER TABLE onboarding_state
+ADD COLUMN mode_intent TEXT NULL;
+ALTER TABLE onboarding_state
+ADD COLUMN setup_step TEXT NULL;
+ALTER TABLE onboarding_state
+ADD COLUMN model_profile_id TEXT NULL;
+"""
+    return """
+ALTER TABLE onboarding_state
+ADD COLUMN mode_intent VARCHAR(16) NULL AFTER updated_at;
+ALTER TABLE onboarding_state
+ADD COLUMN setup_step VARCHAR(16) NULL AFTER mode_intent;
+ALTER TABLE onboarding_state
+ADD COLUMN model_profile_id VARCHAR(36) NULL AFTER setup_step;
+"""
+
+
+async def _062_onboarding_progress(cursor: Any) -> None:
+    if _dialect(cursor) == "sqlite":
+        existing = await cursor.columns("onboarding_state")
+        statements = _split_statements(onboarding_progress_ddl("sqlite"))
+        for column, statement in zip(
+            ("mode_intent", "setup_step", "model_profile_id"),
+            statements,
+            strict=True,
+        ):
+            if column not in existing:
+                await cursor.execute(statement)
+        return
+    for statement in _split_statements(onboarding_progress_ddl("mysql")):
+        try:
+            await cursor.execute(statement)
+        except Exception as error:  # noqa: BLE001 - MySQL driver error type varies
+            if _is_duplicate_column(error):
+                continue
+            raise
+
+
+IMPORT_JOB_LOOKUP_INDEXES_MIGRATION_VERSION = 63
+
+
+def import_job_lookup_indexes_ddl(dialect: str = "mysql") -> str:
+    """Index the per-source and per-status import job lookups.
+
+    Migration 7 gave SQLite `import_jobs` no index beyond its primary key (the
+    one-active-job index is partial), so every "this source's jobs" or "the
+    jobs in this state" question read and sorted the whole table. Live sync
+    adds a row per change it imports and nothing removed them, so on a machine
+    a few weeks old that table was thousands of rows read several times a poll.
+
+    `import_jobs_lane` serves the lane lookups (one user, one source, one
+    operation, a status, newest first) and the pruning of finished syncs;
+    `import_jobs_status` serves restart recovery and the status filters.
+    MySQL's migration 7 already has a status index and no `operation` column,
+    so it only gains the ordered source index.
+    """
+    if dialect == "sqlite":
+        return """
+CREATE INDEX IF NOT EXISTS import_jobs_lane
+ON import_jobs(user_id, source_id, operation, status, created_at);
+CREATE INDEX IF NOT EXISTS import_jobs_status
+ON import_jobs(status, created_at);
+"""
+    return """
+CREATE INDEX idx_import_jobs_source_created
+ON import_jobs(user_id, source_id, created_at);
+"""
+
+
+def _is_duplicate_index(error: Exception) -> bool:
+    """MySQL's "index name already there" (1061): the index is in place."""
+    args: tuple[object, ...] = getattr(error, "args", ())
+    return bool(args) and args[0] == 1061
+
+
+async def _063_import_job_lookup_indexes(cursor: Any) -> None:
+    dialect = _dialect(cursor)
+    if dialect == "sqlite":
+        # `operation` was added by the job store, not by migration 7, so a
+        # database built from the catalog alone may not have it yet. Same
+        # declaration as the store's own addition.
+        if "operation" not in await cursor.columns("import_jobs"):
+            await cursor.execute(
+                "ALTER TABLE import_jobs ADD COLUMN operation TEXT NOT NULL DEFAULT 'history'"
+            )
+        for statement in _split_statements(import_job_lookup_indexes_ddl(dialect)):
+            await cursor.execute(statement)
+        return
+    for statement in _split_statements(import_job_lookup_indexes_ddl(dialect)):
+        try:
+            await cursor.execute(statement)
+        except Exception as error:  # noqa: BLE001 - MySQL driver error type varies
+            if _is_duplicate_index(error):
+                continue
+            raise
+
+
 def _split_statements(sql: str) -> list[str]:
     """Split a multi-statement script, dropping blanks, PRAGMA and comments.
 
@@ -3384,5 +3592,17 @@ MIGRATIONS: tuple[Migration, ...] = (
         "memory_note_requests",
         _060_memory_note_requests,
         ("memory_note_requests",),
+    ),
+    Migration(61, "write_job_retries", _061_write_job_retries),
+    Migration(
+        ONBOARDING_PROGRESS_MIGRATION_VERSION,
+        "onboarding_progress",
+        _062_onboarding_progress,
+        ("onboarding_state",),
+    ),
+    Migration(
+        IMPORT_JOB_LOOKUP_INDEXES_MIGRATION_VERSION,
+        "import_job_lookup_indexes",
+        _063_import_job_lookup_indexes,
     ),
 )

@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 _operation: ContextVar[tuple["ModelProbeOperations", str] | None] = ContextVar(
     "model_probe_operation", default=None
 )
+_dispatch_started: ContextVar[bool] = ContextVar("model_probe_dispatch_started", default=False)
 
 
 class ProbeCode(StrEnum):
@@ -113,16 +114,26 @@ class ModelProber:
         if existing is not None:
             return existing
         token = _operation.set((operations, request.operation_id))
+        dispatch_token = _dispatch_started.set(False)
         try:
             await self._probe(profile_id)
         except ProbeOperationConflict:
             await asyncio.to_thread(
                 operations.fail, request.operation_id, "model_probe_profile_changed"
             )
-        except Exception:
-            # Unknown dispatch/storage outcomes stay reserved, including across restart.
-            raise ProbeOperationUnavailable("model_probe_operation_unavailable") from None
+        except Exception as exc:
+            if _dispatch_started.get():
+                # Once a request may have reached the provider, preserve the
+                # reservation so a retry cannot duplicate a possibly billed call.
+                raise ProbeOperationUnavailable("model_probe_operation_unavailable") from None
+            logging.getLogger(__name__).warning(
+                "model probe failed before dispatch: %s", type(exc).__name__
+            )
+            await asyncio.to_thread(
+                operations.fail, request.operation_id, "model_probe_execution_failed"
+            )
         finally:
+            _dispatch_started.reset(dispatch_token)
             _operation.reset(token)
         return await asyncio.to_thread(operations.lookup, request.operation_id)
 
@@ -317,6 +328,8 @@ class ModelProber:
         listing_optional: bool = False,
     ) -> ProbeStage:
         await self._check_operation()
+        if _operation.get() is not None:
+            _dispatch_started.set(True)
         started = monotonic()
         try:
             response = await client.request(
@@ -423,7 +436,7 @@ class ModelProber:
         ModelProbeOperations(self.store).assert_no_pending(profile.profile_id)
         # Measuring embedding width may create a new profile version of its own.
         input_revision = profile.revision
-        profile = self._record_embedding_width(profile, stages)
+        profile, _switch_required = self._record_embedding_width(profile, stages)
         self.store.record_capabilities(
             profile.profile_id,
             expected_revision=profile.revision,
@@ -442,30 +455,53 @@ class ModelProber:
         self,
         profile: ModelProfile,
         stages: tuple[ProbeStage, ...],
-    ) -> ModelProfile:
-        """Store the measured vector width on the profile.
+    ) -> tuple[ModelProfile, bool]:
+        """Store the measured vector width on the profile, unless it moves the space.
 
         The graph store fixes its embedding column width when it is first
         created, so guessing this leaves every relation write failing later.
+        On the profile that fills the live embedding space a different width
+        is not recorded: it would name other collections (B2). True when the
+        width was refused that way: using it takes an embedding switch, which
+        the switch plan reports (the probe result keeps its shape).
         """
-        width = next(
-            (
-                stage.embedding_dimensions
-                for stage in stages
-                if stage.stage == "embedding" and stage.embedding_dimensions
-            ),
-            None,
-        )
+        width = measured_width(stages)
         if width is None or width == profile.embedding_dimensions:
-            return profile
-        return self.store.update(
-            profile.profile_id,
-            ModelProfilePatch(
-                expected_revision=profile.revision,
-                embedding_dimensions=width,
+            return profile, False
+        from one_memory.embedding_spaces import EmbeddingSpaceStore, probe_width_allowed
+
+        spaces = EmbeddingSpaceStore(self.store.database_path)
+        with spaces.transaction() as connection:
+            allowed = probe_width_allowed(
+                connection,
+                profile.profile_id,
+                width,
+                data_dir=self.store.database_path.parent,
+            )
+        if not allowed:
+            return profile, True
+        return (
+            self.store.update(
+                profile.profile_id,
+                ModelProfilePatch(
+                    expected_revision=profile.revision,
+                    embedding_dimensions=width,
+                ),
+                self.secrets,
             ),
-            self.secrets,
+            False,
         )
+
+
+def measured_width(stages: tuple[ProbeStage, ...]) -> int | None:
+    return next(
+        (
+            stage.embedding_dimensions
+            for stage in stages
+            if stage.stage == "embedding" and stage.embedding_dimensions
+        ),
+        None,
+    )
 
 
 def _models_request(
@@ -564,7 +600,7 @@ def _embedding_request(
     secret: str | None,
 ) -> tuple[str, str, dict[str, str], dict[str, object]]:
     provider = profile.embedding_provider_kind or profile.provider_kind
-    base_url = (profile.embedding_base_url or profile.base_url or "").rstrip("/")
+    base_url = (profile.embedding_base_url or "").rstrip("/")
     if provider is ProviderKind.OLLAMA:
         return (
             "POST",

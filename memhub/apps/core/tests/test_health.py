@@ -48,6 +48,7 @@ def test_health_reports_the_single_core() -> None:
         # No lifespan ran, so recovery has not begun.
         "recovery": "pending",
         "recovery_failed_steps": [],
+        "embedding_switch": None,
     }
 
 
@@ -149,15 +150,19 @@ def test_lifespan_content_backfill_failure_is_visible(tmp_path, monkeypatch) -> 
 
     async def scenario() -> None:
         async with app.router.lifespan_context(app):
-            # Recovery holds the rebuild until its steps finish, then the
-            # worker records the failure. The first read can still say
-            # running. Startup itself must stay up.
-            health: dict[str, object] = {}
-            for _ in range(100):
-                health = await _get_json(app, "/api/v1/health")
-                if health["content_candidate_backfill"] == "failed":
+            # Recovery holds the rebuild until its steps finish, and the
+            # import resume runs off the loop, so the first read can still
+            # say running. Startup itself must stay up.
+            for _ in range(500):
+                if app.state.recovery in {"done", "failed"}:
                     break
-                await asyncio.sleep(0.02)
+                await asyncio.sleep(0.01)
+            health: dict[str, object] = {}
+            for _ in range(500):
+                health = await _get_json(app, "/api/v1/health")
+                if health["content_candidate_backfill"] != "running":
+                    break
+                await asyncio.sleep(0.01)
             assert health["content_candidate_backfill"] == "failed"
             assert health["content_candidate_backfill_failure"] == "database_locked"
 

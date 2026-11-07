@@ -53,6 +53,32 @@ node apps/cli/dist/one-memory.cjs sources connect --all-detected --import
 （如 `DSH_HOME`）的来源必须加 `--confirm-overrides`，否则被拒绝（或在
 `--all-detected` 时跳过并列出）。用同一个 `--request-id <uuid>` 重试不会重复导入。
 
+### 接入 Hermes 的另一个 profile（多用户）
+
+一个 Runtime 可以给多个用户记忆。**用户由读的是哪个目录决定**，不看会话或平台账号：
+`~/.hermes/state.db` 属于默认用户 `local`，`~/.hermes/profiles/<name>/state.db` 是另一个用户。
+
+```bash
+# 把 wife 这个 Hermes profile 接成用户 wife：授权 + 导入历史，一步完成
+node apps/cli/dist/one-memory.cjs sources connect hermes --user-id wife --root ~/.hermes/profiles/wife
+# 也可以显式加 --import，效果相同；可带 --request-id <uuid> 幂等重试
+node apps/cli/dist/one-memory.cjs sources connect hermes --user-id wife --root ~/.hermes/profiles/wife --import --json
+
+# 列出来源；其他用户的连接单独列在「其他用户的连接」下，--json 里在 grants 字段
+node apps/cli/dist/one-memory.cjs sources list
+```
+
+- 只有 `hermes` 能带 `--user-id`（非 `local`）或 `--root`；其他来源带了会退 2，什么都不发。
+- 用户 ID 不必等于 profile 名：profile 名里有 `:` 等字符时另起一个，例如
+  `--user-id wife-work --root ~/.hermes/profiles/wife:work`。
+- `--root` 里的 `~` 由 CLI 展开为主目录，相对路径按当前目录解析成绝对路径。
+- 扫描时任何层级名为 `profiles` 的目录都会被排除，所以 `local` 不会读到 wife 的 `state.db`，
+  即使授权的根在 `~/.hermes` 之上。
+- `--root` 不能是 `profiles` 目录本身（`hermes_root_is_profiles_container`），也不能与另一个
+  用户已接入的 Hermes 目录相同、包含它或在它之内（`hermes_root_overlaps_other_user`，解析
+  symlink 后比较）；`~/.hermes` 给 `local`、`~/.hermes/profiles/<name>` 给另一个用户是允许的。
+- App 不变：它只读写 `local`，其他来源也都固定是 `local`。
+
 ## 3. 看导入进度
 
 ```bash
@@ -104,6 +130,83 @@ node apps/cli/dist/one-memory.cjs write status <request_id> --json
 ```
 
 两条都返回 request id；它是幂等键，结果未知时用**同一个** `--request-id` 重试不会重复写入。
+
+### 按用户读写（`--user-id`）
+
+记忆命令都接受全局 `--user-id <id>`（默认 `local`，即 App 看到的那份）：
+`memories list/show/add/add-status/update/delete`、`recall`、`profile`、`write submit/status`。
+
+```bash
+node apps/cli/dist/one-memory.cjs memories list --user-id wife --json
+node apps/cli/dist/one-memory.cjs memories add "我更喜欢喝绿茶" --user-id wife
+node apps/cli/dist/one-memory.cjs recall "喝什么茶" --user-id wife
+node apps/cli/dist/one-memory.cjs profile --user-id wife
+node apps/cli/dist/one-memory.cjs write status <request_id> --user-id wife
+```
+
+- 用户 ID 只能是 1–64 位字母、数字、`.`、`_`、`-`；其他写法退 2，不连 Runtime。
+- 不带 `--user-id`（或写 `--user-id local`）时请求里不出现 `user_id`，和以前完全一样。
+- 用户之间互相隔离：读、改、删另一个用户的记忆 ID 返回「未找到」（HTTP 404 `memory_not_found`，
+  与不存在的 ID 完全一样）；write 的 request id 也只属于提交它的用户。
+- `memories delete <id> --yes` 遇到「未找到」时按已删除处理：提示「未找到记忆 <id>（可能已删除）」，
+  退出 0；`--json` 为 `state: "committed"` 加 `already_gone: true`。App 里重复点删除也不再报错。
+- 读接口（`memories list`、`profile`、`recall` 等背后的 HTTP 响应）都带 `user_id`，即实际读的是哪个用户。
+
+### 画像版本（`profile --versions`）
+
+```bash
+node apps/cli/dist/one-memory.cjs profile --versions            # L0 画像版本链，最新在前，* 为当前版本
+node apps/cli/dist/one-memory.cjs profile --versions --user-id wife --json
+```
+
+用于找出覆盖了正确值的错误版本（例如 `用户` / `The user`），再用
+`memories delete <memory-id> --yes` 删除；对应 `GET /api/v2/user-profile/versions`。
+
+### 记忆模式与进化（`settings mode` / `evolve`）
+
+```bash
+node apps/cli/dist/one-memory.cjs settings mode                 # 当前模式
+node apps/cli/dist/one-memory.cjs settings mode ultra           # 只显示切换计划，不改动
+node apps/cli/dist/one-memory.cjs settings mode ultra --yes     # 切换
+node apps/cli/dist/one-memory.cjs evolve --user-id wife --wait  # 立即进化（仅 ultra）
+```
+
+- 切换不迁移数据：已处理的对话不会重做，排队中的和新的按新模式处理；正在写的一批按旧模式写完。
+- 任何模式都保留全部原始对话。
+- `status --json` 与 `progress --json` 输出 `pipeline.mode`、每晚进化时间和每个用户的上次进化。
+- 契约见 `docs/contracts/memory-mode-evolve-v1.md`。
+
+### SDK 可选功能（`settings features`）
+
+```bash
+node apps/cli/dist/one-memory.cjs settings features                                   # 列出全部功能、默认值、当前模式下是否生效
+node apps/cli/dist/one-memory.cjs settings features set episode_recall=true session_episodes=true        # 只显示计划
+node apps/cli/dist/one-memory.cjs settings features set episode_recall=true session_episodes=true --yes  # 生效
+node apps/cli/dist/one-memory.cjs settings features reset episode_recall               # 恢复默认
+node apps/cli/dist/one-memory.cjs settings features reset                              # 全部恢复默认
+```
+
+- 全局设置，不分用户；没设置的功能保持 SDK 默认值，什么都不设时与以前完全一样（App 不变）。
+- 可设：`graph_rerank`（图谱重排，仅 ultra）、`same_series_timeline`（需 graph_rerank）、`episode_recall`（片段召回，pro 即可）、`session_episodes`（片段写入）、`episode_summary`（片段摘要，每个片段一次模型调用）、`intention`（默认开）、`intention_dedup`（意图判重，默认开；关闭后检索和写入都不判重、不删除意图）、`few_shot`；以及数值 `intention_dedup_threshold`（意图判重的余弦阈值，默认 0.95，可设 0.8–1.0，例如 `settings features set intention_dedup_threshold=0.9 --yes`）。
+- 片段召回只对带片段的记忆有用：同时开 `session_episodes`，之后提取的记忆才按会话归入片段。
+- 在当前模式下不生效的功能照样保存，并注明原因（如 `graph_rerank` 在 pro 下「需要 ultra」）。
+- 修改会重建 SDK 客户端：正在写的一批按旧设置写完，之后的写入和检索用新设置；不迁移数据，不改集合名。
+- `status --json` / `progress --json` 的 `pipeline.features` 列出与默认值不同的功能。
+- 契约见 `docs/contracts/memory-features-v1.md`。
+
+### 界面语言与 SDK 提示语言（`settings language`）
+
+```bash
+node apps/cli/dist/one-memory.cjs settings language          # 界面语言和 SDK 提示语言
+node apps/cli/dist/one-memory.cjs settings language ja       # 设为日语，立即生效
+node apps/cli/dist/one-memory.cjs settings language system   # 清除设置（不指定 SDK 语言）
+```
+
+- 可选 11 种：`en`、`zh-Hans`、`zh-Hant`、`ja`、`es`、`de`、`pt`、`fr`、`ko`、`ru`、`id`，以及 `system`；旧代码 `zh-CN` 按 `zh-Hans` 处理。
+- App 切换语言时会自动设置；Desktop 每次启动也会同步一次界面实际显示的语言（App 选“跟随系统”时，发送它按系统语言解析出的语言，例如 `zh-Hans`）。全局设置，存于 `config.json` 的 `ui_language`；从未设置时不写入。
+- 所有语言（包括 `zh-Hans` 和 `en`）都作为 `MemoryConfig.language` 传给 SDK，提取等提示使用该语言；只有未设置（`system`，或只用 CLI/API、从未打开 App 的安装）时不向 SDK 传语言，SDK 照旧自动识别中文或英文。
+- 修改会像功能开关一样重建 SDK 客户端；不迁移数据，不改集合名（需要 hy-memory 2.0.11 的 `MemoryConfig.language`）。
+- `status --json` 的 `pipeline.ui_language` / `pipeline.sdk_language`（`auto` 或语言代码；`zh-Hans` 用户显示 `zh-Hans`）。API：`GET`/`PUT /api/v1/settings/ui-language`。
 
 ## 8. 召回（recall）
 

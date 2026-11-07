@@ -29,6 +29,7 @@ from one_memory.imports.adapters import (
 )
 from one_memory.imports.jobs import ImportJob, ImportJobStore, ImportStatus
 from one_memory.imports.supervisor import ImportSupervisor
+from one_memory.user_scope import DEFAULT_USER_ID, split_lane
 
 #: How long an automatic retry will wait for a wedged worker to notice cancel.
 ABANDON_TIMEOUT_SECONDS = 5.0
@@ -65,7 +66,12 @@ class LiveSyncHealth(BaseModel):
 
 
 class PollingLiveSyncSupervisor:
-    """Near-live sync that reuses each adapter's persisted incremental cursor."""
+    """Near-live sync that reuses each adapter's persisted incremental cursor.
+
+    A "source" here is a lane key (`user_scope.lane_key`): the bare source id
+    for `local`, `source@user` for another user's grant. Cursors, jobs and
+    locks are therefore per `(user_id, source_id)`.
+    """
 
     def __init__(
         self,
@@ -93,7 +99,21 @@ class PollingLiveSyncSupervisor:
         }
         self._locks = {source_id: asyncio.Lock() for source_id in self.source_ids}
         self._task: asyncio.Task[None] | None = None
+        self._group: asyncio.TaskGroup | None = None
         self._observers: set[asyncio.Task[None]] = set()
+
+    def ensure_source(self, source_id: str) -> None:
+        """Follow a lane granted after start, such as a new Hermes profile."""
+        if source_id in self._locks:
+            return
+        self.source_ids = (*self.source_ids, source_id)
+        self._health.setdefault(
+            source_id,
+            LiveSyncHealth(source_id=source_id, mode=self.mode, state=LiveSyncState.IDLE),
+        )
+        self._locks[source_id] = asyncio.Lock()
+        if self._group is not None:
+            self._group.create_task(self._poll_source(source_id))
 
     def _set_health(self, source_id: str, value: LiveSyncHealth) -> None:
         previous = self._health.get(source_id)
@@ -153,7 +173,12 @@ class PollingLiveSyncSupervisor:
         self._watched_sources = frozenset(source_ids)
 
     def all_health(self) -> tuple[LiveSyncHealth, ...]:
-        return tuple(self.health(source_id) for source_id in self.source_ids)
+        """`local`'s lanes only: what the App has always been shown."""
+        return tuple(
+            self.health(source_id)
+            for source_id in self.source_ids
+            if split_lane(source_id)[0] == DEFAULT_USER_ID
+        )
 
     async def initialize_source(
         self, source_id: str, *, baseline_missing_files: bool = True
@@ -163,11 +188,12 @@ class PollingLiveSyncSupervisor:
             return
         adapter = self.import_supervisor.adapters[source_id]
         baselines, files = await self._baseline_files(adapter)
+        user_id, bare_source_id = split_lane(source_id)
         await in_the_background(
             partial(
                 self.job_store.ensure_live_cursors,
-                user_id="local",
-                source_id=source_id,
+                user_id=user_id,
+                source_id=bare_source_id,
                 baselines=baselines,
                 baseline_missing_files=baseline_missing_files,
                 files=files,
@@ -223,13 +249,15 @@ class PollingLiveSyncSupervisor:
                     ),
                 )
                 return None
-            source_jobs = await in_the_background(self.job_store.list_jobs)
+            # This lane's unfinished jobs only: the newest unfinished sync, and
+            # whatever history shares its cursor. Asked in SQL; listing every
+            # job ever run and filtering here was the poll's biggest read.
+            source_jobs = await in_the_background(self._lane_jobs, source_id)
             active_sync = next(
                 (
                     job
                     for job in reversed(source_jobs)
-                    if job.source_id == source_id
-                    and job.operation == "sync"
+                    if job.operation == "sync"
                     and job.status
                     in {
                         ImportStatus.PENDING,
@@ -249,7 +277,9 @@ class PollingLiveSyncSupervisor:
                     active_sync.job_id
                 ):
                     attempted_at = datetime.now(UTC)
-                    self.import_supervisor.enqueue(active_sync.job_id)
+                    await self.import_supervisor.enqueue_off_loop(
+                        active_sync.job_id, job=active_sync
+                    )
                     if not wait_for_completion:
                         self._observe_sync(source_id, attempted_at, active_sync.job_id)
                         return active_sync
@@ -269,22 +299,20 @@ class PollingLiveSyncSupervisor:
                 # by a process restart between yield and claim.  Enqueue is
                 # the operation that actually creates the task.
                 attempted_at = datetime.now(UTC)
-                self.import_supervisor.resume(active_sync.job_id)
-                self.import_supervisor.enqueue(active_sync.job_id)
+                resumed = await self.import_supervisor.resume_off_loop(active_sync.job_id)
+                await self.import_supervisor.enqueue_off_loop(active_sync.job_id, job=resumed)
                 completed = await self.import_supervisor.wait(active_sync.job_id)
                 self._record_outcome(source_id, attempted_at, completed)
                 return completed
             competing = [
                 job
                 for job in source_jobs
-                if job.source_id == source_id
-                and job.operation != "sync"
+                if job.operation != "sync"
                 and job.status
                 in {ImportStatus.PENDING, ImportStatus.RUNNING, ImportStatus.INTERRUPTED}
             ]
             bounded_history_incomplete = any(
-                job.source_id == source_id
-                and job.operation == "history"
+                job.operation == "history"
                 and job.history_after is not None
                 and job.status is not ImportStatus.COMPLETED
                 for job in source_jobs
@@ -327,6 +355,38 @@ class PollingLiveSyncSupervisor:
             # status rewrite is needed: history remains pending and resumes
             # automatically after the realtime slice completes.
             return await self._run_sync(source_id, wait_for_completion=wait_for_completion)
+
+    def _lane_jobs(self, source_id: str) -> list[ImportJob]:
+        """The lane's jobs `_sync` decides on, oldest first.
+
+        Everything not completed, of either operation: an unfinished sync to
+        pick up, a history that competes for the cursor, and a bounded history
+        that has not completed yet (which includes a cancelled one). Finished
+        syncs, the rows that grow without end, are never read.
+        """
+        user_id, bare_source_id = split_lane(source_id)
+        unfinished = tuple(
+            status for status in ImportStatus if status is not ImportStatus.COMPLETED
+        )
+        return [
+            *self.job_store.find_jobs(
+                user_id=user_id,
+                source_id=bare_source_id,
+                operation="history",
+                statuses=unfinished,
+            ),
+            *self.job_store.find_jobs(
+                user_id=user_id,
+                source_id=bare_source_id,
+                operation="sync",
+                statuses=(
+                    ImportStatus.PENDING,
+                    ImportStatus.RUNNING,
+                    ImportStatus.PAUSED,
+                    ImportStatus.INTERRUPTED,
+                ),
+            ),
+        ]
 
     async def _has_work(self, source_id: str) -> bool:
         """Ask the source whether a scan would write anything, before taking a job out.
@@ -379,11 +439,12 @@ class PollingLiveSyncSupervisor:
                 await close()
 
     async def _live_cursors(self, source_id: str, adapter: object) -> dict[str, SourceCursor]:
+        user_id, bare_source_id = split_lane(source_id)
         cursors = await in_the_background(
             partial(
                 self.job_store.get_source_cursors,
-                user_id="local",
-                source_id=source_id,
+                user_id=user_id,
+                source_id=bare_source_id,
                 operation="sync",
             )
         )
@@ -393,8 +454,8 @@ class PollingLiveSyncSupervisor:
         return await in_the_background(
             partial(
                 self.job_store.ensure_live_cursors,
-                user_id="local",
-                source_id=source_id,
+                user_id=user_id,
+                source_id=bare_source_id,
                 baselines=baselines,
                 files=files,
             )
@@ -435,7 +496,7 @@ class PollingLiveSyncSupervisor:
             ),
         )
         self._active_jobs[source_id] = job.job_id
-        self.import_supervisor.enqueue(job.job_id)
+        await self.import_supervisor.enqueue_off_loop(job.job_id, job=job)
         if not wait_for_completion:
             self._observe_sync(source_id, attempted_at, job.job_id)
             return job
@@ -530,13 +591,21 @@ class PollingLiveSyncSupervisor:
     async def _run(self) -> None:
         # A source owns its cadence; one large catch-up cannot delay every
         # other source. The group keeps shutdown responsible for every poller.
-        async with asyncio.TaskGroup() as group:
-            for source_id in self.source_ids:
-                group.create_task(self._poll_source(source_id))
+        try:
+            async with asyncio.TaskGroup() as group:
+                self._group = group
+                for source_id in self.source_ids:
+                    group.create_task(self._poll_source(source_id))
+        finally:
+            self._group = None
 
     async def _poll_source(self, source_id: str) -> None:
         while True:
-            await asyncio.sleep(self.interval_seconds)
+            # A watched source is normally triggered by its filesystem event.
+            # Its timer is only a missed-event backstop; recursively walking
+            # every multi-gigabyte host root once a minute starved unrelated
+            # Core reads even when no source had changed.
+            await asyncio.sleep(self._poll_interval(source_id))
             try:
                 await self.trigger(source_id)
             except asyncio.CancelledError:
@@ -552,6 +621,11 @@ class PollingLiveSyncSupervisor:
                     raise
                 except Exception as again:
                     self._note_internal_error(source_id, again)
+
+    def _poll_interval(self, source_id: str) -> float:
+        if source_id in (self._watched_sources or ()):
+            return max(self.interval_seconds, 15 * 60)
+        return self.interval_seconds
 
     def _note_worker_still_running(self, source_id: str) -> None:
         current = self.health(source_id)

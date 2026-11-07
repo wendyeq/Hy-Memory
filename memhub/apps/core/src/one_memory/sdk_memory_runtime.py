@@ -5,8 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from collections.abc import AsyncIterator
-from contextlib import AsyncExitStack, asynccontextmanager, suppress
+from collections.abc import AsyncIterator, Callable
+from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -25,7 +25,7 @@ from one_memory.hy_runtime_config import HY_MEMORY_READER
 from one_memory.hy_sdk_runtime import SdkClientHandle, sdk_relevance_floor
 from one_memory.hy_sdk_types import HySdkError, parse_sdk_search
 from one_memory.memory_queue import ExtractionWindowPreset, QueueDepths
-from one_memory.memory_server.durable_queue import COMPLETED, DurableWriteQueue
+from one_memory.memory_server.durable_queue import WAITING_FOR_MODEL, DurableWriteQueue
 from one_memory.sdk_write_processor import SdkWriteCoordinator
 from one_memory.semantic_deadline import SemanticMemoryHit
 
@@ -33,16 +33,10 @@ from one_memory.semantic_deadline import SemanticMemoryHit
 _STABLE_CODE = re.compile(r"[a-z][a-z0-9_]{0,95}")
 
 logger = logging.getLogger(__name__)
-RAW_RETENTION_DAYS = 3
-RAW_RETENTION_CHECK_SECONDS = 6 * 60 * 60
-_RAW_STATUSES = (
-    "active",
-    "superseded",
-    "shadow",
-    "negated",
-    "conflicted",
-    "archived",
-)
+
+#: Jobs not yet run that a suspended source holds back.
+_WAITING_STATES = frozenset({"pending", "waiting_for_model", "waiting_for_permission"})
+_WAITING_SQL = ",".join(f"'{state}'" for state in sorted(_WAITING_STATES))
 
 
 class SdkMemoryRuntime:
@@ -56,74 +50,27 @@ class SdkMemoryRuntime:
         write_queue: DurableWriteQueue,
         extraction_settings: ExtractionSettingsStore,
         data_dir: Path,
+        memory_mode: Callable[[], str] = lambda: "pro",
+        writes_open: Callable[[], bool] = lambda: True,
+        source_active: Callable[[str], bool] = lambda _source_key: True,
     ) -> None:
         self.coordinator = coordinator
+        #: The SDK mode, for the graph store's path (`hy_graph_admin`).
+        self.memory_mode = memory_mode
+        #: False while an embedding switch pauses model writes.
+        self.writes_open = writes_open
+        #: Whether a queue lane's source may still become memories: the same
+        #: question the drain's claim asks of it. A lane that is off (the
+        #: user turned the source off, or its grant was revoked) has its
+        #: waiting jobs suspended: kept, never claimed, and not counted as
+        #: pending until the source is on again.
+        self.source_active = source_active
         self.read_handle = read_handle
         self.write_queue = write_queue
         self.extraction_settings = extraction_settings
         self.data_dir = data_dir
-        self._raw_retention_task: asyncio.Task[None] | None = None
-
-    def start_raw_retention(self) -> None:
-        if self._raw_retention_task is None or self._raw_retention_task.done():
-            self._raw_retention_task = asyncio.create_task(
-                self._raw_retention_loop(),
-                name="one-memory-sdk-raw-retention",
-            )
-
-    async def prune_expired_raw(self, *, now: datetime | None = None) -> int:
-        cutoff = (now or datetime.now(UTC)) - timedelta(days=RAW_RETENTION_DAYS)
-        cutoff_timestamp = int(cutoff.timestamp())
-        client = await self.read_handle.client()
-        deleted = 0
-        while True:
-            page = await asyncio.to_thread(
-                client.list_memories,
-                user_id="local",
-                layers=["l1_raw"],
-                statuses=list(_RAW_STATUSES),
-                order="asc",
-                limit=500,
-                offset=0,
-            )
-            bucket = page.get("vdb") if isinstance(page, dict) else None
-            rows = bucket.get("memories") if isinstance(bucket, dict) else None
-            if not isinstance(rows, list) or not rows:
-                return deleted
-            expired = [
-                row
-                for row in rows
-                if isinstance(row, dict)
-                and isinstance(row.get("memory_id"), str)
-                and int(row.get("memory_at") or row.get("gmt_created") or 0)
-                < cutoff_timestamp
-            ]
-            if not expired:
-                return deleted
-            removed_page = 0
-            for row in expired:
-                result = await asyncio.to_thread(client.delete, row["memory_id"])
-                if isinstance(result, dict) and result.get("success") is True:
-                    count = int(result.get("deleted_count") or 0)
-                    deleted += count
-                    removed_page += count
-            if removed_page == 0:
-                return deleted
-
-    async def _raw_retention_loop(self) -> None:
-        while True:
-            await asyncio.sleep(RAW_RETENTION_CHECK_SECONDS)
-            try:
-                removed = await self.prune_expired_raw()
-                if removed:
-                    logger.info("sdk_raw_retention_deleted count=%d", removed)
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                logger.warning(
-                    "sdk_raw_retention_failed error_type=%s",
-                    type(error).__name__,
-                )
+        # MemHub keeps every raw the SDK stores, in every mode: there is no
+        # retention window (owner decision; the SDK itself never deletes raw).
 
     async def semantic_recall(
         self,
@@ -154,11 +101,10 @@ class SdkMemoryRuntime:
         limit: int = 12,
     ) -> tuple[tuple[str, float], ...]:
         return tuple(
-            (hit.memory_id, hit.score)
-            for hit in await self.semantic_recall(query, limit=limit)
+            (hit.memory_id, hit.score) for hit in await self.semantic_recall(query, limit=limit)
         )
 
-    async def graph_snapshot(self, *, limit: int = 300) -> HyGraphSnapshot:
+    async def graph_snapshot(self, *, limit: int = 300, user_id: str = "local") -> HyGraphSnapshot:
         try:
             await self.coordinator.active_profile_credentials()
         except RuntimeError as error:
@@ -173,12 +119,14 @@ class SdkMemoryRuntime:
             return await asyncio.to_thread(
                 read_graph_snapshot,
                 client,
-                "local",
+                user_id,
                 "*",
                 limit,
             )
 
     async def digest(self) -> dict[str, object]:
+        if not self.writes_open():
+            raise HySdkError("embedding_switch_in_progress")
         async with self.coordinator.use_client() as client:
             try:
                 raw = await asyncio.to_thread(
@@ -219,11 +167,14 @@ class SdkMemoryRuntime:
             if str(error) == "model_profile_not_active":
                 return None
             raise
+        space = await self.coordinator.live_space()
         return await asyncio.to_thread(
             inspect_profile_graph_width,
             profile,
             api_key=secret,
             data_dir=self.data_dir,
+            mode=self.memory_mode(),
+            graph_dir=space.graph_dir if space is not None and space.graph_dir else "graph",
         )
 
     async def decide_graph_width(
@@ -234,12 +185,15 @@ class SdkMemoryRuntime:
             profile, secret = await self.coordinator.active_profile_credentials()
         except RuntimeError as error:
             raise HySdkError(str(error)) from error
+        space = await self.coordinator.live_space()
         return await asyncio.to_thread(
             decide_profile_graph_width,
             profile,
             api_key=secret,
             data_dir=self.data_dir,
             decision=decision,
+            mode=self.memory_mode(),
+            graph_dir=space.graph_dir if space is not None and space.graph_dir else "graph",
         )
 
     @asynccontextmanager
@@ -249,6 +203,8 @@ class SdkMemoryRuntime:
         Callers record these against the edit or deletion instead of failing
         the request that already committed it.
         """
+        if not self.writes_open():
+            raise HySdkError("embedding_switch_in_progress")
         async with AsyncExitStack() as stack:
             try:
                 client = await stack.enter_async_context(self.coordinator.use_client())
@@ -296,22 +252,11 @@ class SdkMemoryRuntime:
         now = datetime.now(UTC)
         fresh_since = (now - timedelta(days=7)).isoformat()
         with main_database(self.write_queue.database_path).read() as database:
-            fresh = int(
-                database.execute(
-                    "SELECT COUNT(*) FROM memory_write_jobs "
-                    "WHERE state IN ('pending','waiting_for_model','waiting_for_permission') "
-                    "AND event_at>=?",
-                    (fresh_since,),
-                ).fetchone()[0]
-            )
-            backlog = int(
-                database.execute(
-                    "SELECT COUNT(*) FROM memory_write_jobs "
-                    "WHERE state IN ('pending','waiting_for_model','waiting_for_permission') "
-                    "AND event_at<?",
-                    (fresh_since,),
-                ).fetchone()[0]
-            )
+            rows = database.execute(
+                "SELECT source_key,event_at>=? AS fresh,COUNT(*) FROM memory_write_jobs "
+                f"WHERE state IN ({_WAITING_SQL}) GROUP BY source_key,fresh",
+                (fresh_since,),
+            ).fetchall()
             recent = tuple(
                 datetime.fromisoformat(str(row[0]))
                 for row in database.execute(
@@ -319,6 +264,9 @@ class SdkMemoryRuntime:
                     "ORDER BY updated_at DESC LIMIT 8"
                 )
             )
+        active = self._active_lanes({str(row[0]) for row in rows})
+        fresh = sum(int(row[2]) for row in rows if str(row[0]) in active and row[1])
+        backlog = sum(int(row[2]) for row in rows if str(row[0]) in active and not row[1])
         return QueueDepths(fresh=fresh, backlog=backlog, recent_completions=recent)
 
     def active_depths(self) -> tuple[int, int]:
@@ -331,13 +279,27 @@ class SdkMemoryRuntime:
         return running, running
 
     def status_counts(self) -> dict[str, int]:
+        """Jobs per state, with a suspended source's waiting jobs as `suspended`.
+
+        Those jobs keep their state in the table: suspension is the source's
+        switch, not the row's, so turning the source back on is all it takes
+        for the drain to claim them again, and nothing is moved or deleted.
+        """
         with main_database(self.write_queue.database_path).read() as database:
-            return {
-                str(row[0]): int(row[1])
-                for row in database.execute(
-                    "SELECT state,COUNT(*) FROM memory_write_jobs GROUP BY state"
-                )
-            }
+            rows = database.execute(
+                "SELECT source_key,state,COUNT(*) FROM memory_write_jobs GROUP BY source_key,state"
+            ).fetchall()
+        active = self._active_lanes({str(row[0]) for row in rows if str(row[1]) in _WAITING_STATES})
+        counts: dict[str, int] = {}
+        for source_key, state, count in rows:
+            name = str(state)
+            if name in _WAITING_STATES and str(source_key) not in active:
+                name = "suspended"
+            counts[name] = counts.get(name, 0) + int(count)
+        return counts
+
+    def _active_lanes(self, lanes: set[str]) -> set[str]:
+        return {lane for lane in lanes if self.source_active(lane)}
 
     def manual_batch_progress(self) -> tuple[int, int]:
         return 0, 0
@@ -346,44 +308,17 @@ class SdkMemoryRuntime:
         del task_ids
         return []
 
-    async def reconcile_unknown_outputs(
-        self,
-        *,
-        limit: int = 128,
-        exclude_error_codes: tuple[str, ...] = (),
-    ) -> int:
-        reconciled = 0
-        for job in await asyncio.to_thread(
-            self.write_queue.unknown_jobs,
-            limit=limit,
-            exclude_error_codes=exclude_error_codes,
-        ):
-            receipt = await self.coordinator.inquire_write_outcome(job.request_id)
-            if receipt is None:
-                continue
-            await asyncio.to_thread(
-                self.write_queue.settle,
-                job.job_id,
-                state=COMPLETED,
-                sdk_raw_ids=receipt.raw_ids,
-                sdk_memory_ids=receipt.memory_ids,
-            )
-            reconciled += 1
-        return reconciled
-
     async def resume_allowed(self) -> None:
-        await asyncio.to_thread(self.write_queue.readmit_parked)
+        await asyncio.to_thread(
+            self.write_queue.readmit_parked,
+            states=(WAITING_FOR_MODEL,),
+        )
 
     def accepted_backfill_status(self) -> None:
         return None
 
     async def shutdown(self) -> None:
-        if self._raw_retention_task is None:
-            return
-        self._raw_retention_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await self._raw_retention_task
-        self._raw_retention_task = None
+        return None
 
 
 def _agent_ids(raw: object) -> tuple[str, ...]:

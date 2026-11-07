@@ -24,7 +24,8 @@ def model_snapshot(
         model="memory-model",
         embedding_model="embedding-model",
         embedding_provider_kind=embedding_provider,
-        embedding_base_url=embedding_base_url,
+        # Stored profiles always name it; see `pinned_embedding_base_url`.
+        embedding_base_url=embedding_base_url or base_url,
         embedding_dimensions=768,
         timeout_seconds=30,
         max_concurrency=1,
@@ -38,8 +39,7 @@ def kuzu_graph_with_embedding_width(db_path: Path, width: int) -> None:
     database = kuzu.Database(str(db_path))
     connection = kuzu.Connection(database)
     connection.execute(
-        f"CREATE NODE TABLE Memory("
-        f"node_id STRING, embedding FLOAT[{width}], PRIMARY KEY(node_id))"
+        f"CREATE NODE TABLE Memory(node_id STRING, embedding FLOAT[{width}], PRIMARY KEY(node_id))"
     )
     del connection
     del database

@@ -110,9 +110,18 @@ export async function connectSourcesWithImport(
     sourceIds: readonly string[];
     confirmOverrides: boolean;
     requestId?: string;
+    /** Whose grant this is. Omitted for the default user (`local`). */
+    userId?: string;
+    /** An absolute root other than the source's candidate (a Hermes
+     * profile). Core reads its identity itself, so the source's candidate
+     * root id and revision are not sent for it. */
+    root?: string;
   },
 ): Promise<FlowDocument> {
   const sourceIds = input.sourceIds;
+  // A second user's grant is not a first run, and a custom root has no
+  // candidate the app showed: both are a plain connect.
+  const profile = input.root !== undefined || input.userId !== undefined;
   if (
     sourceIds.length < 1 ||
     sourceIds.length > 32 ||
@@ -134,9 +143,14 @@ export async function connectSourcesWithImport(
     return invalid("source_unavailable");
   }
   const items = selected.map(([candidate]) => candidate);
-  const needsOverride = items
-    .filter((item) => item.requires_override_confirmation)
-    .map((item) => item.source_id);
+  // A custom root is the caller's own choice, not the environment override
+  // the confirmation exists for.
+  const needsOverride =
+    input.root !== undefined
+      ? []
+      : items
+          .filter((item) => item.requires_override_confirmation)
+          .map((item) => item.source_id);
   if (needsOverride.length > 0 && !input.confirmOverrides) {
     return {
       schema_version: 1,
@@ -154,18 +168,22 @@ export async function connectSourcesWithImport(
     request = buildSourceImportRequest({
       sourceIds: [...sourceIds],
       sourceRoots: Object.fromEntries(
-        items.map((item) => [item.source_id, item.candidate_root_id]),
+        items.flatMap((item) =>
+          input.root === undefined
+            ? [[item.source_id, item.candidate_root_id]]
+            : [],
+        ),
       ),
       sourceCandidateRevisions: Object.fromEntries(
         items.flatMap((item) =>
-          item.candidate_revision === undefined
+          item.candidate_revision === undefined || input.root !== undefined
             ? []
             : [[item.source_id, item.candidate_revision]],
         ),
       ),
       confirmEnvironmentOverrides: needsOverride.length > 0,
       fullRescan: false,
-      onboarding: true,
+      onboarding: !profile,
       enableSync: true,
       requestId,
     });
@@ -175,7 +193,11 @@ export async function connectSourcesWithImport(
     }
     throw error;
   }
-  const result = await operations.post<unknown>(request.path, request.body);
+  const result = await operations.post<unknown>(request.path, {
+    ...request.body,
+    ...(input.userId === undefined ? {} : { user_id: input.userId }),
+    ...(input.root === undefined ? {} : { root: input.root }),
+  });
   if (result.state === "rejected") {
     return rejected(requestId, result.code);
   }
@@ -326,12 +348,25 @@ export function parseApiKey(bytes: Buffer | null): string | undefined {
   return value;
 }
 
+/** What to do about a refusal whose code alone does not say. */
+const FLOW_CODE_HINTS: Record<string, string> = {
+  hermes_root_is_profiles_container:
+    "--root 指向的是 profiles 目录本身；请指向其中一个 profile，例如 ~/.hermes/profiles/wife。",
+  hermes_root_overlaps_other_user:
+    "--root 与另一个用户已接入的 Hermes 目录相同或互相包含，会读到对方的记录；请换一个目录，或先撤销对方的接入。~/.hermes 与 ~/.hermes/profiles/<name> 可以分属两个用户。",
+};
+
 export function renderFlowText(document: FlowDocument): string {
   const lines = [
     `操作状态：${document.state}`,
     `操作 ID：${document.operation_id ?? "无"}`,
     "code" in document ? `代码：${document.code}` : "已返回有界回执。",
   ];
+  const hint =
+    "code" in document && typeof document.code === "string"
+      ? FLOW_CODE_HINTS[document.code]
+      : undefined;
+  if (hint) lines.push(hint);
   // A partial success or an all-rejected batch must name each source that was
   // not accepted; a bare "partial" leaves the user with nothing to act on.
   if (

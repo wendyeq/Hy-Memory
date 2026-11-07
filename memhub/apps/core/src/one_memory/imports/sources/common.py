@@ -240,6 +240,9 @@ class JsonlSourceAdapter:
         self.header_gate = header_gate
         self._header_cache: dict[str, tuple[str, dict[str, JsonValue] | None]] = {}
         self._history_listing_cache: SourceListing | None = None
+        self._probe_listing_cache: (
+            tuple[dict[str, SourceCursor], int | None, SourceListing] | None
+        ) = None
 
     @property
     def descriptor(self) -> SourceDescriptor:
@@ -295,6 +298,11 @@ class JsonlSourceAdapter:
             predicate=self.file_predicate,
             cursors=options.cursors,
         )
+        self._probe_listing_cache = (
+            dict(options.cursors),
+            options.max_scan_targets,
+            listing,
+        )
         return bool(listing.changed or listing.failures)
 
     async def live_baseline(self) -> dict[str, SourceCursor]:
@@ -342,9 +350,11 @@ class JsonlSourceAdapter:
             async for event in self._scan_frozen(options):
                 yield event
             return
-        listing = await asyncio.to_thread(
-            self._history_listing if options.reuse_listing else self._fresh_listing,
-            options,
+        listing = (
+            await asyncio.to_thread(self._history_listing, options)
+            if options.reuse_listing
+            else self._take_probe_listing(options)
+            or await asyncio.to_thread(self._fresh_listing, options)
         )
         for failure in listing.failures:
             yield ScanFailure(reason_code=discovery_failure_code(failure))
@@ -374,6 +384,16 @@ class JsonlSourceAdapter:
         listing = self._fresh_listing(options)
         if listing.changed and not listing.failures:
             self._history_listing_cache = listing
+        return listing
+
+    def _take_probe_listing(self, options: ScanOptions) -> "SourceListing | None":
+        cached = self._probe_listing_cache
+        self._probe_listing_cache = None
+        if cached is None:
+            return None
+        cursors, max_scan_targets, listing = cached
+        if cursors != options.cursors or max_scan_targets != options.max_scan_targets:
+            return None
         return listing
 
     def _fresh_listing(self, options: ScanOptions) -> "SourceListing":

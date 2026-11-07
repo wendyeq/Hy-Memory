@@ -27,6 +27,11 @@ class SemanticMemoryHit:
     member_ids: tuple[str, ...] = ()
     sdk_formatted: bool = False
     formatting_complete: bool = False
+    #: The recall lane that produced the hit (`sdk_search_options.SearchLane`)
+    #: and the namespace to read it back from. Defaults are a chat memory.
+    lane: str = "normal"
+    kind: str = "chat"
+    variant: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -140,6 +145,10 @@ async def search_within(
         return (), "failed"
     error = pending.exception()
     if error is not None:
+        if getattr(error, "code", None) == "embedding_unavailable":
+            # Not "HY found nothing": the query could not be embedded, and
+            # the caller must say so instead of answering empty.
+            raise error
         return (), "failed"
     found = pending.result()
     normalized = normalize_semantic_hits(found)

@@ -13,10 +13,13 @@ import threading
 from collections.abc import Mapping
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 
+from one_memory.memory_features import MemoryFeatures
 from one_memory.memory_queue import ExtractionWindowPreset
+from one_memory.ui_language import UI_LANGUAGES, UiLanguage
 
 _SOURCE_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,127}$")
 
@@ -25,6 +28,31 @@ class SourceConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
     sync_enabled: StrictBool = False
+
+
+#: The SDK pipeline mode (hy-memory `HyMemoryClient(mode=...)`):
+#: lite keeps raw conversations only, with no model call; pro extracts
+#: memories (System 1); ultra adds the knowledge graph and evolve (System 2).
+MemoryMode = Literal["lite", "pro", "ultra"]
+MEMORY_MODES: tuple[MemoryMode, ...] = ("lite", "pro", "ultra")
+_SCHEDULE_TIME = re.compile(r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$")
+
+
+class EvolveSchedule(BaseModel):
+    """When ultra runs evolve for every user: once a day, local time."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+    enabled: StrictBool = True
+    #: `HH:MM`, 24-hour, the machine's local time.
+    time: str = "03:00"
+
+    @field_validator("time")
+    @classmethod
+    def valid_time(cls, value: str) -> str:
+        if _SCHEDULE_TIME.fullmatch(value) is None:
+            raise ValueError("invalid_evolve_schedule_time")
+        return value
 
 
 class ConfigDocument(BaseModel):
@@ -39,6 +67,17 @@ class ConfigDocument(BaseModel):
     #: needs no re-entry of a key.
     sedimentation_enabled: StrictBool = True
     extraction_window_preset: ExtractionWindowPreset = ExtractionWindowPreset.THREE_MONTHS
+    #: The SDK mode every client is built with. `ONE_MEMORY_GRAPH_STORE` (dev)
+    #: still forces ultra over it; see `hy_graph_admin.effective_memory_mode`.
+    memory_mode: MemoryMode = "pro"
+    evolve_schedule: EvolveSchedule = Field(default_factory=EvolveSchedule)
+    #: SDK retrieval and extraction features a person set; an unset one keeps
+    #: the SDK default. See `one_memory.memory_features`.
+    memory_features: MemoryFeatures = Field(default_factory=MemoryFeatures)
+    #: The display language the App shows (its choice, or the system language
+    #: it follows); None = none set. See `one_memory.ui_language` for what it
+    #: does to the SDK.
+    ui_language: UiLanguage | None = None
 
     @field_validator("sources")
     @classmethod
@@ -59,6 +98,9 @@ class ConfigDocument(BaseModel):
 
 class ConfigFileError(RuntimeError):
     pass
+
+
+_WRITTEN_WHEN_SET = frozenset({"memory_mode", "evolve_schedule", "memory_features", "ui_language"})
 
 
 class ConfigStore:
@@ -103,6 +145,63 @@ class ConfigStore:
             raise ValueError("invalid_extraction_window_config")
         with self._lock:
             updated = self._document.model_copy(update={"extraction_window_preset": preset})
+            self._write(updated)
+            self._document = updated
+            return updated
+
+    def memory_mode(self) -> MemoryMode:
+        with self._lock:
+            return self._document.memory_mode
+
+    def memory_mode_explicitly_configured(self) -> bool:
+        """Whether a person chose the mode, including choosing the default."""
+        with self._lock:
+            return "memory_mode" in self._document.model_fields_set
+
+    def set_memory_mode(self, mode: MemoryMode) -> ConfigDocument:
+        if mode not in MEMORY_MODES:
+            raise ValueError("invalid_memory_mode")
+        with self._lock:
+            updated = self._document.model_copy(update={"memory_mode": mode})
+            self._write(updated)
+            self._document = updated
+            return updated
+
+    def evolve_schedule(self) -> EvolveSchedule:
+        with self._lock:
+            return self._document.evolve_schedule
+
+    def set_evolve_schedule(self, schedule: EvolveSchedule) -> ConfigDocument:
+        if not isinstance(schedule, EvolveSchedule):
+            raise ValueError("invalid_evolve_schedule")
+        with self._lock:
+            updated = self._document.model_copy(update={"evolve_schedule": schedule})
+            self._write(updated)
+            self._document = updated
+            return updated
+
+    def memory_features(self) -> MemoryFeatures:
+        with self._lock:
+            return self._document.memory_features
+
+    def set_memory_features(self, features: MemoryFeatures) -> ConfigDocument:
+        if not isinstance(features, MemoryFeatures):
+            raise ValueError("invalid_memory_features")
+        with self._lock:
+            updated = self._document.model_copy(update={"memory_features": features})
+            self._write(updated)
+            self._document = updated
+            return updated
+
+    def ui_language(self) -> UiLanguage | None:
+        with self._lock:
+            return self._document.ui_language
+
+    def set_ui_language(self, language: UiLanguage | None) -> ConfigDocument:
+        if language is not None and language not in UI_LANGUAGES:
+            raise ValueError("invalid_ui_language")
+        with self._lock:
+            updated = self._document.model_copy(update={"ui_language": language})
             self._write(updated)
             self._document = updated
             return updated
@@ -152,9 +251,16 @@ class ConfigStore:
             raise ConfigFileError("config_invalid") from error
 
     def _write(self, document: ConfigDocument) -> None:
+        # Settings added after 1.0.5 are written only once a person chose
+        # them, so an untouched install's file stays what older builds read.
+        unset = {name for name in _WRITTEN_WHEN_SET if name not in document.model_fields_set}
+        values = document.model_dump(mode="json", exclude=unset)
+        if "memory_features" in values:
+            # Only the features a person set; an absent one is the SDK default.
+            values["memory_features"] = document.memory_features.model_dump(exclude_none=True)
         payload = (
             json.dumps(
-                document.model_dump(mode="json"),
+                values,
                 ensure_ascii=False,
                 indent=2,
                 sort_keys=True,

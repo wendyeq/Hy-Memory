@@ -23,7 +23,9 @@ import {
   type HostPermissionClient,
   installPackagedRuntime,
   installUserService,
+  queryRuntimeServiceState,
   RecallBrokerSupervisor,
+  type RuntimeServiceState,
   RuntimeSupervisor,
   readInstalledRuntimeSource,
   readPublishedCorePort,
@@ -59,6 +61,7 @@ import { installApplicationMenu } from "./application-menu";
 import { installBackgroundHealthIpc } from "./background-health-ipc";
 import { installBackgroundTray } from "./background-tray";
 import { installConnectionSetupIpc } from "./connection-setup-ipc";
+import { installCoreLanguageSync } from "./core-language-sync";
 import {
   CoreSupervisor,
   ensureRuntimeProcess,
@@ -109,6 +112,7 @@ import { showMigrationFailureDialog } from "./migration-failure-dialog";
 import { isAllowedNavigation } from "./navigation-policy";
 import { installDenyAllPermissionPolicy } from "./permissions";
 import { isHostPresent, recallHosts } from "./recall-hosts";
+import { reconcileRunningRuntime } from "./runtime-adoption";
 import { shutdownRuntime } from "./runtime-shutdown";
 import { createSourceChangeHandler } from "./source-change-handler";
 import { SourceDirectoryPicker } from "./source-directory-picker";
@@ -139,7 +143,12 @@ let runtimeSupervisor: RuntimeSupervisor | null = null;
 // Where the Runtime keeps its receipt. Stopping it on a full quit needs this,
 // and `stop` runs outside `initialize`, where the directory is chosen.
 let runtimeDataDir: string | null = null;
-let preserveManagedRuntimeOnQuit = false;
+// Whether quitting stops the Runtime is asked of the service manager at quit
+// time (`currentRuntimeServiceState`), never remembered from startup. The one
+// startup fact kept is a Runtime whose build could not be read: this App never
+// stops one it could not compare with its own.
+let preserveRuntimeOnQuitReason: string | null = null;
+let runtimeServiceManagedByApp = false;
 let disposeTray: (() => void) | null = null;
 let disposeApplicationMenu: (() => void) | null = null;
 let languagePreferences: LanguagePreferences | null = null;
@@ -151,6 +160,7 @@ let connectionSetup: ReturnType<typeof installConnectionSetupIpc> | null = null;
 let disposeBackgroundHealth: (() => void) | null = null;
 let stableRuntimeRepair: Promise<void> | null = null;
 let disposeDiagnostics: (() => void) | null = null;
+let disposeCoreLanguageSync: (() => void) | null = null;
 let desktopDiagnostics: DiagnosticLogger | null = null;
 let exportDiagnosticsFromMenu: (() => Promise<void>) | null = null;
 const desktopStartupStartedAt = Date.now();
@@ -165,7 +175,7 @@ installEarlyStartupErrorHandler({
     process.env.ONE_MEMORY_DATA_DIR?.trim() ||
     path.join(app.getPath("home"), ".one-memory"),
   stderr: process.stderr,
-  readLocale: () => languagePreferences?.read().locale ?? "zh-CN",
+  readLocale: () => languagePreferences?.read().locale ?? "zh-Hans",
   showError: (title, message) => dialog.showErrorBox(title, message),
   exit: (code) => app.exit(code),
 });
@@ -245,6 +255,25 @@ if (trialProfile) {
   app.setPath("userData", hourlyUserDataDir);
 }
 
+/** Ask the service manager, now, whether the background service for this data
+ * dir is on. Never cached: quit and the tray each re-read it, so a switch made
+ * in Settings, by `memhub service`, or by `launchctl` counts immediately. */
+function currentRuntimeServiceState(): Promise<RuntimeServiceState> {
+  if (!runtimeDataDir) {
+    return Promise.resolve({
+      state: "unknown",
+      reason: "service-state-query-failed",
+      jobPid: null,
+    });
+  }
+  return queryRuntimeServiceState({
+    dataDir: runtimeDataDir,
+    home: app.getPath("home"),
+    platform: process.platform,
+    uid: process.getuid?.(),
+  });
+}
+
 function prepareProtocol(): void {
   protocol.registerSchemesAsPrivileged([
     {
@@ -296,9 +325,9 @@ function installPackagedWebProtocol(): void {
   installAppProtocol(path.join(process.resourcesPath, "web"), {
     // Preferences are open by now: beforeNativeUi runs before this window.
     startupScreen: () => {
-      let locale: GuiLocale = "zh-CN";
+      let locale: GuiLocale = "zh-Hans";
       try {
-        locale = languagePreferences?.read().locale ?? "zh-CN";
+        locale = languagePreferences?.read().locale ?? "zh-Hans";
       } catch {
         // An unreadable preference keeps the Chinese placeholder.
       }
@@ -496,6 +525,7 @@ async function initialize(isQuitting: () => boolean): Promise<void> {
     !preview &&
     (hostIntegrationEnabled || desktopTestIsolation !== null) &&
     installedApplication;
+  runtimeServiceManagedByApp = appManagedRuntime;
   const runningPackagedHost =
     app.isPackaged && !isolatedHourly
       ? await resolveRunningPackagedHostPaths({
@@ -851,14 +881,25 @@ async function initialize(isQuitting: () => boolean): Promise<void> {
   );
   ipcMain.handle("one-memory:get-login-preference", (event) => {
     assertAllowedRenderer(event.senderFrame?.url);
-    return readLoginPreference(dataDir, process.platform, appManagedRuntime);
+    return readLoginPreference(
+      dataDir,
+      process.platform,
+      appManagedRuntime,
+      currentRuntimeServiceState,
+    );
   });
   ipcMain.handle("one-memory:set-login-preference", (event, input: unknown) => {
     assertAllowedRenderer(event.senderFrame?.url);
     return observeDesktopAction(
       "login_preference",
       () =>
-        setLoginPreference(dataDir, process.platform, input, appManagedRuntime),
+        setLoginPreference(
+          dataDir,
+          process.platform,
+          input,
+          appManagedRuntime,
+          currentRuntimeServiceState,
+        ),
       { action: "set" },
     );
   });
@@ -1173,7 +1214,6 @@ async function initialize(isQuitting: () => boolean): Promise<void> {
       const startAtLogin = owner?.owner === "app" ? owner.start_at_login : true;
       const previousOwner = owner;
       let runtimeChanged = false;
-      let transientRuntime = false;
       // Install whoever owns the service. Owner decides who starts and stops
       // it, not which build runs: skipping the install for a CLI owner (also
       // the App's own guess when its receipt is missing) left an upgraded App
@@ -1243,12 +1283,68 @@ async function initialize(isQuitting: () => boolean): Promise<void> {
         const frozen = await readSdkMigrationBlock(dataDir);
         if (frozen?.frozen !== undefined) throw new Error(frozen.code);
       }
-      const alreadyRunning = runtimeChanged
-        ? false
-        : await waitForRuntimeProcess({ dataDir, attempts: 4 }).then(
-            () => true,
-            () => false,
-          );
+      // One Runtime per data dir. A Runtime already serving it is adopted
+      // when it is this App's build or newer (silently; a newer one is never
+      // stopped or downgraded at startup); an older one is replaced (through
+      // launchd when it is the service's job), and one whose build cannot be
+      // read is adopted but never stopped.
+      const reconciled = await reconcileRunningRuntime({
+        app: {
+          ...(packagedBuildNumber === undefined
+            ? {}
+            : { buildNumber: packagedBuildNumber }),
+          ...(packagedCommit === undefined ? {} : { commit: packagedCommit }),
+        },
+        installedChanged: runtimeChanged,
+        findRunning: () =>
+          waitForRuntimeProcess({ dataDir, attempts: 4 }).then(
+            (attachment) =>
+              attachment.servicePid === null
+                ? null
+                : {
+                    pid: attachment.servicePid,
+                    build: attachment.runtimeBuild,
+                  },
+            () => null,
+          ),
+        queryServiceState: currentRuntimeServiceState,
+        stopRuntime: () => stopRuntimeProcess({ dataDir }),
+        log: ({ decision, service, running }) =>
+          diagnostics.log({
+            level: decision.action === "adopt-unverified" ? "warn" : "info",
+            component: "desktop.stable_runtime",
+            event: "stable_runtime.adoption",
+            outcome:
+              decision.action === "adopt-unverified" ? "degraded" : "succeeded",
+            details: {
+              action: decision.action,
+              reason:
+                "reason" in decision
+                  ? decision.reason
+                  : (service?.reason ?? "no-runtime-running"),
+              status: service?.state ?? "not-queried",
+              version:
+                running === null
+                  ? "none"
+                  : running.build === undefined
+                    ? "legacy"
+                    : String(running.build.buildNumber ?? "unknown"),
+            },
+          }),
+      });
+      preserveRuntimeOnQuitReason = reconciled.preserveReason;
+      if (reconciled.decision.action === "adopt-unverified") {
+        void dialog
+          .showMessageBox({
+            type: "warning",
+            message: "MemHub",
+            detail: stableRuntimeFailureDetail(
+              new Error("runtime_build_unknown"),
+            ),
+          })
+          .catch(() => undefined);
+      }
+      const alreadyRunning = reconciled.adopted;
       if (owner?.owner !== "cli") {
         const appBundle = path.resolve(path.dirname(process.execPath), "../..");
         owner = await claimRuntimeServiceForApp({
@@ -1262,8 +1358,13 @@ async function initialize(isQuitting: () => boolean): Promise<void> {
         // A durable `launchctl disable` override is a state to report, not a
         // failure to undo: `installUserService` never re-enables a service the
         // user or the system disabled. An explicit App launch may still own a
-        // transient Runtime for this UI session. Shutdown stops that process.
-        const serviceMode = await installServiceWithDisabledFallback({
+        // transient Runtime for this UI session; quit stops it because the
+        // service is disabled, which it decides by asking launchd again then.
+        // For an enabled service, `installUserService` restarts the job with
+        // `kickstart -k` (or re-bootstraps a changed plist), so an older
+        // Runtime is replaced through launchd rather than killed into a
+        // respawn of the old binary.
+        await installServiceWithDisabledFallback({
           install: async () => {
             await installUserService(layout, {
               uid: process.getuid?.(),
@@ -1295,12 +1396,10 @@ async function initialize(isQuitting: () => boolean): Promise<void> {
             });
           },
         });
-        transientRuntime = serviceMode === "transient";
       }
       if (owner?.owner === "app" && !startAtLogin) {
         await disableRuntimeService(dataDir);
       }
-      preserveManagedRuntimeOnQuit = !transientRuntime;
     } else if (standaloneRuntime) {
       if (
         !desktopBackgroundLaunch &&
@@ -1410,16 +1509,16 @@ async function initialize(isQuitting: () => boolean): Promise<void> {
       void dialog.showMessageBox({
         type: "warning",
         message: translate(
-          languagePreferences?.read().locale ?? "zh-CN",
+          languagePreferences?.read().locale ?? "zh-Hans",
           "nativeMoveTitle",
         ),
         detail: translate(
-          languagePreferences?.read().locale ?? "zh-CN",
+          languagePreferences?.read().locale ?? "zh-Hans",
           "nativeMoveDetail",
         ),
         buttons: [
           translate(
-            languagePreferences?.read().locale ?? "zh-CN",
+            languagePreferences?.read().locale ?? "zh-Hans",
             "nativeAcknowledge",
           ),
         ],
@@ -1524,6 +1623,43 @@ async function initialize(isQuitting: () => boolean): Promise<void> {
         };
       },
     });
+    if (languagePreferences) {
+      // Core builds the SDK clients with the display language (`ui_language`).
+      disposeCoreLanguageSync = installCoreLanguageSync({
+        language: languagePreferences,
+        send: async (uiLanguage) => {
+          const core = coreSupervisor;
+          if (!core) throw new Error("core_supervisor_unavailable");
+          const publishedPort = await readPublishedCorePort(dataDir).catch(
+            () => null,
+          );
+          const response = await fetch(
+            `http://127.0.0.1:${publishedPort ?? core.port}/api/v1/settings/ui-language`,
+            {
+              method: "PUT",
+              headers: {
+                Authorization: `Bearer ${core.apiToken}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({ ui_language: uiLanguage }),
+              signal: AbortSignal.timeout(5_000),
+            },
+          );
+          if (!response.ok)
+            throw new Error(`ui_language_sync_http_${response.status}`);
+        },
+        reportError: (error) =>
+          void diagnostics
+            .log({
+              level: "warn",
+              component: "desktop.language",
+              event: "ui_language.sync_failed",
+              outcome: "failed",
+              ...diagnosticError(error),
+            })
+            .catch(() => {}),
+      });
+    }
     await diagnostics.log({
       level: "info",
       component: "desktop.lifecycle",
@@ -1632,7 +1768,8 @@ if (desktopVersion !== null) {
             ? readLoginPreference(
                 runtimeDataDir,
                 process.platform,
-                preserveManagedRuntimeOnQuit,
+                runtimeServiceManagedByApp,
+                currentRuntimeServiceState,
               )
             : Promise.resolve({
                 supported: false,
@@ -1645,8 +1782,20 @@ if (desktopVersion !== null) {
             runtimeDataDir,
             process.platform,
             { openAtLogin: enabled, userConfirmed: true },
-            preserveManagedRuntimeOnQuit,
+            runtimeServiceManagedByApp,
+            currentRuntimeServiceState,
           );
+        },
+        readRuntimeHosting: async () => {
+          if (!runtimeDataDir || !app.isPackaged) return "unknown";
+          // A Runtime whose build could not be read is never stopped by it.
+          if (preserveRuntimeOnQuitReason) return "unknown";
+          const service = await currentRuntimeServiceState();
+          return service.state === "enabled"
+            ? "background-service"
+            : service.state === "disabled"
+              ? "app-hosted"
+              : "unknown";
         },
         ...(trialProfile
           ? { allowLoginStartup: false, productName: app.getName() }
@@ -1663,6 +1812,8 @@ if (desktopVersion !== null) {
         ...(coreSupervisor ? { instance_id: coreSupervisor.instanceId } : {}),
       });
       // An admitted native effect must settle and journal before Runtime detach.
+      disposeCoreLanguageSync?.();
+      disposeCoreLanguageSync = null;
       disposeLanguagePreferences?.();
       disposeLanguagePreferences = null;
       await languagePreferences?.drain();
@@ -1677,7 +1828,10 @@ if (desktopVersion !== null) {
         // stop and says so by taking the embedded path instead.
         dataDir: runtimeDataDir ?? "",
         standalone: app.isPackaged && runtimeDataDir !== null,
-        preserveManagedRuntime: preserveManagedRuntimeOnQuit,
+        // Asked now, not remembered from startup: the user may have switched
+        // the background service on or off since.
+        queryServiceState: currentRuntimeServiceState,
+        preserveReason: preserveRuntimeOnQuitReason,
         stopSupervisor: async () => {
           const results = await Promise.allSettled([
             runtimeSupervisor?.stop() ?? coreSupervisor?.stop(),
@@ -1714,6 +1868,8 @@ if (desktopVersion !== null) {
       });
     },
     dispose: () => {
+      disposeCoreLanguageSync?.();
+      disposeCoreLanguageSync = null;
       disposeLanguagePreferences?.();
       disposeLanguagePreferences = null;
       disposeApplicationMenu?.();
@@ -1744,7 +1900,7 @@ if (desktopVersion !== null) {
         showMigrationFailureDialog({
           error,
           dataDir: runtimeDataDir,
-          locale: languagePreferences?.read().locale ?? "zh-CN",
+          locale: languagePreferences?.read().locale ?? "zh-Hans",
           dependencies: {
             showMessageBoxSync: (options) => dialog.showMessageBoxSync(options),
             showItemInFolder: (target) => shell.showItemInFolder(target),
@@ -1772,7 +1928,7 @@ if (desktopVersion !== null) {
         return;
       dialog.showErrorBox(
         translate(
-          languagePreferences?.read().locale ?? "zh-CN",
+          languagePreferences?.read().locale ?? "zh-Hans",
           "nativeErrorTitle",
         ),
         stableRuntimeFailureDetail(error),

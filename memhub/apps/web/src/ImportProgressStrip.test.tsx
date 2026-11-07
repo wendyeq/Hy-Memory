@@ -95,7 +95,7 @@ describe("ImportProgressStrip", () => {
     function Switch() {
       const { setPreference } = useGuiLanguage();
       return (
-        <button type="button" onClick={() => void setPreference("zh-CN")}>
+        <button type="button" onClick={() => void setPreference("zh-Hans")}>
           Cambiar idioma
         </button>
       );
@@ -148,6 +148,58 @@ describe("ImportProgressStrip", () => {
         sources={sources}
         backfilling={false}
         onOpenSources={vi.fn()}
+      />,
+    );
+    expect(container.textContent).toBe("");
+  });
+
+  it("uses raw-saving copy and never offers model setup in lite mode", () => {
+    render(
+      <ImportProgressStrip
+        jobs={[job()]}
+        sources={sources}
+        backfilling={false}
+        onOpenSources={vi.fn()}
+        onConfigureModel={vi.fn()}
+        modeCapabilities={{
+          content_plane: "raw",
+          generation_required: false,
+          graph_enabled: false,
+          evolve_available: false,
+        }}
+        arrival={{
+          importing: true,
+          importedMessages: 3,
+          importedConversations: 1,
+          phase: "model-required",
+        }}
+      />,
+    );
+    expect(screen.getByRole("status").textContent).toContain(
+      "正在保存原始对话",
+    );
+    expect(screen.queryByRole("button", { name: "设置模型" })).toBeNull();
+  });
+
+  it("does not keep a lite progress strip mounted without active work", () => {
+    const { container } = render(
+      <ImportProgressStrip
+        jobs={[]}
+        sources={sources}
+        backfilling={false}
+        onOpenSources={vi.fn()}
+        modeCapabilities={{
+          content_plane: "raw",
+          generation_required: false,
+          graph_enabled: false,
+          evolve_available: false,
+        }}
+        arrival={{
+          importing: false,
+          importedMessages: 3,
+          importedConversations: 1,
+          phase: "stopped",
+        }}
       />,
     );
     expect(container.textContent).toBe("");
