@@ -5,6 +5,9 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from one_memory.sdk_search_options import SdkSearchOptions
+from one_memory.user_scope import DEFAULT_USER_ID, UserId
+
 ContextKind = Literal["raw", "memory"]
 ContextSearchChannel = Literal["lexical", "semantic"]
 ContextSemanticStatus = Literal["not_searched", "completed", "failed", "timed_out"]
@@ -47,17 +50,26 @@ class ContextSearchRequest(BaseModel):
         return self
 
 
-class SdkContextSearchRequest(ContextSearchRequest):
+class SdkContextSearchRequest(ContextSearchRequest, SdkSearchOptions):
     """`POST /api/v2/context/search`: the three SDK recall lanes are set apart.
 
     `limit` is the normal lane's top-k and the cap on returned items;
     `schema_limit` and `intention_limit` are the SDK's schema (L6) and
     proactive intention (L7) lanes. A caller's values are passed through.
+
+    The `SdkSearchOptions` fields reach the memory lane's `client.search`;
+    the raw lane takes the floor and the source, session, agent and time
+    filters (never wider than the caller's raw authority). Absent, both
+    lanes make the call they always made.
     """
 
     limit: int = Field(default=10, ge=1, le=20, strict=True)
     schema_limit: int = Field(default=3, ge=0, le=20, strict=True)
     intention_limit: int = Field(default=1, ge=0, le=20, strict=True)
+    #: Product callers can request one item per turn instead of SDK raw batches.
+    raw_unit: Literal["raw", "turn"] = "raw"
+    #: Whose memories to search. The App never sends it and reads `local`.
+    user_id: UserId = DEFAULT_USER_ID
 
 
 class ContextMessage(BaseModel):
@@ -113,6 +125,9 @@ class SdkRawContextItem(BaseModel):
     memory_at: datetime | None = None
     score: float = Field(ge=0, le=1)
     truncated: bool = False
+    turn_id: str | None = Field(default=None, min_length=1, max_length=96)
+    turn_index: int | None = Field(default=None, ge=0)
+    turn_count: int | None = Field(default=None, ge=1)
 
 
 class SdkMemoryContextItem(BaseModel):
@@ -145,6 +160,8 @@ class SdkContextSearchResponse(BaseModel):
     used_characters: int = Field(ge=0, le=20000)
     truncated: bool
     total_ms: float = Field(ge=0)
+    #: Whose memories were searched: the request's `user_id`, else `local`.
+    user_id: str = Field(min_length=1, max_length=64)
 
 
 class ContextLaneResult(BaseModel):

@@ -71,6 +71,16 @@ def graph_store_enabled() -> bool:
     return raw != "none"
 
 
+def effective_memory_mode(configured: str = "pro") -> str:
+    """The SDK mode clients are built with: the setting, unless dev forces ultra.
+
+    `ONE_MEMORY_GRAPH_STORE` (any value but empty or `none`) predates the
+    setting and keeps working for development: it forces ultra whatever the
+    configured mode. Without it the configured mode (default pro) applies.
+    """
+    return "ultra" if graph_store_enabled() else configured
+
+
 def inspect_graph_width_mismatch(config: Any) -> GraphWidthMismatch | None:
     """Return a mismatch without renaming or deleting anything."""
     db_path = Path(config.graph_store.db_path)
@@ -83,11 +93,16 @@ def inspect_profile_graph_width(
     *,
     api_key: str | None,
     data_dir: Path,
+    mode: str | None = None,
+    graph_dir: str = "graph",
 ) -> GraphWidthMismatch | None:
-    """Inspect the graph path and width selected by the active profile."""
+    """Inspect the graph path and width selected by the active profile.
+
+    `graph_dir` is the live embedding space's graph (`embedding_spaces`).
+    """
     del api_key
     return _inspect_graph_width(
-        _profile_graph_path(data_dir),
+        _profile_graph_path(data_dir, mode, graph_dir),
         _profile_embedding_width(profile),
     )
 
@@ -98,11 +113,13 @@ def decide_profile_graph_width(
     api_key: str | None,
     data_dir: Path,
     decision: GraphWidthDecision,
+    mode: str | None = None,
+    graph_dir: str = "graph",
 ) -> GraphWidthOutcome:
     """Apply the user's decision to the active profile's graph."""
     del api_key
     config = _GraphAdminConfig(
-        graph_store=_GraphStoreConfig(str(_profile_graph_path(data_dir))),
+        graph_store=_GraphStoreConfig(str(_profile_graph_path(data_dir, mode, graph_dir))),
         embedder=_EmbeddingWidthConfig(_profile_embedding_width(profile)),
     )
     return apply_graph_width_decision(
@@ -192,6 +209,12 @@ _GRAPH_WIDTH_CACHE: dict[str, int | None] = {}
 _GRAPH_WIDTH_LOCK = threading.Lock()
 
 
+def forget_graph_widths() -> None:
+    """Drop every remembered width: an embedding switch moved the graph."""
+    with _GRAPH_WIDTH_LOCK:
+        _GRAPH_WIDTH_CACHE.clear()
+
+
 def _graph_embedding_width(db_path: Path) -> int | None:
     """Read the Memory embedding width directly from Kuzu's schema."""
     try:
@@ -240,8 +263,9 @@ def _inspect_graph_width(
     )
 
 
-def _profile_graph_path(data_dir: Path) -> Path:
-    name = "graph" if graph_store_enabled() else "graph-disabled"
+def _profile_graph_path(data_dir: Path, mode: str | None = None, graph_dir: str = "graph") -> Path:
+    ultra = mode == "ultra" if mode is not None else graph_store_enabled()
+    name = graph_dir if ultra else "graph-disabled"
     return data_dir / "hy-memory" / HY_MEMORY_NAMESPACE / name
 
 

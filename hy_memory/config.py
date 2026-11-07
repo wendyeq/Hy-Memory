@@ -260,6 +260,7 @@ class EmbedderConfig:
     max_retries: int = None  # 最大重试次数
     retry_delay: float = None  # 重试间隔（秒）
     timeout: int = None  # 请求超时（秒）
+    batch_size: int = None  # 单次 HTTP 请求最多带多少条 input（embed_batch 按此切块）
 
     # 内部平台扩展（extra_headers / extra_body 会透传给 OpenAI client）
     extra_headers: Optional[Dict[str, str]] = None
@@ -294,6 +295,10 @@ class EmbedderConfig:
             # 请求切断并制造重试风暴。SDK 内层重试已关闭，15s 是每个显式 attempt
             # 的真实上限；部署可通过 MEMORY_EMBEDDER_TIMEOUT 覆盖。
             self.timeout = _get_env_int("MEMORY_EMBEDDER_TIMEOUT", 15)
+        if self.batch_size is None:
+            # 大批量（如重新 embed 整个库）不能一次 HTTP 发几千条：多数服务对
+            # input 数组有上限，超了直接 400。按 batch_size 切块逐块发送。
+            self.batch_size = _get_env_int("MEMORY_EMBEDDER_BATCH_SIZE", 64)
         if self.extra_headers is None:
             val = os.getenv("MEMORY_EMBEDDER_EXTRA_HEADERS")
             if val:
@@ -427,6 +432,14 @@ class RecallConfig:
     retrieval_clauses_require_keyword: bool = None  # env: MEMORY_RETRIEVAL_CLAUSES_REQUIRE_KEYWORD
     retrieval_clauses_min_keyword_score: float = None  # normalized BM25 floor
     supplemental_propositions_enabled: bool = None  # env: MEMORY_SUPPLEMENTAL_PROPOSITIONS_ENABLED
+    # ── Intention（L7）判重 ──
+    # 开启（默认）：召回时同 user+agent+同天 memory_at+同 valid_until 且
+    # cosine≥阈值 的意图视为复本，只返回最早一条，其余异步从 VDB 删除（历史行为）。
+    # 关闭：读侧与写入侧批内都不判重——不隐藏、不丢弃、不删除任何意图。
+    intention_dedup_enabled: bool = None       # env: MEMORY_INTENTION_DEDUP_ENABLED
+    # 读侧意图判重 cosine 阈值。env: MEMORY_INTENTION_DEDUP_THRESHOLD，
+    # 未设置时回退到共享的 MEMORY_DEDUP_THRESHOLD（兼容旧部署），默认 0.95。
+    intention_dedup_threshold: float = None
 
     # 最小分数阈值
     min_score_threshold: float = 0.0
@@ -744,6 +757,15 @@ class RecallConfig:
         if self.supplemental_propositions_enabled is None:
             self.supplemental_propositions_enabled = _get_env_bool(
                 "MEMORY_SUPPLEMENTAL_PROPOSITIONS_ENABLED", False
+            )
+        if self.intention_dedup_enabled is None:
+            self.intention_dedup_enabled = _get_env_bool(
+                "MEMORY_INTENTION_DEDUP_ENABLED", True
+            )
+        if self.intention_dedup_threshold is None:
+            self.intention_dedup_threshold = _get_env_float(
+                "MEMORY_INTENTION_DEDUP_THRESHOLD",
+                _get_env_float("MEMORY_DEDUP_THRESHOLD", 0.95),
             )
 
 
@@ -1259,6 +1281,12 @@ class MemoryConfig:
     enable_agent: bool = False
     debug: bool = False
     metrics_enabled: bool = True
+    # LLM prompt 语言（client 默认值；env: MEMORY_LANGUAGE）。canonical 码见
+    # hy_memory.prompts.SUPPORTED_LANGUAGES（en / zh-Hans / zh-Hant / ja / es / de /
+    # pt / fr / ko / ru / id），也接受别名 zh、zh-CN → zh-Hans，zh-TW、zh-HK →
+    # zh-Hant，pt-BR → pt。add() 等的 per-call language 优先于它。None（默认）=
+    # 沿用 zh/en 自动检测。显式指定时记忆正文用该语言书写。未知码抛 ValueError。
+    language: Optional[str] = None
     # Runtime-only HTTP transport factory. MemHub uses this for request-cost
     # budgeting without restricting the embedded SDK's local store access.
     http_transport_factory: Optional[Callable[[], Any]] = field(
@@ -1273,6 +1301,11 @@ class MemoryConfig:
         self.enable_agent = _get_env_bool("MEMORY_ENABLE_AGENT", False)
         self.debug = _get_env_bool("MEMORY_DEBUG", False)
         self.metrics_enabled = _get_env_bool("MEMORY_METRICS", True)
+        if self.language is None:
+            self.language = os.getenv("MEMORY_LANGUAGE", "").strip() or None
+        from .prompts import normalize_language
+
+        self.language = normalize_language(self.language)
 
     @classmethod
     def from_env(cls) -> "MemoryConfig":
@@ -1323,6 +1356,10 @@ class MemoryConfig:
         config.metrics_enabled = config_dict.get(
             "metrics_enabled", config.metrics_enabled
         )
+        if config_dict.get("language") is not None:
+            from .prompts import normalize_language
+
+            config.language = normalize_language(config_dict["language"])
 
         return config
 
@@ -1364,6 +1401,8 @@ class MemoryConfig:
                 "supplemental_propositions_enabled": (
                     self.recall.supplemental_propositions_enabled
                 ),
+                "intention_dedup_enabled": self.recall.intention_dedup_enabled,
+                "intention_dedup_threshold": self.recall.intention_dedup_threshold,
             },
             "pipeline": {
                 "default_version": self.pipeline.default_version,
@@ -1381,6 +1420,7 @@ class MemoryConfig:
             "enable_graph": self.enable_graph,
             "enable_agent": self.enable_agent,
             "metrics_enabled": self.metrics_enabled,
+            "language": self.language,
         }
 
     def print_config(self) -> None:

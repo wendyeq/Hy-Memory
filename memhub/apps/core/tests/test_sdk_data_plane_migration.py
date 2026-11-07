@@ -6,7 +6,7 @@ import io
 import json
 import sqlite3
 from contextlib import closing
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -30,7 +30,6 @@ from one_memory.sdk_data_plane_migration import (
     MemoryAuthority,
     SdkDataPlaneMigrationStore,
 )
-from one_memory.sdk_memory_runtime import SdkMemoryRuntime
 from one_memory.sdk_migration_bundle import create_sdk_migration_bundle
 from one_memory.sdk_migration_runner import (
     PREPARED_PHASE,
@@ -708,6 +707,7 @@ def test_cutover_waits_until_the_new_runtime_reads_every_chat_memory(store, acti
         "chat_readable": 1,
         "productivity_expected": 0,
         "productivity_readable": 0,
+        "chat_missing_before_migration": 0,
         "passed": False,
     }
     assert store.authority() is MemoryAuthority.LEGACY
@@ -774,17 +774,185 @@ def test_retired_coding_experiences_do_not_block_but_an_empty_store_does(store, 
     assert (result.readback.productivity_expected, result.readback.productivity_readable) == (2, 1)
 
 
-def test_memories_without_a_model_profile_keep_legacy_authority(store, monkeypatch):
+def test_a_home_without_a_model_profile_migrates_on_the_builtin_embedding(store, monkeypatch):
+    """#234: no generation model was ever configured, and the upgrade stopped.
+
+    No profile means no LLM, not no embedding: the vectors are the built-in
+    model's, the same space the Runtime reads with. They are reattached and
+    read back through it, and the client is opened without resolving a key.
+    """
+    from one_memory.hy_sdk_runtime import builtin_retrieval_snapshot, vector_collection_bases
+
     monkeypatch.setattr("one_memory.sdk_migration_runner.read_active_profile", lambda _db: None)
+    home = store.database_path.parent
+    builtin = builtin_retrieval_snapshot()
+    _current, legacy_bases = vector_collection_bases(builtin)
+    client = _chroma(home)
+    _fill(client, f"{legacy_bases[0]}_512", ["m1", "m2"])
+    del client
+    _confirmed(store, "m1", "m2")
+    opened: list[str] = []
+
+    def open_client(profile):
+        opened.append(profile.profile_id)
+        return _reading({"m1", "m2"})(profile)
+
+    result = run_startup_migration(
+        data_dir=home,
+        runtime_build="21",
+        sdk_version="2.0.5",
+        namespace="governed-v2",
+        open_client=open_client,
+    )
+
+    assert result.state == "cutover"
+    assert opened == [builtin.profile_id]
+    assert [item.legacy for item in result.reattached] == [f"{legacy_bases[0]}_512"]
+    assert result.readback is not None and result.readback.passed
+    assert store.authority() is MemoryAuthority.SDK
+
+
+def test_the_builtin_readback_client_resolves_no_secret(tmp_path, monkeypatch):
+    """The built-in snapshot has no stored version and no key to look up."""
+    from one_memory import sdk_migration_verify
+    from one_memory.hy_sdk_runtime import builtin_retrieval_snapshot
+
+    leased: list[tuple[str, object]] = []
+
+    class Lease:
+        client = object()
+
+        def close(self) -> None:
+            leased.append(("closed", None))
+
+    def acquire(profile, *, api_key, data_dir):
+        leased.append((profile.profile_id, api_key))
+        return Lease()
+
+    def no_lookup(*_args, **_kwargs):
+        raise AssertionError("a key-less profile must not touch the secret store")
+
+    monkeypatch.setattr("one_memory.hy_sdk_runtime.acquire_client", acquire)
+    monkeypatch.setattr(
+        "one_memory.model_profiles.ModelProfileStore.resolve_snapshot_secret", no_lookup
+    )
+    with sdk_migration_verify.runtime_sdk_client(
+        tmp_path / "missing.sqlite3", tmp_path, builtin_retrieval_snapshot()
+    ) as client:
+        assert client is Lease.client
+    assert leased == [("builtin-retrieval", None), ("closed", None)]
+
+
+def test_vectors_left_by_a_deleted_profile_stop_the_upgrade_by_name(store, monkeypatch):
+    """No active profile, and the vectors sit in another profile's space.
+
+    The built-in model cannot read them, so the old abort was right for this
+    one shape; it now says what is actually wrong, before anything changes.
+    """
+    from one_memory.hy_sdk_runtime import vector_collection_bases
+    from one_memory.model_profiles import ModelProfileSnapshot, ProviderKind
+
+    monkeypatch.setattr("one_memory.sdk_migration_runner.read_active_profile", lambda _db: None)
+    deleted = ModelProfileSnapshot(
+        profile_id="deleted",
+        revision=3,
+        provider_kind=ProviderKind.OPENAI_COMPATIBLE,
+        base_url="https://models.example/v1",
+        model="chat",
+        embedding_provider_kind=ProviderKind.OPENAI_COMPATIBLE,
+        embedding_base_url="https://models.example/v1",
+        embedding_model="text-embedding-3-large",
+        embedding_dimensions=1024,
+        timeout_seconds=60,
+        max_concurrency=1,
+        context_window=None,
+        has_api_key=True,
+    )
+    current, _legacy = vector_collection_bases(deleted)
+    home = store.database_path.parent
+    client = _chroma(home)
+    _fill(client, f"{current}_1024", ["m1"])
+    del client
     _confirmed(store, "m1")
 
-    with pytest.raises(DataPlaneMigrationError, match="sdk_migration_model_profile_required"):
+    with pytest.raises(DataPlaneMigrationError, match="sdk_migration_vector_profile_missing"):
         run_startup_migration(
-            data_dir=store.database_path.parent,
+            data_dir=home,
             runtime_build="21",
             sdk_version="2.0.5",
             namespace="governed-v2",
+            open_client=_reading({"m1"}),
         )
+    assert store.authority() is MemoryAuthority.LEGACY
+    assert not (home / "backups").exists()
+
+
+def test_confirmed_chats_the_sdk_had_already_merged_do_not_fail_the_upgrade(store, active_profile):
+    """#229/#240: 658 confirmed chats, 657 in the store, and the upgrade failed.
+
+    A 1.0.4 library can hold confirmed rows whose SDK node had been merged or
+    deleted before the upgrade; no migration can read those back. The check
+    holds chat to what the store held before this run and counts the rest.
+    """
+    from one_memory.hy_sdk_runtime import vector_collection_bases
+
+    home = store.database_path.parent
+    stored = [f"chat-{index:03d}" for index in range(657)]
+    current, _legacy = vector_collection_bases(active_profile)
+    client = _chroma(home)
+    _fill(client, f"{current}_512", stored)
+    del client
+    _confirmed(store, *stored, "chat-merged-before-upgrade")
+
+    result = run_startup_migration(
+        data_dir=home,
+        runtime_build="21",
+        sdk_version="2.0.5",
+        namespace="governed-v2",
+        open_client=_reading(set(stored)),
+    )
+
+    assert result.state == "cutover"
+    assert result.readback is not None
+    assert result.readback.as_document() == {
+        "chat_expected": 657,
+        "chat_readable": 657,
+        "productivity_expected": 0,
+        "productivity_readable": 0,
+        "chat_missing_before_migration": 1,
+        "passed": True,
+    }
+    assert store.authority() is MemoryAuthority.SDK
+
+
+def test_a_chat_in_the_store_before_the_upgrade_must_still_read_back(store, active_profile):
+    """Only what was already gone is excused; losing a stored memory still fails."""
+    from one_memory.hy_sdk_runtime import vector_collection_bases
+    from one_memory.sdk_migration_verify import MemoryReadbackFailed
+
+    home = store.database_path.parent
+    current, _legacy = vector_collection_bases(active_profile)
+    client = _chroma(home)
+    _fill(client, f"{current}_512", ["m1", "m2"])
+    del client
+    _confirmed(store, "m1", "m2", "merged")
+
+    with pytest.raises(MemoryReadbackFailed) as caught:
+        run_startup_migration(
+            data_dir=home,
+            runtime_build="21",
+            sdk_version="2.0.5",
+            namespace="governed-v2",
+            open_client=_reading({"m1"}),
+        )
+    assert caught.value.report.as_document() == {
+        "chat_expected": 2,
+        "chat_readable": 1,
+        "productivity_expected": 0,
+        "productivity_readable": 0,
+        "chat_missing_before_migration": 1,
+        "passed": False,
+    }
     assert store.authority() is MemoryAuthority.LEGACY
 
 
@@ -956,13 +1124,13 @@ def test_pre_upgrade_unknown_writes_are_settled_at_cutover_not_retried(store):
     surviving = DurableWriteQueue(store.database_path, sdk_authority=True)
     assert surviving.unknown_jobs() == ()
     # Never requeued: they may already have written.
-    assert surviving.retry_unknown_confirmed(unknown[0]) == 0
+    assert surviving.recover_unknown() == 0
     assert surviving.readmit_parked() == 0
     assert PENDING not in {state for state, _, _ in rows.values()}
 
 
-def test_retrying_unknown_writes_works_after_the_legacy_tables_are_dropped(store):
-    """The retry button raised `no such table: memory_tasks` after an upgrade."""
+def test_recovering_unknown_writes_works_after_the_legacy_tables_are_dropped(store):
+    """The old retry button raised `no such table: memory_tasks` after an upgrade."""
     from one_memory.memory_server.durable_queue import PENDING, UNKNOWN
     from one_memory.target_schema import drop_legacy_tables
 
@@ -994,14 +1162,10 @@ def test_retrying_unknown_writes_works_after_the_legacy_tables_are_dropped(store
         surviving = DurableWriteQueue(store.database_path, sdk_authority=sdk_authority)
         make_unknown("model_content_outcome_unknown", 1)
         assert surviving.resolve_unknown_from_linked_output(identifier) is False
-        assert surviving.retry_unknown_confirmed(identifier) == 1
+        assert surviving.recover_unknown() == 1
         assert surviving.get("after-upgrade").state == PENDING
-
-        make_unknown("hy_memory_timeout", 1)
-        since = datetime.now(UTC)
-        assert surviving.retry_timed_out_unknown_after_reconcile(older_than=since) == 1
-        make_unknown("model_content_outcome_unknown", 1)
-        assert surviving.retry_first_unknown_after_reconcile(older_than=since) == 1
+        with main_database(store.database_path).write() as database, database:
+            database.execute("UPDATE memory_write_jobs SET retries=0 WHERE job_id=?", (identifier,))
         if sdk_authority:
             # The SDK-authority queue never brings a dropped table back.
             assert legacy_tables_present(store.database_path) == ()
@@ -1072,7 +1236,13 @@ def test_host_capture_is_fenced_for_the_whole_migration(store):
     )
 
     assert result.state == "cutover"
-    assert fenced == {"bundle": True, "prepare": True, "cutover": True, "cleanup": True}
+    assert fenced == {
+        "bundle": True,
+        "prepare": True,
+        "vectors": True,
+        "cutover": True,
+        "cleanup": True,
+    }
     assert not sdk_migration_capture_fenced(home)
 
 
@@ -1173,57 +1343,6 @@ def test_raw_http_dto_uses_the_unified_memory_list_shape():
     )
     assert page.raw[0].raw_id == "raw-1"
     assert page.raw[0].custom == {"role": "user"}
-
-
-def test_sdk_raw_retention_keeps_only_the_latest_three_days():
-    now = datetime(2026, 10, 23, tzinfo=UTC)
-
-    class Client:
-        def __init__(self):
-            self.rows = [
-                {
-                    "memory_id": "old",
-                    "memory_at": int((now - timedelta(days=4)).timestamp()),
-                },
-                {
-                    "memory_id": "recent",
-                    "memory_at": int((now - timedelta(days=2)).timestamp()),
-                },
-            ]
-
-        def list_memories(self, **_kwargs):
-            return {
-                "vdb": {
-                    "memories": list(self.rows),
-                    "total": len(self.rows),
-                    "limit": 500,
-                    "offset": 0,
-                }
-            }
-
-        def delete(self, memory_id):
-            before = len(self.rows)
-            self.rows = [row for row in self.rows if row["memory_id"] != memory_id]
-            return {
-                "success": True,
-                "deleted_count": before - len(self.rows),
-            }
-
-    client = Client()
-
-    class Handle:
-        async def client(self):
-            return client
-
-    runtime = SdkMemoryRuntime(
-        coordinator=None,
-        read_handle=Handle(),
-        write_queue=None,
-        extraction_settings=None,
-        data_dir=Path("."),
-    )
-    assert asyncio.run(runtime.prune_expired_raw(now=now)) == 1
-    assert [row["memory_id"] for row in client.rows] == ["recent"]
 
 
 # The UI asks which memory data plane is authoritative and must get the
@@ -1353,7 +1472,7 @@ def test_the_sdk_memory_map_draws_sdk_memories_without_legacy_tables(tmp_path) -
             original = app.state.sdk_client_handle
             app.state.sdk_client_handle = Handle()
 
-            async def graph_snapshot(*, limit):
+            async def graph_snapshot(*, limit, user_id="local"):
                 del limit
                 return HyGraphSnapshot(
                     nodes=(HyGraphNode(node_id="t1", content="topic", layer="TOPIC"),),
@@ -1494,7 +1613,7 @@ def test_a_completed_sdk_write_does_not_touch_retired_evidence(store) -> None:
     class Supervisor:
         async def process_sdk_job(self, records, *, request_id, before_hy_invocation):
             del records, request_id
-            await before_hy_invocation()
+            await before_hy_invocation(True)
             return SimpleNamespace(raw_ids=("raw-1",), memory_ids=("m-1",))
 
     asyncio.run(

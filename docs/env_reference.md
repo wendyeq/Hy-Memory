@@ -9,6 +9,7 @@
 |---|---|---|
 | `MEMORY_MODE` | `pro` | `lite` / `pro` / `ultra` |
 | `MEMORY_DATA_DIR` | `~/.hy_memory` | 本地数据、缓存和日志根目录 |
+| `MEMORY_LANGUAGE` | — | LLM 提示词与记忆正文语言：`en` / `zh-Hans` / `zh-Hant` / `ja` / `es` / `de` / `pt` / `fr` / `ko` / `ru` / `id`（别名 `zh`、`zh-CN` → `zh-Hans`，`zh-TW`、`zh-HK` → `zh-Hant`，`pt-BR` → `pt`）。未设置时按输入做 zh/en 自动检测；per-call `language=` 优先 |
 
 - `lite`：纯 Embedding 写入，Graph 强制关闭。
 - `pro`：LLM 提取与 reconcile；Graph 由 `MEMORY_ENABLE_GRAPH` 控制。
@@ -48,6 +49,7 @@
 | `MEMORY_EMBEDDER_TIMEOUT` | `15` | 单次超时，秒 |
 | `MEMORY_EMBEDDER_MAX_RETRIES` | `2` | 最大重试次数 |
 | `MEMORY_EMBEDDER_RETRY_DELAY` | `0.3` | 重试间隔，秒 |
+| `MEMORY_EMBEDDER_BATCH_SIZE` | `64` | `embed_batch` 单次请求最多发送的文本条数，超出按此切块 |
 | `MEMORY_EMBEDDER_EXTRA_HEADERS` | — | JSON object，附加 HTTP headers |
 | `MEMORY_EMBEDDER_EXTRA_BODY` | — | JSON object，附加请求 body |
 
@@ -180,8 +182,28 @@ SDK 不设置 Rerank Search 并发上限。开启后模型在 `HyMemoryClient` �
 | `MEMORY_RECALL_STRENGTH_TAU` | `180` | 衰减时间常数，天 |
 | `MEMORY_RECALL_ACCESS_TRACKING` | `true` | Strength 开启时是否回写访问信息 |
 | `MEMORY_ENTITY_STORE_ENABLED` | `false` | 是否维护独立 entity collection；当前 Reader 不直接读取 |
+| `MEMORY_INTENTION_DEDUP_ENABLED` | `true` | 是否对 L7 Intention 判重（读侧和写入侧批内）；见下文 |
+| `MEMORY_INTENTION_DEDUP_THRESHOLD` | `MEMORY_DEDUP_THRESHOLD`，再缺省为 `0.95` | Intention 读侧判重的 cosine 阈值 |
 
 旧数据可调用当前公开方法 `client.build_entity_store(user_id)` 补建 Entity Store。
+
+Intention 判重：开启时（默认，与以往行为一致），Search 召回的 L7 Intention 中，
+同 `user_id` + 同 `agent_id` + `memory_at` 同一天 + `valid_until` 相同、且 cosine ≥ 阈值的
+条目视为复本，只返回最早写入的一条，其余在后台从向量库**删除**。判重不区分内容中的项目、
+对象等语义差异，内容高度相似但对象不同的意图可能被误删；写入时同一批抽取结果也会做一次
+批内判重。关闭后这两处都不判重，不隐藏、不丢弃、也不删除意图。两项对应
+`MemoryConfig.recall.intention_dedup_enabled` /
+`recall.intention_dedup_threshold`，按 client 生效，环境变量只提供默认值：
+
+```python
+client = HyMemoryClient.from_config({
+    "recall": {"intention_dedup_enabled": False},
+})
+```
+
+`MEMORY_DEDUP_THRESHOLD` 同时被写入侧批内意图判重和 dedup 内核使用；
+`MEMORY_INTENTION_DEDUP_THRESHOLD` 只影响读侧 Intention 判重，写入侧批内判重的阈值
+仍取 `MEMORY_DEDUP_THRESHOLD`。
 
 ## 日志、Trace 与历史
 

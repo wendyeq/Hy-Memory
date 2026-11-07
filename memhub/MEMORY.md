@@ -13,8 +13,8 @@
    接口先补 SDK。Runtime writers 停止后的 App 启动迁移可直接操作底层存储，
    但不得把迁移专用方法加入公共 Client。
 3. MemHub **不存 memory 实体**；**可以存 `memory_id`** 做组织/回执。原文进入 **SDK raw**。
-4. SDK raw 只保留滚动三天；一条 raw 对应一个完整 turn，只含真人 user 与
-   assistant，tool 不持久化。提取后的高层 memory 不受该窗口影响。
+4. SDK raw 全部保留，任何模式（lite / pro / ultra）都不删除；一条 raw 对应一个
+   完整 turn，只含真人 user 与 assistant，tool 不持久化。
 5. `source_raw_ids` 是 SDK 内部溯源关系，不是产品 Evidence 合同；记忆详情不提供
    “原始依据”或按 raw ID 展开原文的入口。
 
@@ -136,6 +136,15 @@ memhub profile
 `memory_write_jobs`，worker 对 SDK 执行一次 `add()`，成功后清除队列正文。
 `user-profile` / `memhub profile` 调用 SDK `get_user_profile()`，返回组装后的
 用户长期画像，不通过普通 Search 拼装。
+
+读接口都回显 `user_id`（实际读的用户，未指定时为 `local`）：
+`GET /api/v2/memory-library`、`/memory-library/layers`、`/user-profile`、
+`/user-profile/versions`、`/home-summary`、`/memories/graph`、`/raw`，
+`POST /api/v2/context/search`、`/api/v1/recall`、`/api/v2/memories/ask`；
+`/memories/ask/stream` 写在第一个 `recall` 事件上。
+`DELETE /api/v2/memories/{id}` 只在删掉调用者自己的记忆时回 204；另一个用户的
+记忆和不存在的 ID 一律回 404 `memory_not_found`（不暴露是否存在），调用方按
+「已不存在」处理。
 
 返回值：
 

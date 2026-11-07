@@ -48,7 +48,41 @@ it("sizes the import action to its label and wraps footer content", () => {
   );
 });
 
-it("keeps progress cards content-sized and the step-two footer in normal flow", () => {
+it("uses content-driven shell, discovery and mode geometry", () => {
+  const stage = declaration("onboarding-r6.css", ".onboarding-r6-stage");
+  const shell = declaration("onboarding-r6.css", ".onboarding-r6-shell");
+  const discovery = declaration(
+    "onboarding-r6.css",
+    ".onboarding-r6-discovery",
+  );
+  const heading = declaration(
+    "onboarding-r6.css",
+    ".onboarding-r6-list-heading",
+  );
+  const mode = declaration("onboarding-r6.css", ".onboarding-r6-mode");
+
+  expect(stage).toMatch(/min-height:\s*0/);
+  expect(stage).not.toMatch(/min-height:\s*852px/);
+  expect(shell).toMatch(/height:\s*100%/);
+  expect(shell).not.toMatch(/(?:^|;)\s*height:\s*820px/);
+  expect(discovery).toMatch(/height:\s*100%/);
+  expect(heading).toMatch(/position:\s*static/);
+  expect(mode).toMatch(/width:\s*100%/);
+});
+
+it("does not reserve an empty eyebrow row", () => {
+  render(
+    <LanguageProvider>
+      <R6ColdStartFrame step={1} title="Fixture" footer={null}>
+        <p>Fixture body</p>
+      </R6ColdStartFrame>
+    </LanguageProvider>,
+  );
+  expect(screen.getByRole("heading", { name: "Fixture" })).toBeTruthy();
+  expect(screen.queryByText("你的记忆，从这里接上")).toBeNull();
+});
+
+it("keeps the v1.0.4 step-two split layout and progress geometry", () => {
   const card = declaration(
     "r6-import-progress.css",
     ".r6-import-progress-card",
@@ -60,13 +94,12 @@ it("keeps progress cards content-sized and the step-two footer in normal flow", 
       "first-import-r6.css",
       ".first-import-r6-main > .r6-import-progress",
     ),
-  ).toMatch(/flex:\s*0 0 auto/);
-  expect(declaration("first-import-r6.css", ".first-import-r6-layout")).toMatch(
-    /height:\s*auto/,
+  ).toMatch(/flex:\s*0 0 218px/);
+  const layout = declaration("first-import-r6.css", ".first-import-r6-layout");
+  expect(layout).toMatch(
+    /grid-template-columns:\s*minmax\(0,\s*738px\)\s+278px/,
   );
-  expect(
-    declaration("first-import-r6.css", ".first-import-r6-footer-note"),
-  ).not.toMatch(/max-height|overflow/);
+  expect(layout).toMatch(/height:\s*560\.2px/);
   expect(declaration("onboarding-r6.css", ".onboarding-r6-body")).toMatch(
     /overflow-y:\s*auto/,
   );
@@ -85,6 +118,26 @@ it("removes the duplicate native drag overlay above the language selector", () =
       ".onboarding-r6-titlebar .r6-language-selector--compact",
     ),
   ).toMatch(/-webkit-app-region:\s*no-drag/);
+});
+
+it("keeps long language names on one line in the fixed-size selectors", () => {
+  // "Utiliser la langue du système", "Systemsprache verwenden" and
+  // "Bahasa Indonesia" are wider than the 144px title-bar button.
+  for (const [file, selector] of [
+    [
+      "onboarding-r6.css",
+      ".onboarding-r6-titlebar .r6-language-option-menu .om-option-menu-button",
+    ],
+    [
+      "r6-settings.css",
+      ".r6-settings .r6-language-option-menu .om-option-menu-button",
+    ],
+  ] as const) {
+    const rule = declaration(file, selector);
+    expect(rule, selector).toMatch(/white-space:\s*nowrap/);
+    expect(rule, selector).toMatch(/text-overflow:\s*ellipsis/);
+    expect(rule, selector).toMatch(/overflow:\s*hidden/);
+  }
 });
 
 it("keeps selection status outside decorative fades and readable when disabled", () => {
@@ -122,7 +175,7 @@ it("keeps the product language menu keyboard-focusable and switches both languag
   expect(screen.getByRole("combobox").getAttribute("id")).toBe(selector.id);
   await user.click(selector);
   await user.click(screen.getByRole("option", { name: "简体中文" }));
-  expect(document.documentElement.lang).toBe("zh-CN");
+  expect(document.documentElement.lang).toBe("zh-Hans");
   expect(screen.getByRole("combobox", { name: "界面语言" })).toBe(selector);
 });
 
@@ -146,7 +199,7 @@ it.each([1, 2, 3] as const)(
     await userEvent.click(selector);
     expect(
       screen.getByRole("option", { name: "简体中文" }).getAttribute("lang"),
-    ).toBe("zh-CN");
+    ).toBe("zh-Hans");
     expect(
       screen.getByRole("option", { name: "Español" }).getAttribute("lang"),
     ).toBe("es");

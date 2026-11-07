@@ -11,6 +11,10 @@ import {
   currentSpanishMessages,
 } from "./gui-i18n-current.js";
 import {
+  embeddingSwitchChineseMessages,
+  embeddingSwitchSpanishMessages,
+} from "./gui-i18n-embedding-switch.js";
+import {
   guideChineseMessages,
   guideSpanishMessages,
 } from "./gui-i18n-guide.js";
@@ -22,6 +26,11 @@ import {
   memoryChineseMessages,
   memorySpanishMessages,
 } from "./gui-i18n-memory.js";
+import {
+  migrationChineseMessages,
+  migrationSpanishMessages,
+} from "./gui-i18n-migration.js";
+import { modeChineseMessages, modeSpanishMessages } from "./gui-i18n-mode.js";
 import {
   onboardingChineseMessages,
   onboardingSpanishMessages,
@@ -91,6 +100,11 @@ export const guiCatalogs: readonly Catalog[] = [
     spanish: currentSpanishMessages,
   },
   {
+    name: "embedding-switch",
+    chinese: embeddingSwitchChineseMessages,
+    spanish: embeddingSwitchSpanishMessages,
+  },
+  {
     name: "workbench",
     chinese: workbenchChineseMessages,
     spanish: workbenchSpanishMessages,
@@ -121,6 +135,11 @@ export const guiCatalogs: readonly Catalog[] = [
     spanish: onboardingSpanishMessages,
   },
   {
+    name: "mode",
+    chinese: modeChineseMessages,
+    spanish: modeSpanishMessages,
+  },
+  {
     name: "applications",
     chinese: applicationsChineseMessages,
     spanish: applicationsSpanishMessages,
@@ -139,6 +158,11 @@ export const guiCatalogs: readonly Catalog[] = [
     name: "language",
     chinese: languageChineseMessages,
     spanish: languageSpanishMessages,
+  },
+  {
+    name: "migration",
+    chinese: migrationChineseMessages,
+    spanish: migrationSpanishMessages,
   },
 ];
 
@@ -172,14 +196,17 @@ const merged = mergeCatalogs(guiCatalogs);
 
 /** The complete Chinese GUI catalog defines the supported message keys. */
 export const chineseMessages = merged.chinese as typeof guideChineseMessages &
+  typeof embeddingSwitchChineseMessages &
   typeof healthChineseMessages &
   typeof recoveryChineseMessages &
   typeof settingsChineseMessages &
   typeof onboardingChineseMessages &
+  typeof modeChineseMessages &
   typeof applicationsChineseMessages &
   typeof memoryChineseMessages &
   typeof callsChineseMessages &
   typeof languageChineseMessages &
+  typeof migrationChineseMessages &
   typeof workbenchChineseMessages &
   typeof currentChineseMessages;
 

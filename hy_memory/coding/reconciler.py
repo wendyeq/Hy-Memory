@@ -7,6 +7,9 @@ Coding Memory Reconciler
         （DELETE 由 LLM 在 draft 与 candidate 关系中观察到"明确否定/作废"时附带产出）
 
 执行端：reconcile() 调用 store 完成实际 ADD / UPDATE / DELETE 持久化操作。
+CodingWriter 分两步用：先 plan()（检索 + LLM 决策，不落库），等经验层与事实层的
+模型决策都成功后再 apply()（落库）。LLM 失败 / 空回复 / 解析不出时 plan() 抛
+CodingWriteError(RECONCILE_FAILED)，本次写入什么都不存。
 
 复用 LLMConfig.model（与 chat reconciler 共用）。
 
@@ -17,14 +20,20 @@ import json
 import logging
 import time
 import uuid
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..agent.llm_provider import LLMProvider
 from ..core.embed_service import EmbedService
-from ..utils.lang_detect import is_chinese
+from ..prompts import (
+    get_prompt,
+    normalize_language,
+    resolve_language,
+    with_output_language,
+)
 from .judge import _store_coding_log
 from .store import CodingMemoryStore
-from .types import CodingMemory, CodingMemoryDraft, ReconcileOp
+from .types import CodingMemory, CodingMemoryDraft, CodingWriteError, ReconcileOp
 
 
 
@@ -50,57 +59,7 @@ def _resolve_configured_temperature(llm_provider) -> Optional[float]:
 # Prompt
 # ================================================================
 
-RECONCILE_PROMPT = """\
-You decide how to merge new coding memory drafts with the user's existing memories.
-
-For each new draft, decide one of:
-  ADD     — no existing memory describes the same task/aspect
-  UPDATE  — an existing memory describes the same task; the new draft replaces it
-            (solution may have changed, env may have upgraded, etc.)
-  SKIP    — duplicate of existing; nothing new
-
-Additionally, you may emit DELETE ops on existing candidates when the new
-content makes them obsolete or invalid:
-  DELETE  — the new conversation EXPLICITLY supersedes/cancels/invalidates an
-            existing memory that cannot be repaired via UPDATE. Examples:
-              * user says "don't use X anymore" and X is only present as a
-                separate memory (not the one being added/updated)
-              * candidate's boundary_envs (service / endpoint / SDK) is gone
-                and the new conversation confirms the deprecation
-
-Rules:
-- "Same task" means the existing memory and the new draft would both be valid
-  answers to the same future user query.
-- If solution differs, prefer UPDATE (we don't keep history).
-- If both task and solution match closely, SKIP.
-- DELETE only when there is EXPLICIT evidence the candidate is invalid/obsolete.
-  Never DELETE just because a candidate looks "stale".
-- Output ops can outnumber drafts when DELETEs are produced.
-
-═══════════════════════════════════════════════════════════════════
-NEW DRAFTS
-═══════════════════════════════════════════════════════════════════
-{drafts_block}
-
-═══════════════════════════════════════════════════════════════════
-EXISTING CANDIDATES (per draft, retrieved by task similarity)
-═══════════════════════════════════════════════════════════════════
-{candidates_block}
-
-═══════════════════════════════════════════════════════════════════
-OUTPUT (strict JSON only, no markdown)
-═══════════════════════════════════════════════════════════════════
-{{
-  "ops": [
-    {{"draft_idx": 0, "action": "ADD"}},
-    {{"draft_idx": 1, "action": "UPDATE", "target_experience_id": "exp_xxx", "reason": "..."}},
-    {{"draft_idx": 1, "action": "DELETE", "target_experience_id": "exp_yyy", "reason": "user explicitly deprecated Y"}},
-    {{"draft_idx": 2, "action": "SKIP",   "reason": "duplicate"}}
-  ]
-}}
-
-If there are no drafts, output {{"ops": []}}.
-"""
+from ..prompts.en import CODING_RECONCILE_PROMPT as RECONCILE_PROMPT  # noqa: E402,F401  (re-export)
 
 
 def _drafts_language_text(drafts: List[CodingMemoryDraft]) -> str:
@@ -119,24 +78,32 @@ def _drafts_language_text(drafts: List[CodingMemoryDraft]) -> str:
 def build_experience_reconcile_prompt(
     drafts: List[CodingMemoryDraft],
     candidates_per_draft: List[List[CodingMemory]],
+    language: Optional[str] = None,
 ) -> Tuple[str, str]:
-    """Return the language-matched experience reconcile prompt and language."""
+    """Return the experience reconcile prompt and its language code.
+
+    Explicit ``language`` wins; otherwise zh/en auto-detection over the drafts.
+    """
     drafts_block = CodingMemoryReconciler._format_drafts(drafts)
     candidates_block = CodingMemoryReconciler._format_candidates(
         drafts, candidates_per_draft,
     )
-    if is_chinese(_drafts_language_text(drafts)):
-        from .prompts_zh import RECONCILE_PROMPT_ZH
-
-        template = RECONCILE_PROMPT_ZH
-        language = "zh"
-    else:
-        template = RECONCILE_PROMPT
-        language = "en"
-    return template.format(
+    explicit = normalize_language(language)
+    code = resolve_language(explicit, _drafts_language_text(drafts))
+    prompt = get_prompt("CODING_RECONCILE_PROMPT", code).format(
         drafts_block=drafts_block,
         candidates_block=candidates_block,
-    ), language
+    )
+    return with_output_language(prompt, code, explicit=explicit is not None), code
+
+
+@dataclass
+class ExperienceReconcilePlan:
+    """plan() 的产物：模型已决策、尚未落库。apply() 才执行 store 操作。"""
+
+    drafts: List[CodingMemoryDraft]
+    candidates_per_draft: List[List[CodingMemory]] = field(default_factory=list)
+    ops: List[ReconcileOp] = field(default_factory=list)
 
 
 # ================================================================
@@ -186,23 +153,55 @@ class CodingMemoryReconciler:
         user_id: str = "",
         agent_id: str = "default_agent",
         session_id: str = "",
+        language: Optional[str] = None,
     ) -> List[ReconcileOp]:
         """
-        执行 reconcile + 持久化。返回执行的 ReconcileOp[]（含成功执行的 ADD/UPDATE/DELETE/SKIP）。
+        执行 reconcile + 持久化（plan() 后紧接 apply()）。返回执行的 ReconcileOp[]
+        （含成功执行的 ADD/UPDATE/DELETE/SKIP）。
 
-        执行错误（如 LLM 失败）会 fail-safe 回退到对每个 draft 直接 ADD。
+        LLM 失败、空回复或解析不出时抛 CodingWriteError(RECONCILE_FAILED)，什么都
+        不落库——不再回退成「全部 ADD」。
+        """
+        plan = await self.plan(
+            drafts,
+            request_id=request_id,
+            user_id=user_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            language=language,
+        )
+        return await self.apply(plan)
 
-        cache 非空时落 CODING_RECONCILE pipeline log——在 LLM 决策后、执行入库前打点，
-        这样即使 store 入库崩溃，reconcile 决策仍已可见（crash 不丢）。
+    async def plan(
+        self,
+        drafts: List[CodingMemoryDraft],
+        *,
+        request_id: str = "",
+        user_id: str = "",
+        agent_id: str = "default_agent",
+        session_id: str = "",
+        language: Optional[str] = None,
+    ) -> ExperienceReconcilePlan:
+        """检索 candidates + LLM 决策，不落库。
+
+        有效回复 = 一个 JSON 对象，其 "ops" 是列表：
+          - {"ops": []}：模型判定「无需任何操作」（与 chat reconcile 的 [] 同义），
+            成功、本层什么都不存；
+          - 非空列表：至少要有一条可识别的 op（ADD/UPDATE/DELETE/SKIP），否则视为
+            解析失败。漏掉的 draft 仍按原规则补 ADD（那是对有效回复的校验兜底，
+            不是模型失败兜底）。
+        LLM 调用失败（LLM_UNAVAILABLE）、200 但 content 为空（EMPTY_RESPONSE）、
+        回复不是上述形状（JSON_PARSE_FAILED）时抛 CodingWriteError(RECONCILE_FAILED)。
+
+        cache 非空时落 CODING_RECONCILE pipeline log（成功、失败都落）。
         """
         if not drafts:
-            return []
+            return ExperienceReconcilePlan(drafts=[])
 
         # 从 draft 回填 trace 身份（writer 通常显式传，这里兜底）
-        if drafts:
-            user_id = user_id or drafts[0].user_id
-            agent_id = agent_id or drafts[0].agent_id
-            session_id = session_id or (drafts[0].session_id or "")
+        user_id = user_id or drafts[0].user_id
+        agent_id = agent_id or drafts[0].agent_id
+        session_id = session_id or (drafts[0].session_id or "")
 
         # 1. 检索 candidates
         candidates_per_draft: List[List[CodingMemory]] = await self._retrieve_candidates(drafts)
@@ -212,19 +211,20 @@ class CodingMemoryReconciler:
         _decide_prompt = ""
         _decide_raw = ""
         _decide_resp = None
+        failure: Optional[Tuple[str, str]] = None
+        ops: List[ReconcileOp] = []
         try:
             ops, _decide_prompt, _decide_raw, _decide_resp = await self._llm_decide(
-                drafts, candidates_per_draft
+                drafts, candidates_per_draft, language=language,
             )
+            failure = self._reply_failure(_decide_raw)
         except Exception as e:
-            logger.warning(f"[coding-reconcile] LLM decide failed, fallback to ADD-all: {e}")
-            ops = [ReconcileOp(action="ADD", draft_idx=i) for i in range(len(drafts))]
+            logger.warning(f"[coding-reconcile] LLM decide failed: {e}")
             _decide_raw = f"[LLM error] {type(e).__name__}: {str(e)[:300]}"
-
-        if not ops:
-            # LLM 输出无 ops，但有 drafts → fallback ADD-all
-            logger.info("[coding-reconcile] LLM returned no ops, fallback to ADD-all")
-            ops = [ReconcileOp(action="ADD", draft_idx=i) for i in range(len(drafts))]
+            failure = (
+                "LLM_UNAVAILABLE",
+                f"coding reconcile LLM call failed: {type(e).__name__}: {e}",
+            )
 
         _decide_elapsed = round((time.perf_counter() - _t0) * 1000, 2)
         # CODING_RECONCILE：LLM 决策完成即打点（执行入库之前，crash 不丢）
@@ -232,17 +232,42 @@ class CodingMemoryReconciler:
             self.cache, request_id=request_id, user_id=user_id, agent_id=agent_id,
             session_id=session_id, step="CODING_RECONCILE",
             prompt=_decide_prompt, response=_decide_raw,
-            parsed=json.dumps({"ops": [o.to_dict() for o in ops]}, ensure_ascii=False, default=str),
+            parsed=json.dumps(
+                {"error": failure[0], "message": failure[1], "stored": 0}
+                if failure else {"ops": [o.to_dict() for o in ops]},
+                ensure_ascii=False, default=str,
+            ),
             elapsed_ms=_decide_elapsed,
             prompt_tokens=getattr(_decide_resp, "prompt_tokens", 0) if _decide_resp else 0,
             completion_tokens=getattr(_decide_resp, "completion_tokens", 0) if _decide_resp else 0,
             total_tokens=getattr(_decide_resp, "tokens_used", 0) if _decide_resp else 0,
         )
+        if failure is not None:
+            code, message = failure
+            logger.warning(f"[coding-reconcile] {code}: {message}")
+            raise CodingWriteError("RECONCILE_FAILED", message, cause=code)
 
-        # 3. 校验 + 执行
-        executed = await self._execute(ops, drafts, candidates_per_draft)
+        return ExperienceReconcilePlan(
+            drafts=list(drafts),
+            candidates_per_draft=candidates_per_draft,
+            ops=ops,
+        )
+
+    async def apply(self, plan: ExperienceReconcilePlan) -> List[ReconcileOp]:
+        """执行 plan() 的决策（store ADD / UPDATE / DELETE）。"""
+        if not plan.drafts:
+            return []
+        if not plan.ops:
+            # 有效的 {"ops": []}：模型判定无需任何操作，本层什么都不存。
+            logger.info(
+                f"[coding-reconcile] drafts={len(plan.drafts)} LLM decided no ops"
+            )
+            return []
+        executed = await self._execute(
+            plan.ops, plan.drafts, plan.candidates_per_draft,
+        )
         logger.info(
-            f"[coding-reconcile] drafts={len(drafts)} ops={len(executed)} "
+            f"[coding-reconcile] drafts={len(plan.drafts)} ops={len(executed)} "
             + ", ".join(f"{a}={sum(1 for o in executed if o.action == a)}"
                         for a in ("ADD", "UPDATE", "DELETE", "SKIP"))
         )
@@ -311,9 +336,12 @@ class CodingMemoryReconciler:
         self,
         drafts: List[CodingMemoryDraft],
         candidates_per_draft: List[List[CodingMemory]],
+        language: Optional[str] = None,
     ) -> Tuple[List[ReconcileOp], str, str, Any]:
         """返回 (ops, prompt, raw_response, llm_resp)，供上层打 CODING_RECONCILE log。"""
-        prompt, _ = build_experience_reconcile_prompt(drafts, candidates_per_draft)
+        prompt, _ = build_experience_reconcile_prompt(
+            drafts, candidates_per_draft, language=language,
+        )
 
         resp = await self.llm_provider.complete(
             prompt=prompt,
@@ -358,11 +386,30 @@ class CodingMemoryReconciler:
             rows.append(f"for draft[{i}]:\n" + "\n".join(cand_rows))
         return "\n\n".join(rows) if rows else "(none)"
 
+    @classmethod
+    def _reply_failure(cls, text: Optional[str]) -> Optional[Tuple[str, str]]:
+        """回复本身是失败时返回 (cause, message)；有效回复（含 {"ops": []}）返回 None。"""
+        if not (text or "").strip():
+            return "EMPTY_RESPONSE", "coding reconcile LLM returned empty response"
+        obj = cls._load_object(text)
+        ops_raw = obj.get("ops") if isinstance(obj, dict) else None
+        if not isinstance(ops_raw, list):
+            return (
+                "JSON_PARSE_FAILED",
+                f"coding reconcile output has no ops list ({len(text)} chars)",
+            )
+        if ops_raw and not cls._parse_ops(text):
+            return (
+                "JSON_PARSE_FAILED",
+                f"coding reconcile output has no recognizable op ({len(text)} chars)",
+            )
+        return None
+
     @staticmethod
-    def _parse_ops(text: str) -> List[ReconcileOp]:
-        """宽松解析 ops 列表。"""
+    def _load_object(text: Optional[str]) -> Optional[Dict[str, Any]]:
+        """宽松解析出顶层 JSON 对象；解析不出返回 None。"""
         if not text:
-            return []
+            return None
         s = text.strip()
         # 去 markdown fence
         if s.startswith("```"):
@@ -386,8 +433,15 @@ class CodingMemoryReconciler:
                     obj = json.loads(s[start: end + 1])
                 except Exception:
                     obj = None
+        return obj if isinstance(obj, dict) else None
 
-        if not obj or not isinstance(obj, dict):
+    @classmethod
+    def _parse_ops(cls, text: str) -> List[ReconcileOp]:
+        """宽松解析 ops 列表。"""
+        if not text:
+            return []
+        obj = cls._load_object(text)
+        if not obj:
             logger.warning(
                 f"[coding-reconcile] failed to parse ops output ({len(text or '')} chars)"
             )
@@ -436,6 +490,9 @@ class CodingMemoryReconciler:
         - UPDATE  需 draft_idx 合法 + target_experience_id 非空
         - DELETE  需 target_experience_id 非空
         - SKIP    不执行任何 store 操作
+
+        向量化失败（CodingWriteError(EMBEDDING_FAILED)）不吞成「少执行一条」，
+        原样抛给 CodingWriter，整次写入报失败。
         """
         executed: List[ReconcileOp] = []
         # 已被 UPDATE 占用的 draft_idx → 防止同 draft 被重复 ADD/UPDATE
@@ -456,6 +513,8 @@ class CodingMemoryReconciler:
                     op.target_experience_id = memory.experience_id  # 回写 id 供 caller 读
                     executed.append(op)
                     consumed.add(op.draft_idx)
+                except CodingWriteError:
+                    raise
                 except Exception as e:
                     logger.warning(f"[coding-reconcile] ADD failed: {e}")
 
@@ -486,6 +545,8 @@ class CodingMemoryReconciler:
                     await self.store.update(memory)
                     executed.append(op)
                     consumed.add(op.draft_idx)
+                except CodingWriteError:
+                    raise
                 except Exception as e:
                     logger.warning(f"[coding-reconcile] UPDATE failed: {e}")
 
@@ -529,6 +590,8 @@ class CodingMemoryReconciler:
                     target_experience_id=memory.experience_id,
                     reason="fallback ADD (no LLM op)",
                 ))
+            except CodingWriteError:
+                raise
             except Exception as e:
                 logger.warning(f"[coding-reconcile] fallback ADD failed: {e}")
 

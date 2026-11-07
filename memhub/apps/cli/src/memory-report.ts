@@ -14,6 +14,25 @@ import { type CoreReader, RESERVED_MEMORY_SEGMENTS } from "./core-client.js";
 import type { CoreOperations } from "./core-operations.js";
 import { PRODUCT } from "./version.js";
 
+/** A MemHub user id, the same shape Core accepts. `local` is the default. */
+const USER_ID = /^[A-Za-z0-9._-]{1,64}$/;
+export const DEFAULT_USER_ID = "local";
+
+export function isUserId(value: string): boolean {
+  return USER_ID.test(value);
+}
+
+/**
+ * The `user_id` to send, or nothing. The default user is never named on the
+ * wire, so a request without `--user-id` stays exactly what it was before
+ * multi-user support and still works against an older Core.
+ */
+export function userIdParameters(userId?: string): { user_id?: string } {
+  return userId === undefined || userId === DEFAULT_USER_ID
+    ? {}
+    : { user_id: userId };
+}
+
 /** Output budget: a long memory is shortened visibly, never dropped silently. */
 const CONTENT_BUDGET = 240;
 
@@ -101,10 +120,12 @@ export interface MemoryDetailDocument {
 export async function readMemoryPage(
   reader: CoreReader,
   query: MemoryQuery,
+  userId?: string,
 ): Promise<MemoryPageDocument> {
   const parameters: Record<string, string | number> = {
     offset: query.offset,
     limit: query.limit,
+    ...userIdParameters(userId),
   };
   if (query.status !== undefined) parameters.statuses = query.status;
   if (query.source !== undefined) parameters.source = query.source;
@@ -156,8 +177,12 @@ export async function readMemoryDetail(
   reader: CoreReader,
   memoryId: string,
   namespace: MemoryNamespace = {},
+  userId?: string,
 ): Promise<MemoryDetailDocument> {
-  const parameters = namespaceParameters(namespace);
+  const parameters = {
+    ...namespaceParameters(namespace),
+    ...userIdParameters(userId),
+  };
   const outcome = await reader<unknown>(
     `/api/v2/memories/${memoryId}`,
     Object.keys(parameters).length > 0 ? parameters : undefined,
@@ -223,6 +248,10 @@ function addReceipt(receipt: MemoryAddReceipt): Record<string, unknown> {
     task_id: receipt.task_id,
     memory_ids: receipt.memory_ids,
     error: receipt.error,
+    error_code:
+      typeof receipt.error_code === "string" ? receipt.error_code : null,
+    next_retry_at:
+      typeof receipt.next_retry_at === "string" ? receipt.next_retry_at : null,
   };
 }
 
@@ -236,6 +265,7 @@ export async function addMemory(
   operations: CoreOperations,
   text: string,
   requestId: string = randomUUID(),
+  userId?: string,
 ): Promise<MemoryAddDocument> {
   const base = {
     schema_version: 2 as const,
@@ -259,7 +289,10 @@ export async function addMemory(
     }
     throw error;
   }
-  const result = await operations.post<unknown>(request.path, request.body);
+  const result = await operations.post<unknown>(request.path, {
+    ...request.body,
+    ...userIdParameters(userId),
+  });
   if (result.state !== "committed") {
     return { ...base, state: result.state, code: result.code };
   }
@@ -273,6 +306,7 @@ export async function addMemory(
 export async function readMemoryAddStatus(
   reader: CoreReader,
   requestId: string,
+  userId?: string,
 ): Promise<MemoryAddDocument> {
   const base = {
     schema_version: 2 as const,
@@ -283,7 +317,11 @@ export async function readMemoryAddStatus(
   if (!UUID.test(requestId)) {
     return { ...base, state: "invalid", code: "invalid_request_id" };
   }
-  const outcome = await reader<unknown>(memoryAddStatusPath(requestId));
+  const user = userIdParameters(userId);
+  const outcome =
+    user.user_id === undefined
+      ? await reader<unknown>(memoryAddStatusPath(requestId))
+      : await reader<unknown>(memoryAddStatusPath(requestId), user);
   if (outcome.state === "not_found") {
     return { ...base, state: "not_found", code: "memory_add_not_found" };
   }
@@ -313,6 +351,12 @@ export function renderMemoryAddText(document: MemoryAddDocument): string {
       ...((document.receipt.memory_ids as string[]).length > 0
         ? [`memory_ids: ${(document.receipt.memory_ids as string[]).join(",")}`]
         : []),
+      ...(document.receipt.error_code
+        ? [`error_code: ${document.receipt.error_code}`]
+        : []),
+      ...(document.receipt.next_retry_at
+        ? [`next_retry_at: ${document.receipt.next_retry_at}`]
+        : []),
       document.command === "memories add"
         ? `查询进度：memhub memories add-status ${document.request_id}；重试请带上同一个 --request-id，不会重复添加。`
         : "",
@@ -338,6 +382,9 @@ export function renderMemoryAddText(document: MemoryAddDocument): string {
 export function renderMemoryPageText(document: MemoryPageDocument): string {
   const page = document.page;
   if (page.state !== "ok") {
+    if (page.state === "unavailable" && page.code === "embedding_unavailable") {
+      return "向量服务不可用，无法检索；请检查向量模型配置。\n";
+    }
     if (page.state === "unavailable") {
       return "后台正忙，记忆列表这次没查完，不代表没有记忆，请稍后再试\n";
     }

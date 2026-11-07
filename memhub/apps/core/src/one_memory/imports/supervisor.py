@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
+from functools import partial
 from time import monotonic
 from typing import Literal
 
@@ -24,6 +25,7 @@ from one_memory.service_levels import (
     ServiceLevelScheduler,
     ServiceResource,
 )
+from one_memory.user_scope import lane_key, split_lane
 
 
 class UnknownSourceError(KeyError):
@@ -81,12 +83,22 @@ class ImportSupervisor:
         )
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._drains: dict[str, asyncio.Task[None]] = {}
+        #: Pause and cancel settle a stopped job with a read and a transition.
+        #: Made on the loop, two of them could not interleave; made off it,
+        #: they are serialized here so they still land in the order they woke.
+        self._settling = asyncio.Lock()
 
-    def register_adapter(self, adapter: SourceAdapter) -> None:
-        self.adapters[adapter.descriptor.source_id] = adapter
+    def register_adapter(self, adapter: SourceAdapter, *, user_id: str = "local") -> None:
+        """Adapters are keyed by lane: the source id for `local`, `source@user`
+        for another user's grant of the same source."""
+        self.adapters[lane_key(user_id, adapter.descriptor.source_id)] = adapter
 
     def unregister_adapter(self, source_id: str) -> None:
         self.adapters.pop(source_id, None)
+
+    @staticmethod
+    def lane_of(job: ImportJob) -> str:
+        return lane_key(job.user_id, job.source_id)
 
     def active_job_ids(self) -> frozenset[str]:
         return frozenset(job_id for job_id, task in self._tasks.items() if not task.done())
@@ -94,11 +106,13 @@ class ImportSupervisor:
     def create_job(
         self, source_id: str, *, operation: Literal["history", "sync"] = "history"
     ) -> ImportJob:
+        """`source_id` is a lane key: another user's lane creates that user's job."""
         if self.source_enabled is not None and not self.source_enabled(source_id):
             raise SourceAccessError(SourceAccessErrorCode.GRANT_REQUIRED)
+        user_id, bare_source_id = split_lane(source_id)
         return self.job_store.create(
-            user_id="local",
-            source_id=source_id,
+            user_id=user_id,
+            source_id=bare_source_id,
             operation=operation,
             history_intent="explicit" if operation == "history" else None,
         )
@@ -107,16 +121,50 @@ class ImportSupervisor:
         if job_id in self._drains:
             raise InvalidJobTransitionError("import_cleanup_in_progress")
         job = self.job_store.require(job_id)
-        if job.source_id not in self.adapters:
-            raise UnknownSourceError(job.source_id)
-        if self.source_enabled is not None and not self.source_enabled(job.source_id):
+        lane = self.lane_of(job)
+        if lane not in self.adapters:
+            raise UnknownSourceError(lane)
+        if self.source_enabled is not None and not self.source_enabled(lane):
             return job
-        existing = self._tasks.get(job_id)
+        self._start(job)
+        return job
+
+    async def enqueue_off_loop(self, job_id: str, *, job: ImportJob | None = None) -> ImportJob:
+        """`enqueue`, with its job read and its grant check made off the loop.
+
+        Both are database reads, and the grant check resolves the source root
+        on disk. Live sync enqueues from its poll, so on the loop they were
+        the main thread waiting for a reader behind an import peak. `job` is
+        the row the caller has just read, when it has one.
+        """
+        if job_id in self._drains:
+            raise InvalidJobTransitionError("import_cleanup_in_progress")
+
+        def admit() -> tuple[ImportJob, bool]:
+            current = job if job is not None and job.job_id == job_id else None
+            if current is None:
+                current = self.job_store.require(job_id)
+            lane = self.lane_of(current)
+            return current, self.source_enabled is None or self.source_enabled(lane)
+
+        current, enabled = await in_the_background(admit)
+        lane = self.lane_of(current)
+        if lane not in self.adapters:
+            raise UnknownSourceError(lane)
+        if job_id in self._drains:
+            raise InvalidJobTransitionError("import_cleanup_in_progress")
+        if enabled:
+            self._start(current)
+        return current
+
+    def _start(self, job: ImportJob) -> None:
+        lane = self.lane_of(job)
+        existing = self._tasks.get(job.job_id)
         if existing is None or existing.done():
-            self._tasks[job_id] = asyncio.create_task(
+            self._tasks[job.job_id] = asyncio.create_task(
                 self._execute(
-                    job_id,
-                    source_id=job.source_id,
+                    job.job_id,
+                    source_id=lane,
                     operation=job.operation,
                 )
             )
@@ -125,18 +173,34 @@ class ImportSupervisor:
                 component="import.supervisor",
                 event="import.queued",
                 outcome="queued",
-                job_id=job_id,
+                job_id=job.job_id,
                 details={"source_id": job.source_id, "mode": job.operation},
             )
-        return job
+
+    async def resume_interrupted_off_loop(self) -> None:
+        """`resume_interrupted` for the running Core: every read and write off the loop."""
+        for status in (ImportStatus.INTERRUPTED, ImportStatus.PENDING):
+            jobs = await in_the_background(partial(self.job_store.find_jobs, statuses=(status,)))
+            for job in jobs:
+                if self.lane_of(job) not in self.adapters:
+                    continue
+                if job.status is not ImportStatus.PENDING:
+                    if self.source_enabled is not None and not await in_the_background(
+                        self.source_enabled, self.lane_of(job)
+                    ):
+                        continue
+                    job = await in_the_background(self.job_store.queue_for_resume, job.job_id)
+                await self.enqueue_off_loop(job.job_id, job=job)
 
     def resume_interrupted(self) -> None:
         # A process restart must not place recoverable work behind every newly
         # pending history. Each resumed runner will yield after one bounded slice.
         for status in (ImportStatus.INTERRUPTED, ImportStatus.PENDING):
             for job in self.job_store.list_jobs(status=status):
-                if job.source_id in self.adapters:
-                    if self.source_enabled is not None and not self.source_enabled(job.source_id):
+                if self.lane_of(job) in self.adapters:
+                    if self.source_enabled is not None and not self.source_enabled(
+                        self.lane_of(job)
+                    ):
                         continue
                     if job.status is not ImportStatus.PENDING:
                         self.job_store.queue_for_resume(job.job_id)
@@ -159,40 +223,64 @@ class ImportSupervisor:
         self.enqueue(job_id)
         return queued
 
+    async def resume_off_loop(self, job_id: str) -> ImportJob:
+        """`resume`, with its reads and its write made off the event loop."""
+        if job_id in self._drains:
+            raise InvalidJobTransitionError("import_cleanup_in_progress")
+        queued = await in_the_background(self._queue_resumable, job_id)
+        if queued.status is not ImportStatus.PENDING:
+            return queued
+        return await self.enqueue_off_loop(job_id, job=queued)
+
+    def _queue_resumable(self, job_id: str) -> ImportJob:
+        job = self.job_store.require(job_id)
+        if job.status not in {
+            ImportStatus.PENDING,
+            ImportStatus.PAUSED,
+            ImportStatus.INTERRUPTED,
+            ImportStatus.FAILED,
+        }:
+            return job
+        return self.job_store.queue_for_resume(job_id)
+
     async def wait(self, job_id: str) -> ImportJob:
         task = self._tasks.get(job_id)
         if task is not None:
             await asyncio.shield(task)
-        return self.job_store.require(job_id)
+        return await in_the_background(self.job_store.require, job_id)
 
     async def pause(self, job_id: str) -> ImportJob:
-        job = self.job_store.require(job_id)
+        job = await in_the_background(self.job_store.require, job_id)
         if job.status in {ImportStatus.PAUSED, ImportStatus.INTERRUPTED}:
             return job
         await self._cancel_task(job_id)
-        current = self.job_store.require(job_id)
-        if current.status is ImportStatus.COMPLETED:
-            return current
-        return self.job_store.transition(job_id, ImportStatus.PAUSED)
+        async with self._settling:
+            return await in_the_background(self._settle_stopped, job_id, ImportStatus.PAUSED)
 
     async def cancel(self, job_id: str) -> ImportJob:
-        job = self.job_store.require(job_id)
+        job = await in_the_background(self.job_store.require, job_id)
         if job.status is ImportStatus.CANCELLED:
             return job
         await self._cancel_task(job_id)
+        async with self._settling:
+            return await in_the_background(self._settle_stopped, job_id, ImportStatus.CANCELLED)
+
+    def _settle_stopped(self, job_id: str, target: ImportStatus) -> ImportJob:
+        """A stopped runner's job moves to `target`, unless it completed first."""
         current = self.job_store.require(job_id)
         if current.status is ImportStatus.COMPLETED:
             return current
-        return self.job_store.transition(job_id, ImportStatus.CANCELLED)
+        return self.job_store.transition(job_id, target)
 
     async def shutdown(self) -> None:
-        running = [
-            job
-            for job in self.job_store.list_jobs(status=ImportStatus.RUNNING)
-            if job.job_id in self._tasks
-        ]
-        for job in running:
-            self.job_store.interrupt_running(job.job_id)
+        mine = frozenset(self._tasks)
+
+        def interrupt_mine() -> None:
+            for job in self.job_store.find_jobs(statuses=(ImportStatus.RUNNING,)):
+                if job.job_id in mine:
+                    self.job_store.interrupt_running(job.job_id)
+
+        await in_the_background(interrupt_mine)
         await asyncio.gather(
             *(self._cancel_task(job_id) for job_id in tuple(self._tasks)),
         )
@@ -232,7 +320,7 @@ class ImportSupervisor:
                     }:
                         return
                     if self.source_enabled is not None and not await in_the_background(
-                        self.source_enabled, job.source_id
+                        self.source_enabled, self.lane_of(job)
                     ):
                         return
                     runner = ImportRunner(
@@ -243,7 +331,7 @@ class ImportSupervisor:
                         sdk_queue=self.sdk_queue,
                         sdk_authority=self.sdk_authority,
                     )
-                    adapter = self.adapters[job.source_id]
+                    adapter = self.adapters[self.lane_of(job)]
                     if self.prepare_adapter is not None:
                         adapter = await self.prepare_adapter(job, adapter)
 
@@ -278,7 +366,7 @@ class ImportSupervisor:
                 and retry_attempt < self.max_history_retries
                 and (
                     self.source_enabled is None
-                    or await in_the_background(self.source_enabled, current.source_id)
+                    or await in_the_background(self.source_enabled, self.lane_of(current))
                 )
             ):
                 delay = self.retry_base_seconds * (2**retry_attempt)
@@ -348,9 +436,7 @@ class ImportSupervisor:
             try:
                 await asyncio.wait_for(asyncio.shield(task), timeout)
             except TimeoutError:
-                current = self.job_store.require(job_id)
-                if current.status is ImportStatus.RUNNING:
-                    self.job_store.interrupt_running(job_id)
+                await in_the_background(self._interrupt_if_running, job_id)
                 return False
             except asyncio.CancelledError:
                 # The worker noticed cancel and exited. A cancel of this
@@ -358,10 +444,16 @@ class ImportSupervisor:
                 caller = asyncio.current_task()
                 if caller is not None and caller.cancelling():
                     raise
+        # A read and a write on the single writer: off the loop. Live sync
+        # calls this from its poll, and on the loop it was the main thread
+        # waiting its turn for the writer behind an import peak.
+        await in_the_background(self._interrupt_if_running, job_id)
+        return True
+
+    def _interrupt_if_running(self, job_id: str) -> None:
         current = self.job_store.require(job_id)
         if current.status is ImportStatus.RUNNING:
             self.job_store.interrupt_running(job_id)
-        return True
 
     async def _cancel_task(self, job_id: str) -> None:
         drain = self._drains.get(job_id)

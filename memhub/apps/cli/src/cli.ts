@@ -123,6 +123,14 @@ import {
   renderDoctorText,
 } from "./doctor-report.js";
 import {
+  activateWithEmbeddingSwitch,
+  cleanupSpace,
+  listSpaces,
+  type SwitchIo,
+  switchCancel,
+  switchStatus,
+} from "./embedding-switch-flow.js";
+import {
   EXIT_FAILED,
   EXIT_OK,
   EXIT_PLAN_BLOCKED,
@@ -189,9 +197,37 @@ import {
   rollbackManagedCliLink,
 } from "./managed-cli-link.js";
 import {
+  type FeaturesDocument,
+  featuresExitCode,
+  parseFeaturesCommand,
+  renderFeaturesText,
+  runFeaturesCommand,
+} from "./memory-features-flow.js";
+import {
+  type LanguageDocument,
+  languageExitCode,
+  parseLanguageCommand,
+  renderLanguageText,
+  runLanguageCommand,
+} from "./memory-language-flow.js";
+import {
+  type EvolveDocument,
+  evolveExitCode,
+  type ModeDocument,
+  modeExitCode,
+  parseEvolveCommand,
+  parseSettingsCommand,
+  renderEvolveText,
+  renderModeText,
+  runEvolveCommand,
+  runModeCommand,
+} from "./memory-mode-flow.js";
+import {
   addMemory,
+  DEFAULT_USER_ID,
   isMemoryId,
   isRequestId,
+  isUserId,
   MEMORY_KINDS,
   MEMORY_SCENES,
   MEMORY_VARIANTS,
@@ -209,6 +245,7 @@ import {
   renderMemoryAddText,
   renderMemoryDetailText,
   renderMemoryPageText,
+  userIdParameters,
   validMemoryText,
 } from "./memory-report.js";
 import {
@@ -226,7 +263,6 @@ import {
   renderModelReportText,
 } from "./model-report.js";
 import {
-  activateModelProfile,
   editModelProfile,
   type ModelWriteDocument,
   modelWriteExitCode,
@@ -322,6 +358,8 @@ export interface RunControls {
   watchSignal?: AbortSignal;
   watchWait?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
   watchNow?: () => string;
+  /** `memhub evolve --wait` polls on this; tests inject an instant one. */
+  sleep?: (milliseconds: number) => Promise<void>;
   readStdin?: () => Promise<Buffer | null>;
   stdinIsTTY?: boolean;
   /** Injectable onboarding prompter so the wizard can be driven in tests
@@ -537,6 +575,23 @@ async function runCommand(
     if (lifted.dataDir !== undefined) {
       environment = { ...environment, ONE_MEMORY_DATA_DIR: lifted.dataDir };
     }
+  }
+  // `--user-id <id>` is global to the memory commands: it names whose
+  // memories are read or written. It is lifted before dispatch so each
+  // command's own parser keeps seeing exactly the arguments it always did.
+  // `sources connect` gives the flag its own meaning and parses it itself.
+  let userId: string | undefined;
+  if (USER_ID_COMMANDS.has(arguments_[0] ?? "")) {
+    const lifted = liftUserIdOption(arguments_);
+    if (lifted === null) {
+      return reject(
+        findCommand(arguments_[0] ?? ""),
+        asJson,
+        "--user-id 无效：只能是 1–64 位字母、数字、点、下划线或连字符。",
+      );
+    }
+    arguments_ = lifted.arguments_;
+    userId = lifted.userId;
   }
   environment = await environmentWithManagedDataDir(environment);
   const command = arguments_[0];
@@ -776,9 +831,11 @@ async function runCommand(
     const attachment = await attachToRuntimeOrNull(environment);
     if (attachment === null) return runtimeUnavailable(descriptor, asJson);
     if (parsed.kind === "status") {
-      const receipt = await readMemoryWrite(attachment, parsed.id).catch(
-        () => undefined,
-      );
+      const receipt = await readMemoryWrite(
+        attachment,
+        parsed.id,
+        userId,
+      ).catch(() => undefined);
       if (receipt === undefined) {
         return emitFailure(asJson, "write status", "memory_write_read_failed");
       }
@@ -812,6 +869,7 @@ async function runCommand(
         ? {}
         : { memory_at: parsed.memory_at }),
       ...(parsed.priority === undefined ? {} : { priority: parsed.priority }),
+      ...(userId === undefined ? {} : { user_id: userId }),
     });
     if (outcome.state !== "accepted") {
       emit(
@@ -957,9 +1015,12 @@ async function runCommand(
                 state: "empty",
                 events: 0,
                 invalid_lines: report.invalid_lines,
+                unrecognized_lines: report.unrecognized_lines,
               })}\n`
           : renderLogText(report.events, report.invalid_lines),
       );
+      // Only lines that are not JSON are damage. Records an older build wrote
+      // are left out without a warning: after an upgrade they are expected.
       if (report.invalid_lines) {
         process.stderr.write(
           `${PRODUCT}: 跳过 ${report.invalid_lines} 行损坏的诊断记录。\n`,
@@ -1582,6 +1643,7 @@ async function runCommand(
           limit: parsed.limit,
           character_budget: parsed.characterBudget,
           timeout_ms: parsed.timeoutMs,
+          ...userIdParameters(userId),
         })
       : ({
           schema_version: 2,
@@ -1655,6 +1717,18 @@ async function runCommand(
       );
       if (apiKey === undefined) return usage();
     }
+    if (
+      parsed.kind === "spaces" &&
+      parsed.cleanup !== undefined &&
+      !parsed.confirmed
+    ) {
+      return emitConfirmPreview(asJson, {
+        command: "models spaces",
+        target: parsed.cleanup,
+        effect: `删除已停用的向量空间 ${parsed.cleanup}（不可恢复；正在使用的空间不能删除）`,
+        retry: `${PRODUCT} models spaces --cleanup ${parsed.cleanup} --yes`,
+      });
+    }
     if (parsed.kind === "remove" && !parsed.confirmed) {
       return emitConfirmPreview(asJson, {
         command: "models remove",
@@ -1677,6 +1751,50 @@ async function runCommand(
       return connected.exitCode;
     }
     const { reader, operations } = connected;
+    // Ctrl-C while following a switch stops watching, never the switch.
+    const interrupt = new AbortController();
+    const switchIo: SwitchIo = {
+      reader,
+      operations,
+      emit: (text) => {
+        emit(text);
+      },
+      asJson,
+      interactive:
+        !asJson && (controls.stdinIsTTY ?? process.stdin.isTTY) === true,
+      confirm: async (question) => {
+        const prompter =
+          controls.wizardPrompter ?? (await createTerminalPrompter());
+        try {
+          return /^(y|yes)$/i.test((await prompter.ask(question)).trim());
+        } finally {
+          if ("close" in prompter && typeof prompter.close === "function") {
+            prompter.close();
+          }
+        }
+      },
+      ...(controls.watchWait ? { wait: controls.watchWait } : {}),
+      signal: controls.watchSignal ?? interrupt.signal,
+    };
+    const withInterrupt = async (run: () => Promise<number>) => {
+      const onInterrupt = () => interrupt.abort();
+      process.once("SIGINT", onInterrupt);
+      try {
+        return await run();
+      } finally {
+        process.removeListener("SIGINT", onInterrupt);
+      }
+    };
+    if (parsed.kind === "switch") {
+      return parsed.action === "status"
+        ? await switchStatus(switchIo)
+        : await switchCancel(switchIo);
+    }
+    if (parsed.kind === "spaces") {
+      return parsed.cleanup === undefined
+        ? await listSpaces(switchIo)
+        : await cleanupSpace(parsed.cleanup, switchIo);
+    }
     if (parsed.kind === "add") {
       const created = await createModelProfile(
         config,
@@ -1691,33 +1809,66 @@ async function runCommand(
         emitFlowDocument(created, asJson);
         return flowExitCode(created);
       }
-      const activated = await activateModelProfile(
-        String(created.receipt.profile_id),
+      // Core activates only a probed profile: probe first, then the same
+      // path as `models activate`, so an embedding change shows its plan.
+      const profileId = String(created.receipt.profile_id);
+      const probe = await probeUntilSettled(
+        reader,
         operations,
+        profileId,
+        controls.watchWait,
       );
-      const document = {
-        ...created,
-        activation:
-          activated.state === "committed"
-            ? { state: "committed" }
-            : { state: activated.state, code: activated.code },
-      };
+      const probed =
+        probe.state === "completed" &&
+        Boolean(
+          (
+            (probe.receipt.result as Record<string, unknown> | undefined)
+              ?.capabilities as Record<string, unknown> | undefined
+          )?.embedding_available,
+        );
       emit(
         asJson
-          ? `${JSON.stringify(document)}\n`
+          ? `${JSON.stringify({
+              ...created,
+              probe: {
+                state: probe.state,
+                ...("operation_id" in probe && probe.operation_id
+                  ? { operation_id: probe.operation_id }
+                  : {}),
+                ...("code" in probe ? { code: probe.code } : {}),
+              },
+            })}\n`
           : `${renderFlowText(created)}${
-              activated.state === "committed"
-                ? "已设为当前使用的模型配置。\n"
-                : `设为当前使用未完成：${activated.state}（${activated.code}）\n`
+              probed
+                ? "探测通过。\n"
+                : `探测未通过（${"code" in probe ? probe.code : probe.state}），没有设为当前使用；用 ${PRODUCT} models test ${profileId} 查看原因。\n`
             }`,
       );
-      return activated.state === "committed" ? EXIT_OK : EXIT_FAILED;
+      if (!probed) return EXIT_FAILED;
+      return await withInterrupt(() =>
+        activateWithEmbeddingSwitch(
+          profileId,
+          { confirmed: parsed.confirmed, follow: parsed.follow },
+          switchIo,
+        ),
+      );
     }
-    if (parsed.kind === "edit" || parsed.kind === "activate") {
-      const document =
-        parsed.kind === "edit"
-          ? await editModelProfile(parsed.profileId, config, apiKey, operations)
-          : await activateModelProfile(parsed.profileId, operations);
+    if (parsed.kind === "activate") {
+      return await withInterrupt(() =>
+        activateWithEmbeddingSwitch(
+          parsed.profileId,
+          { confirmed: parsed.confirmed, follow: parsed.follow },
+          switchIo,
+        ),
+      );
+    }
+    if (parsed.kind === "edit") {
+      const document = await editModelProfile(
+        parsed.profileId,
+        config,
+        apiKey,
+        operations,
+      );
       emitModelWriteDocument(document, asJson);
       return modelWriteExitCode(document);
     }
@@ -1780,6 +1931,16 @@ async function runCommand(
   }
   if (named === "sources" && arguments_[1] !== "list") {
     const parsed = parseSourcesCommand(arguments_.slice(1));
+    if (
+      !parsed &&
+      arguments_.some((item) => item === "--user-id" || item === "--root")
+    ) {
+      return reject(
+        descriptor,
+        asJson,
+        "--user-id 和 --root 只能用于接入单个 hermes 来源（Hermes profile），用户 ID 只能是 1–64 位字母、数字、点、下划线或连字符。用户 ID 不必等于 Hermes profile 名，例如 --user-id wife-work --root ~/.hermes/profiles/wife:work。",
+      );
+    }
     if (!parsed) return usage();
     if (parsed.kind === "receipt") {
       const connected = await connectRuntime(environment);
@@ -1981,11 +2142,16 @@ async function runCommand(
     return sourceProgressExitCode(document);
   }
   if (named === "profile") {
+    const profileFlags = arguments_.slice(1);
     if (
-      arguments_.filter((item) => item === "--json").length > 1 ||
-      arguments_.slice(1).some((value) => value !== "--json")
+      profileFlags.filter((item) => item === "--json").length > 1 ||
+      profileFlags.filter((item) => item === "--versions").length > 1 ||
+      profileFlags.some((value) => value !== "--json" && value !== "--versions")
     ) {
       return usage();
+    }
+    if (profileFlags.includes("--versions")) {
+      return await profileVersionsCommand(environment, { asJson, userId });
     }
     const connected = await connectRuntime(environment, {
       readerTimeoutMs: 15_000,
@@ -2004,7 +2170,11 @@ async function runCommand(
       );
       return connected.exitCode;
     }
-    const outcome = await connected.reader<unknown>("/api/v2/user-profile");
+    const profileUser = userIdParameters(userId);
+    const outcome =
+      profileUser.user_id === undefined
+        ? await connected.reader<unknown>("/api/v2/user-profile")
+        : await connected.reader<unknown>("/api/v2/user-profile", profileUser);
     const value =
       outcome.state === "ok"
         ? (outcome.data as {
@@ -2109,7 +2279,7 @@ async function runCommand(
     }
     const { reader, operations } = connected;
     if (parsed.kind === "list") {
-      const document = await readMemoryPage(reader, parsed.query);
+      const document = await readMemoryPage(reader, parsed.query, userId);
       emit(
         asJson
           ? `${JSON.stringify(document)}\n`
@@ -2122,6 +2292,7 @@ async function runCommand(
         reader,
         parsed.memoryId,
         parsed.namespace,
+        userId,
       );
       emit(
         asJson
@@ -2133,8 +2304,8 @@ async function runCommand(
     if (parsed.kind === "add" || parsed.kind === "add-status") {
       const document =
         parsed.kind === "add"
-          ? await addMemory(operations, text ?? "", parsed.requestId)
-          : await readMemoryAddStatus(reader, parsed.requestId);
+          ? await addMemory(operations, text ?? "", parsed.requestId, userId)
+          : await readMemoryAddStatus(reader, parsed.requestId, userId);
       emit(
         asJson
           ? `${JSON.stringify(document)}\n`
@@ -2149,33 +2320,166 @@ async function runCommand(
             content: text,
             ...namespaceParameters(parsed.namespace),
             ...(parsed.task === undefined ? {} : { task: parsed.task }),
+            ...userIdParameters(userId),
           })
         : await operations.delete<unknown>(
-            withQuery(memoryPath, namespaceParameters(parsed.namespace)),
+            withQuery(memoryPath, {
+              ...namespaceParameters(parsed.namespace),
+              ...userIdParameters(userId),
+            }),
           );
+    // A delete answered 404 `memory_not_found` is already gone (deleted
+    // before, or never this user's): what was asked for holds, so it exits 0
+    // as committed and says so, instead of failing a retry or a double run.
+    const alreadyGone =
+      parsed.kind === "delete" &&
+      outcome.state === "rejected" &&
+      outcome.code === "memory_not_found";
+    const state = alreadyGone ? "committed" : outcome.state;
     const document = {
       schema_version: 2,
       product: PRODUCT,
       command: `memories ${parsed.kind}`,
-      state: outcome.state,
+      state,
       operation: parsed.kind,
       memory_id: parsed.memoryId,
-      ...(outcome.state === "committed"
-        ? parsed.kind === "update"
-          ? { result: outcome.data }
-          : {}
-        : { code: outcome.code }),
+      ...(alreadyGone
+        ? { already_gone: true }
+        : outcome.state === "committed"
+          ? parsed.kind === "update"
+            ? { result: outcome.data }
+            : {}
+          : { code: outcome.code }),
     };
     emit(
       asJson
         ? `${JSON.stringify(document)}\n`
-        : outcome.state === "committed"
-          ? `已${parsed.kind === "update" ? "更新" : "删除"}记忆 ${parsed.memoryId}\n`
-          : outcome.code === "memory_id_ambiguous"
-            ? "这个 ID 同时存在于多个场景；请加 --kind（以及 --variant）指明是哪一条。\n"
-            : `操作失败：${outcome.code}\n`,
+        : alreadyGone
+          ? `未找到记忆 ${parsed.memoryId}（可能已删除），无需再删。\n`
+          : outcome.state === "committed"
+            ? `已${parsed.kind === "update" ? "更新" : "删除"}记忆 ${parsed.memoryId}\n`
+            : outcome.code === "memory_id_ambiguous"
+              ? "这个 ID 同时存在于多个场景；请加 --kind（以及 --variant）指明是哪一条。\n"
+              : `操作失败：${outcome.code}\n`,
     );
-    return outcome.state === "committed" ? EXIT_OK : EXIT_FAILED;
+    return state === "committed" ? EXIT_OK : EXIT_FAILED;
+  }
+  if (
+    named === "settings" &&
+    arguments_.slice(1).find((value) => value !== "--json") === "features"
+  ) {
+    const parsed = parseFeaturesCommand(
+      arguments_
+        .slice(1)
+        .filter((value, index, all) => index !== all.indexOf("features")),
+    );
+    if (!parsed) return usage();
+    const connected = await connectRuntime(environment);
+    if (!connected.ok) {
+      const document: FeaturesDocument = {
+        schema_version: 1,
+        product: PRODUCT,
+        command: "settings features",
+        state: "unavailable",
+        code: connected.code,
+      };
+      emit(
+        asJson ? `${JSON.stringify(document)}\n` : renderFeaturesText(document),
+      );
+      return connected.exitCode;
+    }
+    const document = await runFeaturesCommand(
+      parsed,
+      connected.reader,
+      connected.operations,
+    );
+    emit(
+      asJson ? `${JSON.stringify(document)}\n` : renderFeaturesText(document),
+    );
+    return featuresExitCode(document);
+  }
+  if (
+    named === "settings" &&
+    arguments_.slice(1).find((value) => value !== "--json") === "language"
+  ) {
+    const parsed = parseLanguageCommand(
+      arguments_
+        .slice(1)
+        .filter((value, index, all) => index !== all.indexOf("language")),
+    );
+    if (!parsed) return usage();
+    const connected = await connectRuntime(environment);
+    if (!connected.ok) {
+      const document: LanguageDocument = {
+        schema_version: 1,
+        product: PRODUCT,
+        command: "settings language",
+        state: "unavailable",
+        code: connected.code,
+      };
+      emit(
+        asJson ? `${JSON.stringify(document)}\n` : renderLanguageText(document),
+      );
+      return connected.exitCode;
+    }
+    const document = await runLanguageCommand(
+      parsed,
+      connected.reader,
+      connected.operations,
+    );
+    emit(
+      asJson ? `${JSON.stringify(document)}\n` : renderLanguageText(document),
+    );
+    return languageExitCode(document);
+  }
+  if (named === "settings") {
+    const parsed = parseSettingsCommand(arguments_.slice(1));
+    if (!parsed) return usage();
+    const connected = await connectRuntime(environment);
+    if (!connected.ok) {
+      const document: ModeDocument = {
+        schema_version: 1,
+        product: PRODUCT,
+        command: "settings mode",
+        state: "unavailable",
+        code: connected.code,
+      };
+      emit(asJson ? `${JSON.stringify(document)}\n` : renderModeText(document));
+      return connected.exitCode;
+    }
+    const document = await runModeCommand(
+      parsed,
+      connected.reader,
+      connected.operations,
+    );
+    emit(asJson ? `${JSON.stringify(document)}\n` : renderModeText(document));
+    return modeExitCode(document);
+  }
+  if (named === "evolve") {
+    const parsed = parseEvolveCommand(arguments_.slice(1));
+    if (!parsed) return usage();
+    const connected = await connectRuntime(environment);
+    if (!connected.ok) {
+      const document: EvolveDocument = {
+        schema_version: 1,
+        product: PRODUCT,
+        command: "evolve",
+        state: "unavailable",
+        code: connected.code,
+      };
+      emit(
+        asJson ? `${JSON.stringify(document)}\n` : renderEvolveText(document),
+      );
+      return connected.exitCode;
+    }
+    const document = await runEvolveCommand(parsed, {
+      userId: userIdParameters(userId).user_id,
+      reader: connected.reader,
+      operations: connected.operations,
+      sleep: controls.sleep,
+    });
+    emit(asJson ? `${JSON.stringify(document)}\n` : renderEvolveText(document));
+    return evolveExitCode(document);
   }
   if (named === "graph-width") {
     const parsed = parseGraphWidthCommand(arguments_.slice(1));
@@ -3675,13 +3979,21 @@ async function connectSources(
       asJson,
     );
   }
-  if (parsed.importHistory) {
+  // Another user's Hermes profile is granted and imported in one connect
+  // request: only that request can carry a user and a root.
+  if (
+    parsed.importHistory ||
+    parsed.userId !== undefined ||
+    parsed.root !== undefined
+  ) {
     const document = await connectSourcesWithImport(reader, operations, {
       sourceIds: parsed.sourceIds,
       confirmOverrides: parsed.confirmOverrides,
       ...(parsed.requestId === undefined
         ? {}
         : { requestId: parsed.requestId }),
+      ...(parsed.userId === undefined ? {} : { userId: parsed.userId }),
+      ...(parsed.root === undefined ? {} : { root: parsed.root }),
     });
     emitFlowDocument(document, asJson);
     return flowExitCode(document);
@@ -3834,6 +4146,108 @@ async function emitModelReceipt(
 
 /** Attach to a verified Runtime, telling a stopped one (exit 3) from one
  * that is up but unusable (exit 1). */
+/**
+ * `memhub profile --versions`: the long-term profile's L0 version chains,
+ * latest first, so a value that replaced a better one can be found by id.
+ */
+async function profileVersionsCommand(
+  environment: NodeJS.ProcessEnv,
+  options: { asJson: boolean; userId?: string },
+): Promise<number> {
+  const fail = (state: string, code: string, exitCode: number): number => {
+    emit(
+      options.asJson
+        ? `${JSON.stringify({ schema_version: 2, product: PRODUCT, state, code })}\n`
+        : `画像版本读取失败：${code}\n`,
+    );
+    return exitCode;
+  };
+  const connected = await connectRuntime(environment, {
+    readerTimeoutMs: 15_000,
+  });
+  if (!connected.ok) {
+    return fail("unavailable", connected.code, connected.exitCode);
+  }
+  const outcome = await connected.reader<unknown>(
+    "/api/v2/user-profile/versions",
+    userIdParameters(options.userId),
+  );
+  const chains = outcome.state === "ok" ? profileChains(outcome.data) : null;
+  if (outcome.state !== "ok" || chains === null) {
+    return fail(
+      outcome.state === "ok" ? "invalid" : outcome.state,
+      outcome.state === "ok" ? "response_invalid" : outcome.code,
+      EXIT_FAILED,
+    );
+  }
+  if (options.asJson) {
+    emit(
+      `${JSON.stringify({
+        schema_version: 2,
+        product: PRODUCT,
+        state: "ok",
+        ...(outcome.data as object),
+      })}\n`,
+    );
+    return EXIT_OK;
+  }
+  if (chains.length === 0) {
+    emit("尚未形成用户画像版本。\n");
+    return EXIT_OK;
+  }
+  const lines: string[] = [];
+  for (const chain of chains) {
+    lines.push(`画像 ${chain.memory_id}（${chain.status}）`);
+    for (const version of chain.versions) {
+      const when =
+        typeof version.gmt_created === "number"
+          ? new Date(version.gmt_created * 1000).toISOString()
+          : "时间未知";
+      lines.push(
+        `  ${version.current ? "*" : " "} ${version.memory_id}  ${when}  ${version.content}`,
+      );
+    }
+  }
+  lines.push(
+    "* 表示当前生效的版本；删除错误版本：memhub memories delete <memory-id> --yes",
+  );
+  emit(`${lines.join("\n")}\n`);
+  return EXIT_OK;
+}
+
+type ProfileChainView = {
+  memory_id: string;
+  status: string;
+  versions: {
+    memory_id: string;
+    content: string;
+    gmt_created?: number | null;
+    current: boolean;
+  }[];
+};
+
+function profileChains(value: unknown): ProfileChainView[] | null {
+  if (!value || typeof value !== "object") return null;
+  const chains = (value as { chains?: unknown }).chains;
+  if (!Array.isArray(chains)) return null;
+  const valid = chains.every(
+    (chain) =>
+      chain &&
+      typeof chain === "object" &&
+      typeof (chain as ProfileChainView).memory_id === "string" &&
+      typeof (chain as ProfileChainView).status === "string" &&
+      Array.isArray((chain as ProfileChainView).versions) &&
+      (chain as ProfileChainView).versions.every(
+        (version) =>
+          version &&
+          typeof version.memory_id === "string" &&
+          typeof version.content === "string" &&
+          typeof version.current === "boolean",
+      ),
+  );
+  return valid ? (chains as ProfileChainView[]) : null;
+}
+
 async function connectRuntime(
   environment: NodeJS.ProcessEnv,
   options?: { readerTimeoutMs?: number },
@@ -3969,6 +4383,10 @@ function renderWriteReceiptText(receipt: MemoryWriteReceipt): string {
     ...(receipt.memory_ids && receipt.memory_ids.length > 0
       ? [`memory_ids: ${receipt.memory_ids.join(",")}`]
       : []),
+    ...(receipt.error_code ? [`error_code: ${receipt.error_code}`] : []),
+    ...(receipt.next_retry_at
+      ? [`next_retry_at: ${receipt.next_retry_at}`]
+      : []),
     "",
   ].join("\n");
 }
@@ -4101,6 +4519,8 @@ const SDK_MIGRATION_FAILURES: Record<string, string> = {
     "核对发现新版本还读不到你的全部记忆，没有切换数据源。",
   sdk_migration_model_profile_required:
     "迁移需要先有可用的模型配置，用来核对新版本能否读回记忆。请先用 memhub models setup 完成配置，再运行 memhub restart 重试。",
+  sdk_migration_vector_profile_missing:
+    "记忆的向量来自一个已删除的模型配置，当前配置读不回它们，所以没有迁移。请重新添加并启用那个模型配置，再运行 memhub restart 重试。",
 };
 
 const MIGRATION_ISSUES_URL =
@@ -5022,6 +5442,8 @@ type ModelsCommand =
       configFile: string;
       apiKeyFile?: string;
       activate: boolean;
+      confirmed: boolean;
+      follow?: boolean;
     }
   | {
       kind: "edit";
@@ -5029,7 +5451,14 @@ type ModelsCommand =
       configFile: string;
       apiKeyFile?: string;
     }
-  | { kind: "activate"; profileId: string }
+  | {
+      kind: "activate";
+      profileId: string;
+      confirmed: boolean;
+      follow?: boolean;
+    }
+  | { kind: "switch"; action: "status" | "cancel" }
+  | { kind: "spaces"; cleanup?: string; confirmed: boolean }
   | { kind: "test"; profileId: string }
   | { kind: "receipt"; operationId: string }
   | { kind: "remove"; profileId: string; confirmed: boolean };
@@ -5070,16 +5499,46 @@ function parseModelsCommand(rest: readonly string[]): ModelsCommand | null {
     const flags = readFlags(
       tokens.slice(1),
       ["--config-file", "--api-key-file"],
-      ["--activate"],
+      ["--activate", "--yes", "--wait", "--no-wait"],
     );
     const configFile = flags?.values.get("--config-file");
     if (!flags || configFile === undefined) return null;
+    const follow = followFlag(flags.switches);
+    if (follow === null) return null;
+    const activate = flags.switches.has("--activate");
+    // The switch flags only mean something when the add also activates.
+    if (
+      !activate &&
+      ["--yes", "--wait", "--no-wait"].some((flag) => flags.switches.has(flag))
+    ) {
+      return null;
+    }
     const apiKeyFile = flags.values.get("--api-key-file");
     return {
       kind: "add",
       configFile,
       ...(apiKeyFile === undefined ? {} : { apiKeyFile }),
-      activate: flags.switches.has("--activate"),
+      activate,
+      confirmed: flags.switches.has("--yes"),
+      ...(follow === undefined ? {} : { follow }),
+    };
+  }
+  if (action === "switch") {
+    if (tokens.length !== 2 || (target !== "status" && target !== "cancel")) {
+      return null;
+    }
+    return { kind: "switch", action: target };
+  }
+  if (action === "spaces") {
+    const flags = readFlags(tokens.slice(1), ["--cleanup"], ["--yes"]);
+    if (!flags) return null;
+    const cleanup = flags.values.get("--cleanup");
+    if (cleanup === undefined && flags.switches.has("--yes")) return null;
+    if (cleanup !== undefined && !OPERATION_ID.test(cleanup)) return null;
+    return {
+      kind: "spaces",
+      ...(cleanup === undefined ? {} : { cleanup }),
+      confirmed: flags.switches.has("--yes"),
     };
   }
   if (target === undefined || !OPERATION_ID.test(target)) return null;
@@ -5100,8 +5559,21 @@ function parseModelsCommand(rest: readonly string[]): ModelsCommand | null {
     };
   }
   if (action === "activate") {
-    const flags = readFlags(tokens.slice(2), [], ["--confirm", "--yes"]);
-    return flags ? { kind: "activate", profileId: target } : null;
+    const flags = readFlags(
+      tokens.slice(2),
+      [],
+      ["--confirm", "--yes", "--wait", "--no-wait"],
+    );
+    if (!flags) return null;
+    const follow = followFlag(flags.switches);
+    if (follow === null) return null;
+    return {
+      kind: "activate",
+      profileId: target,
+      // `--confirm` stays the hidden alias of `--yes`.
+      confirmed: flags.switches.has("--yes") || flags.switches.has("--confirm"),
+      ...(follow === undefined ? {} : { follow }),
+    };
   }
   if (action === "test") {
     return tokens.length === 2 ? { kind: "test", profileId: target } : null;
@@ -5124,6 +5596,35 @@ function parseModelsCommand(rest: readonly string[]): ModelsCommand | null {
   return null;
 }
 
+/** `--wait` / `--no-wait`: undefined when neither, null when both. */
+function followFlag(switches: ReadonlySet<string>): boolean | undefined | null {
+  const wait = switches.has("--wait");
+  const noWait = switches.has("--no-wait");
+  if (wait && noWait) return null;
+  return wait ? true : noWait ? false : undefined;
+}
+
+/** Start a probe and read its receipt until it settles (about two minutes). */
+async function probeUntilSettled(
+  reader: CoreReader,
+  operations: CoreOperations,
+  profileId: string,
+  wait?: (milliseconds: number, signal: AbortSignal) => Promise<void>,
+): Promise<ModelProbeFlowDocument> {
+  let document = await startModelProbe(reader, operations, profileId);
+  const pause =
+    wait ??
+    ((milliseconds: number) =>
+      new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
+  const signal = new AbortController().signal;
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    if (document.state !== "pending" || !document.operation_id) break;
+    await pause(1_000, signal);
+    document = await readModelProbeReceipt(reader, document.operation_id);
+  }
+  return document;
+}
+
 type SourcesCommand =
   | {
       kind: "ids";
@@ -5131,14 +5632,23 @@ type SourcesCommand =
       importHistory: boolean;
       confirmOverrides: boolean;
       requestId?: string;
+      /** `--user-id`: whose grant (Hermes only). Absent for `local`. */
+      userId?: string;
+      /** `--root`: an absolute root other than the candidate (Hermes only). */
+      root?: string;
     }
   | { kind: "all"; importHistory: boolean; confirmOverrides: boolean }
   | { kind: "receipt"; requestId: string };
 
 const SOURCE_ID_SHAPE = /^[a-z0-9][a-z0-9-]{0,127}$/;
 
+/** Only Hermes keeps one history per profile, so only Hermes may be
+ * connected for another user or from another root. */
+const MULTI_USER_SOURCES = new Set(["hermes"]);
+
 /** `sources connect <id> [<id> ...] | --all-detected [--import]
- * [--confirm-overrides] [--request-id <uuid>]` and `sources receipt <id>`.
+ * [--confirm-overrides] [--request-id <uuid>]
+ * [--user-id <id>] [--root <path>]` and `sources receipt <id>`.
  *
  * Sources may be named positionally or with repeated `--source` (the old
  * `init --source` spelling is rewritten to this command). */
@@ -5154,11 +5664,28 @@ function parseSourcesCommand(rest: readonly string[]): SourcesCommand | null {
   const sourceIds: string[] = [];
   const switches = new Set<string>();
   let requestId: string | undefined;
+  let userId: string | undefined;
+  let root: string | undefined;
   for (let index = 1; index < tokens.length; index += 1) {
     const token = tokens[index];
     if (["--import", "--confirm-overrides", "--all-detected"].includes(token)) {
       if (switches.has(token)) return null;
       switches.add(token);
+      continue;
+    }
+    if (token === "--user-id" || token === "--root") {
+      const value = tokens[index + 1];
+      if (value === undefined || value.startsWith("--")) return null;
+      if (token === "--user-id") {
+        if (userId !== undefined || !isUserId(value)) return null;
+        userId = value;
+      } else {
+        if (root !== undefined) return null;
+        const expanded = expandRootPath(value);
+        if (expanded === null) return null;
+        root = expanded;
+      }
+      index += 1;
       continue;
     }
     if (token === "--source" || token === "--request-id") {
@@ -5184,9 +5711,22 @@ function parseSourcesCommand(rest: readonly string[]): SourcesCommand | null {
   const confirmOverrides = switches.has("--confirm-overrides");
   if (
     requestId !== undefined &&
-    (!OPERATION_ID.test(requestId) || !importHistory)
+    (!OPERATION_ID.test(requestId) ||
+      !(importHistory || userId !== undefined || root !== undefined))
   ) {
     return null;
+  }
+  // `--user-id local` is the default and changes nothing.
+  if (userId === DEFAULT_USER_ID) userId = undefined;
+  if (userId !== undefined || root !== undefined) {
+    // One Hermes profile per connect: the user and root name one grant.
+    if (
+      switches.has("--all-detected") ||
+      sourceIds.length !== 1 ||
+      !MULTI_USER_SOURCES.has(sourceIds[0])
+    ) {
+      return null;
+    }
   }
   if (switches.has("--all-detected")) {
     // One names exact sources, the other means "whatever is detected".
@@ -5200,7 +5740,22 @@ function parseSourcesCommand(rest: readonly string[]): SourcesCommand | null {
     importHistory,
     confirmOverrides,
     ...(requestId === undefined ? {} : { requestId }),
+    ...(userId === undefined ? {} : { userId }),
+    ...(root === undefined ? {} : { root }),
   };
+}
+
+/** `--root` as an absolute path: a leading `~` is the home directory, a
+ * relative path is taken from the working directory. Core expands nothing. */
+function expandRootPath(value: string): string | null {
+  if (value.length === 0 || /[\0\r\n]/.test(value)) return null;
+  const expanded =
+    value === "~"
+      ? os.homedir()
+      : value.startsWith("~/")
+        ? path.join(os.homedir(), value.slice(2))
+        : value;
+  return path.resolve(expanded);
 }
 
 function parseGraphWidthCommand(
@@ -6596,6 +7151,36 @@ const OWN_DATA_DIR_COMMANDS = new Set([
 
 /** Remove one `--data-dir <absolute path>` from argv; null when it is
  * repeated, missing its value, or not an absolute path. */
+/** Memory commands that honour the global `--user-id`. */
+const USER_ID_COMMANDS = new Set([
+  "memories",
+  "recall",
+  "profile",
+  "write",
+  "evolve",
+]);
+
+/**
+ * Take `--user-id <id>` out of the arguments. The default user (`local`) is
+ * returned as undefined, so a default request names no user at all and stays
+ * byte-identical to one sent before multi-user support.
+ */
+function liftUserIdOption(
+  arguments_: readonly string[],
+): { arguments_: string[]; userId?: string } | null {
+  const index = arguments_.indexOf("--user-id");
+  if (index === -1) return { arguments_: [...arguments_] };
+  if (arguments_.indexOf("--user-id", index + 1) !== -1) return null;
+  const value = arguments_[index + 1];
+  if (value === undefined || value.startsWith("--") || !isUserId(value)) {
+    return null;
+  }
+  return {
+    arguments_: [...arguments_.slice(0, index), ...arguments_.slice(index + 2)],
+    ...(value === DEFAULT_USER_ID ? {} : { userId: value }),
+  };
+}
+
 function liftDataDirOption(
   arguments_: readonly string[],
 ): { arguments_: string[]; dataDir?: string } | null {

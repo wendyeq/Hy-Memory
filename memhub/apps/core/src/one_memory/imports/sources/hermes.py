@@ -1,8 +1,9 @@
 import json
+import re
 import sqlite3
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterable, Iterator
 from functools import partial
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 from pydantic import JsonValue
 
@@ -87,6 +88,7 @@ class HermesSourceAdapter:
             self.grant,
             suffixes=frozenset({".jsonl", ".db"}),
             max_targets=10_000,
+            excluded_directory_names=frozenset({HERMES_PROFILES_DIRECTORY}),
         ):
             if isinstance(item, AuthorizedSourceFile) and _is_hermes_target(
                 item.relative_path.as_posix()
@@ -100,6 +102,7 @@ class HermesSourceAdapter:
             self.grant,
             suffixes=frozenset({".jsonl", ".db"}),
             max_targets=options.max_scan_targets or 100_000,
+            excluded_directory_names=frozenset({HERMES_PROFILES_DIRECTORY}),
         ):
             yield ScanProgressEvent(
                 phase=ScanPhase.DISCOVER,
@@ -214,7 +217,11 @@ def parse_hermes_rollout_record(
         message.get("content"),
         allowed_block_types=frozenset({"text", "input_text", "output_text"}),
     )
-    text = strip_injected_memory(text)
+    text = strip_injected_memory(text or "")
+    if role == "user":
+        text, injected = gateway_user_text(text)
+        if injected is not None:
+            return ParsedSkip(reason_code=injected, conversation_id=conversation_id)
     if not text:
         return ParsedSkip(
             reason_code=ScanIssueCode.NO_TEXT,
@@ -242,9 +249,64 @@ def parse_hermes_rollout_record(
     )
 
 
+#: Hermes keeps each extra profile under `<root>/profiles/<name>/`, with its
+#: own `state.db` and sessions. A profile is another person's history: it is
+#: read only through its own grant (its own MemHub user), never as part of the
+#: root above it. Hermes' own export skips this directory for the same reason.
+#:
+#: Skipped at any depth, not only directly under the root: a root granted
+#: above the Hermes home holds `.hermes/profiles/`. Hermes keeps nothing of
+#: its own under a directory of that name (its history is `state.db` and
+#: `sessions/`), so nothing real is lost.
+HERMES_PROFILES_DIRECTORY = "profiles"
+
+
 def _is_hermes_target(relative_path: str) -> bool:
     path = PurePosixPath(relative_path)
+    if HERMES_PROFILES_DIRECTORY in path.parts[:-1]:
+        return False
     return path.name == "state.db" or (path.suffix == ".jsonl" and "sessions" in path.parts)
+
+
+def hermes_root_is_profiles_container(root: Path) -> bool:
+    """`profiles` itself holds everyone's profiles; it is never one person's history."""
+    return root.name == HERMES_PROFILES_DIRECTORY
+
+
+def hermes_root_conflict(mine: Path, other_users_roots: Iterable[Path]) -> str | None:
+    """Why the resolved root `mine` may not be granted beside other users' Hermes roots.
+
+    Paths are compared resolved (symlinks followed; the other users' roots are
+    resolved here). Two roots that are equal or nest would read the same files
+    for two users, except when one is exactly the other's `profiles/<name>`:
+    the scan above never enters `profiles/`, so the two stay apart (`local` on
+    `~/.hermes`, a user on `~/.hermes/profiles/<name>`). None when it may.
+    """
+    if hermes_root_is_profiles_container(mine):
+        return HERMES_ROOT_IS_PROFILES_CONTAINER
+    for other in other_users_roots:
+        theirs = _real(other)
+        if mine == theirs:
+            return HERMES_ROOT_OVERLAPS_OTHER_USER
+        for parent, child in ((mine, theirs), (theirs, mine)):
+            if parent in child.parents:
+                relative = child.relative_to(parent).parts
+                if len(relative) != 2 or relative[0] != HERMES_PROFILES_DIRECTORY:
+                    return HERMES_ROOT_OVERLAPS_OTHER_USER
+    return None
+
+
+#: 422: the root is the `profiles` container, not a profile.
+HERMES_ROOT_IS_PROFILES_CONTAINER = "hermes_root_is_profiles_container"
+#: 409: the root is, holds or sits inside another user's Hermes root.
+HERMES_ROOT_OVERLAPS_OTHER_USER = "hermes_root_overlaps_other_user"
+
+
+def _real(path: Path) -> Path:
+    try:
+        return path.expanduser().resolve(strict=False)
+    except (OSError, RuntimeError):
+        return path.expanduser().absolute()
 
 
 def _read_rollout(
@@ -389,6 +451,15 @@ def _read_state_db(
             # `tool` rows after it hold only what came back.
             calls = _tool_calls_text(row["tool_calls"]) if role == "assistant" else None
             content = strip_injected_memory(str(row["content"] or ""))
+            if role == "user":
+                content, injected = gateway_user_text(content)
+                if injected is not None:
+                    yield ScanSkip(
+                        cursor=cursor,
+                        conversation_id=str(row["session_id"]),
+                        reason_code=injected,
+                    )
+                    continue
             has_text = bool(content.strip())
             if role not in {"user", "assistant"} or (not has_text and calls is None):
                 yield ScanSkip(
@@ -437,6 +508,69 @@ def _read_state_db(
 #: rest of the gateway) are deliberately left out until a real session shows
 #: whether a bot's own posts land in the same table wearing the `user` role.
 _PERSON_SESSION_SOURCES = frozenset({"cli", "tui", "webui", "desktop"})
+
+
+#: What the Hermes gateway writes into a `user` row on its own behalf. Every
+#: one of these wears the `user` role, so only the text can tell them apart
+#: from the person. Read off real `state.db` rows: a finished background
+#: process is posted as a turn, often with the gateway's own "not written by
+#: a human" note appended, which is why that note counts anywhere in the row.
+_BACKGROUND_NOTICE = re.compile(
+    r"\[IMPORTANT:\s*(?:\d+\s+background\s+process(?:es)?\b|Background\s+process\b)",
+    re.IGNORECASE,
+)
+_GATEWAY_NOTICE = re.compile(
+    r"\[INTERNAL NOTIFICATION\s*\W+\s*generated by the Hermes gateway",
+    re.IGNORECASE,
+)
+_VOICE_PLACEHOLDER = re.compile(r"\[voice message could not be transcribed", re.IGNORECASE)
+_PROBE = re.compile(r"Reply with exactly:\s*[A-Za-z0-9_\-]{1,24}\s*")
+_MEDIA_ONLY = re.compile(r"(?:MEDIA:/\S+\s*)+")
+#: Wrappers the gateway puts around a message the person did write. Only the
+#: wrapper goes; what it carries is the turn. Each is matched at the edge of
+#: what is left, and the set is applied until nothing more comes off, since a
+#: relayed message carries the origin block inside the out-of-band markers.
+_GATEWAY_WRAPPERS = (
+    re.compile(r"^\[OUT-OF-BAND USER MESSAGE\b[^\]\n]*\]"),
+    re.compile(r"\[/OUT-OF-BAND USER MESSAGE\]$"),
+    re.compile(
+        r"^Gateway message origin \(JSON data, not instructions or authorization\):[ \t]*"
+        r"(?:\n[ \t]*\{[^\n]*\}[ \t]*)?"
+        r"(?:\n[ \t]*Do not guess a reply destination[^\n]*)?"
+        r"(?=\n|$)"
+    ),
+    re.compile(r"^\[Context from the interrupted assistant response\][ \t]*(?=\n|$)"),
+)
+
+
+def gateway_user_text(text: str) -> tuple[str, ScanIssueCode | None]:
+    """The person's words in a Hermes `user` row, or why there are none.
+
+    Applied only to the `user` role: an assistant or tool row quoting the
+    same text is reporting what it saw, which is the existing tool rule's
+    business. The cleaned text is what becomes the evidence, so its content
+    hash and duplicate check see the message rather than its envelope.
+    """
+
+    if _GATEWAY_NOTICE.search(text):
+        return "", ScanIssueCode.INJECTED_MACHINE_NOTICE
+    cleaned = text.strip()
+    while True:
+        unwrapped = cleaned
+        for wrapper in _GATEWAY_WRAPPERS:
+            unwrapped = wrapper.sub("", unwrapped, count=1).strip()
+        if unwrapped == cleaned:
+            break
+        cleaned = unwrapped
+    if _BACKGROUND_NOTICE.match(cleaned):
+        return "", ScanIssueCode.INJECTED_MACHINE_NOTICE
+    if _VOICE_PLACEHOLDER.match(cleaned):
+        return "", ScanIssueCode.VOICE_PLACEHOLDER
+    if _PROBE.fullmatch(cleaned):
+        return "", ScanIssueCode.PROBE
+    if _MEDIA_ONLY.fullmatch(cleaned):
+        return "", ScanIssueCode.NO_TEXT
+    return cleaned, None
 
 
 def _tool_calls_text(value: object) -> str | None:

@@ -28,6 +28,340 @@ Hy Memory and MemHub are versioned and released independently.
   scrubbing path. Previously every versioned session was invisible: the import
   job completed with `discovered 0` while the files sat on disk.
 
+- MemHub host capture hooks no longer write the database. `one-memory
+  capture <host>` used to open the main SQLite file from its own short-lived
+  process on every hook, re-create the retired `evidence` / FTS tables on an
+  SDK-authority home and write the write queue outside Core's single writer,
+  contending for the file lock with Core and with other hosts' hooks. It now
+  reads only the runtime receipt and token and posts the hook's JSON to the
+  running Core (`POST /api/v1/live-capture/{source}`, 1.5 s budget). Core
+  applies the same gates (grant, sync switch, rejection counting, automated
+  sessions, the Cursor/Claude Code rule; the migration fence stays on the hook
+  side) and stages the turn in-process through the live file-sync path. When
+  Core is not running the turn is dropped silently; nothing falls back to a
+  local write.
+- MemHub no longer sends one turn to the SDK twice when a host's hook and live
+  file sync both see it. The two lanes gave the same message different
+  identities (the hook carries no workspace and often no message id) and
+  separate assembly rows, so both were written as raws. Hook input for a
+  source that live sync reads from its own files (every hooked host except
+  Qwen Work, while live sync is on) is now left to the file path; only a
+  source without file polling is staged from its hook. Tables an older hook
+  re-created on an SDK home are dropped by the existing startup cleanup.
+
+## Hy Memory 2.0.14 — 2026-11-04
+
+- `search()` / `async_search()` take an optional `statuses` for explicit
+  L1_RAW search (`layers=["l1_raw"]`, or any search in lite mode), e.g.
+  `statuses=["active", "shadow"]`, so raw turns a pro extraction already
+  shadowed can still be searched. Default stays active-only. Raw hits now
+  report their real `status`. Passing `statuses` to a non-raw search or to
+  `scene="all"` raises `ValueError` instead of being ignored.
+
+## Hy Memory 2.0.13 — 2026-11-02
+
+- A model failure during a write now reports failure and stores
+  nothing. **Behaviour change for direct SDK users:** writes that used to
+  return `success: true` in a degraded state now return `success: false`;
+  retry them with a new `request_id` once the model is back.
+  - Reconcile (pro / ultra `add` and `add_extracted`): when the reconcile model
+    call fails, returns HTTP 200 with empty content, or returns a reply that
+    cannot be parsed, or reconcile raises before anything is stored, the write
+    used to fall back to adding every extracted memory as-is (no dedup or
+    evolution) and report success. That fallback is removed, with its
+    `degraded` / `degraded_reason` result fields. The write now returns
+    `success: false`, `error_code: 502`,
+    `agent_error_code: "RECONCILE_FAILED"`, and the cause in the new
+    `reconcile_error_code` (`LLM_UNAVAILABLE`, `EMPTY_RESPONSE`,
+    `JSON_PARSE_FAILED`, `RECONCILE_EXCEPTION`). None of the new memories are
+    stored, the episode counter does not advance, and `add` rolls back its
+    raw turn the same way as an extraction failure
+    (`l1_rollback.retry_safe: true`). An empty 200 reply was previously
+    counted as "no changes" and reported success with 0 memories; only a
+    literal `[]` reply still means that. `RECONCILE_ENABLED=false` is a
+    configuration choice and still writes directly.
+  - Working / coding path: an extraction model failure used to return
+    success with 0 operations. It now returns `success: false` with
+    `agent_error_code` `LLM_ERROR`, `EMPTY_RESPONSE` or `JSON_PARSE_FAILED`.
+    A model that answers with nothing worth remembering is still a success.
+    An embedding failure used to store the experience or fact without a
+    vector, where search never finds it, and report success; it now returns
+    `EMBEDDING_FAILED` and the node is not stored. A fact embedding is checked
+    before any older fact is superseded. A failed write no longer appends its
+    turns to the recent trace and records no `chain_rounds`.
+    With `MEMORY_CODING_VERBATIM_FALLBACK_ENABLED` turned on, extraction
+    failures keep the verbatim fallback.
+  - Working / coding reconcile: when the experience reconcile or the fact
+    reconcile model call fails, returns empty content, or returns a reply that
+    is not a JSON object with an `ops` list, the write returns
+    `success: false`, `agent_error_code: "RECONCILE_FAILED"` and the cause in
+    `reconcile_error_code` (`LLM_UNAVAILABLE`, `EMPTY_RESPONSE`,
+    `JSON_PARSE_FAILED`), the same as chat. Before, experience reconcile fell
+    back to adding every draft, and fact reconcile inserted the new fact
+    without superseding older ones. Both model decisions now run before
+    anything is stored, so a failure in either leaves no experience or fact
+    from the write and supersedes no older fact. An experience reply of
+    `{"ops": []}` is a valid "no changes" decision: the write succeeds and no
+    experience is stored. A non-empty `ops` list with no recognizable op is a
+    parse failure. A fact reply of `{"ops": []}` inserts the new fact without
+    superseding anything. Fact reconcile still makes no model call when there
+    are no candidates.
+
+## Hy Memory 2.0.12 — 2026-11-02
+
+- Intention dedup is now configurable per client
+  (`MemoryConfig.recall.intention_dedup_enabled`, default `true`;
+  `recall.intention_dedup_threshold`, default `MEMORY_DEDUP_THRESHOLD` or
+  `0.95`). Env defaults: `MEMORY_INTENTION_DEDUP_ENABLED`,
+  `MEMORY_INTENTION_DEDUP_THRESHOLD`. When on, behaviour is unchanged
+  (duplicates found at read time are still deleted); when off, no intention
+  dedup runs, at read time or within a write batch, and nothing is hidden,
+  dropped or deleted. The threshold applies to read-time dedup only. Refs #241.
+
+- MemHub pins `hy-memory==2.0.12` and exposes that intention dedup switch in
+  its memory-features setting (`GET`/`PUT /api/v1/settings/memory-features`,
+  `memhub settings features`): the feature `intention_dedup` (default on) and
+  the numeric `intention_dedup_threshold` (default 0.95, accepted 0.8–1.0,
+  anything else is 422 or a CLI usage error). Unset, both keep the SDK
+  default, so nothing changes for the App; a change rebuilds the SDK clients
+  like the other feature switches. The API answer gains `parameters`, and
+  `pipeline.features` can now carry the threshold as a number. Refs #241.
+
+## MemHub 1.0.6 — 2026-11-04
+
+Build 45, on `hy-memory==2.0.14`. Linux x64/arm64 Runtime and macOS arm64
+App and Runtime.
+
+- MemHub App now exposes the complete memory-mode lifecycle. New installs
+  explicitly choose lite or pro during onboarding; pro completes only after a
+  generation model is active, while ultra remains an advanced Settings choice.
+  Settings shows mode effects, graph backfill, the default 03:00 evolve
+  schedule and manual evolve. The memory page shows original conversations in
+  lite and advanced memories in pro/ultra. Existing installs remain pro unless
+  the user changes them, and embedding maintenance blocks mode/evolve changes.
+- MemHub pins `hy-memory==2.0.14`. Lite search is plain RAG over raw: the
+  App's lite search, CLI context search, `/api/v1/recall` and the Host Bridge
+  (`MemHub_recall`, context search) return every vector hit above the floor,
+  ranked by score, over active and shadow raws, so history pro already
+  processed is still found after switching to lite. The turn view no longer
+  drops a hit whose turns do not literally contain the query; it shows the
+  hit's closest turn instead. Pro and ultra raw search stays active-only.
+  Fixes every raw search failing in packaged builds since #316, which passed
+  `statuses` to an SDK (2.0.13) that did not accept it. The lite raw-turn
+  page also stops re-listing the whole raw layer on each poll when a live
+  session only adds new raws.
+- MemHub Core no longer stalls writes or freezes the App for tens of seconds
+  on a machine with a long live-sync history. Finished live-sync import jobs
+  are pruned to the newest 20 per source (at startup, in bounded batches, and
+  every 10 minutes); history imports and every unfinished job are kept. Job
+  lookups are filtered in SQL with new indexes (schema migration 63) instead
+  of reading the whole table. The durable write queue runs its claims,
+  settles and lease renewals on its own threads, so import work can no longer
+  starve a lease. Import abandon, resume and enqueue, and the file watcher's
+  path attribution, no longer touch the database or the disk on the event
+  loop, and the WAL cadence checkpoint runs on its own thread instead of on
+  the writer's. The write drain now restarts itself after an unexpected exit,
+  reports the failure with its stack, and shows `write_drain` /
+  `write_drain_error` in memory-processing and `memhub status`.
+- Model Center (#293, #295): Settings splits into 界面语言 / 记忆模式 /
+  模型配置 pages, with separate 记忆整理 (generation) and 记忆搜索
+  (embedding) lanes. Changing one lane sends only that lane's patch. An
+  embedding change shows the switch plan, confirmation, progress, cancel and
+  rollback, and the search model only changes after the rebuilt index is
+  verified. Model panels open inside the lane that launched them and close
+  only after Core confirms the profile is active (#310).
+- Lite keeps raw conversations (#297): lite raw writes are no longer stopped
+  by the "pause model sedimentation" switch, the memory page lists every
+  imported raw conversation by role (by turn since #316), and lite adds a
+  manual raw input (source `one-memory-manual`) that never calls a
+  generation model.
+- The home page follows the memory mode (#298): lite counts raw
+  conversations and previews the latest one; pro and ultra read memories.
+  Pro and ultra now require an active generation model, in both the mode
+  preview and the switch.
+- Onboarding (#304) asks for lite or pro and resumes after a restart (schema
+  migration 62); pro finishes only once a generation model is active.
+- Smaller App fixes: compact home status copy (#307), clearer mode-switch
+  effects (#312), Ultra topic nodes are hover-only (#315), and settings
+  controls use the content width (#317).
+- Interfaces in 11 languages: English, Simplified and Traditional Chinese,
+  Japanese, Spanish, German, Portuguese, French, Korean, Russian and
+  Indonesian. Every interface language, Simplified Chinese included, sets the
+  SDK prompt language (#270). **User-visible:** zh-Hans users now get Chinese
+  prompts and Chinese memory text for every conversation, English ones
+  included; the App sends the language it displays, also when it follows the
+  system. Only an unset language (CLI/API installs, `memhub settings language
+  system`) keeps the SDK's zh/en detection.
+- Memory modes: lite (no LLM, keeps raw conversations), pro (LLM extraction)
+  and ultra (pro plus the knowledge graph and a nightly evolve run). Set with
+  `GET`/`PUT /api/v1/settings/memory-mode` or `memhub settings mode`. Raw
+  conversations are now kept permanently. `POST /api/v2/evolve` and
+  `memhub evolve` run System 2 on demand.
+- Safe embedding-model switching: an embedding-space registry, a switch that
+  pauses writes, re-embeds every user's vectors and the graph, verifies and
+  commits atomically, and resumes after a crash or an App update. Every start
+  scans the vector store and merges data left in other spaces. When the
+  embedding service is unavailable, search returns `embedding_unavailable`.
+- Multi-user Runtime: memory APIs and the CLI take `user_id` (default
+  `local`); records are isolated per user; Hermes profiles can be connected as
+  separate users. The App keeps using `local`. Hardening (#280): read
+  responses echo `user_id`; deleting another user's memory, or one that does
+  not exist, is 404 `memory_not_found` (the App and `memhub memories delete`
+  treat it as already gone); Hermes never reads a `profiles/` directory, and
+  a root that is the `profiles` container or overlaps another user's grant is
+  refused (`hermes_root_is_profiles_container`,
+  `hermes_root_overlaps_other_user`).
+- Configurable SDK features through the CLI and API (`memhub settings
+  features`): graph rerank, episode recall, session episodes, episode
+  summaries, intention and few-shot, and the intention dedup switch with its
+  threshold (`intention_dedup`, `intention_dedup_threshold`, #277). Defaults
+  are unchanged.
+- Memory writes retry themselves (#278), each time under a new SDK request
+  id after checking whether the previous one landed; interrupted writes
+  re-run automatically. A model provider failure (401/403, 404, 408, 429,
+  5xx, timeout, unreachable) keeps the job pending in place without spending
+  a retry, and a per-profile circuit breaker paces the queue (5 s doubling to
+  180 s, one probe job at a time). Any other failure is retried after 30, 60
+  and 120 s, then `failed`. With `hy-memory==2.0.13` a model failure is no
+  longer a silent success, and a failed job's `error_code` names the SDK's
+  cause (`hy_sdk_reconcile_empty_response`, `hy_sdk_llm_error`, ...) rather
+  than `hy_sdk_write_failed`. **User-visible:** the manual 重新整理 button,
+  the "整理结果不确定" display and
+  `POST /api/v1/memory-processing/retry-unknown` are gone; a banner
+  ("模型配置有问题……记忆暂停处理，已有 N 条在排队") with a button to the model
+  settings shows while a model problem pauses processing, and clears on
+  recovery.
+- Queue, WAL and recall (#278): the WAL stays bounded (64 MiB journal limit,
+  idle `TRUNCATE` checkpoints); a disabled or revoked source's jobs are
+  `suspended` and resume when it is turned back on; SDK writes and recall
+  reads use separate thread pools, and recall has a total budget (504
+  `recall_timeout`, `broker_timeout` in clients) instead of starving behind
+  stuck writes.
+- One Runtime per data dir (#273). App quit asks the service manager at quit
+  time: an enabled background service is never stopped, a disabled one has
+  every Runtime of the data dir stopped (only after an authenticated identity
+  check), and an unknown state stops nothing. At start the App adopts a
+  Runtime of the same build, replaces an older one, and silently adopts a
+  newer one. The tray quit label follows the current state.
+- DeepSeek Harness: the app page's one switch installs and grants recall for
+  every detected profile, and keeps new profiles granted without a restart
+  (#230); versioned session files (`session.v3.jsonl.zstd`,
+  `session.v4.jsonl.zstd`) are imported, and v4 tool output goes through the
+  same clipping and scrubbing (#175).
+- The packaged Runtime accepts only a full 40-character commit, lowercased; a
+  malformed `ONE_MEMORY_COMMIT` fails the build (#235, #236).
+- Search and recall pass through the SDK's search parameters with server-side
+  score floors; the memory library filters by layer; `/api/v2/raw` returns
+  data again; v2 source and import routes; profile version history.
+- Upgrade fixes: migration no longer stops without a model profile (#234) or
+  on a pre-existing readback mismatch (#229, #240); source grants work after
+  the cutover (#233); reads use the active embedding (#242); the embedding
+  endpoint no longer follows the generation `base_url`.
+- Hermes import drops gateway notices and probes and unwraps relayed
+  messages; `memhub logs` no longer reports valid older records as damaged.
+
+## Hy Memory 2.0.11 — 2026-11-01
+
+- Published
+  [`hy-memory==2.0.11`](https://pypi.org/project/hy-memory/2.0.11/).
+- LLM prompts now ship in 11 languages: `en`, `zh-Hans`,
+  `zh-Hant`, `ja`, `es`, `de`, `pt`, `fr`, `ko`, `ru` and `id`. They live in
+  one registry, `hy_memory/prompts/`, with one module per language. Call
+  sites use `get_prompt(name, language)`, so a new language only needs a new
+  module. The registry covers chat extraction (system prompt, basic_info,
+  intentions, few-shot including Example 11), the no-intention variant,
+  reconcile and its search-query prompt, the working/coding extractor, both
+  coding reconcilers and the chain summary, the episode and topic summaries,
+  System 2 evolve, and the user name line. The English and Simplified Chinese
+  strings are unchanged byte for byte, and a test pins them. The old names
+  (`prompts_zh.*_ZH`, `extractor.EXTRACT_SYSTEM_PROMPT`, ...) still import.
+  The nine new languages are machine translations, and native-speaker review
+  is recommended.
+- New optional `language` to choose the prompt language
+  explicitly. Set it on `MemoryConfig.language` (env `MEMORY_LANGUAGE`) for
+  a client default, or per call on `add` / `async_add`, `add_extracted`,
+  `finalize_session`, `evolve` and `sweep`. A per-call value overrides the
+  config. The value goes through every LLM call of the request: extract and
+  basic profile, reconcile, the coding path, the summaries and System 2.
+  Aliases: `zh`, `zh-CN` → `zh-Hans`; `zh-TW`, `zh-HK` → `zh-Hant`; `pt-BR` →
+  `pt`. An unknown code raises `ValueError` listing the supported codes, and
+  the HTTP server returns 400. With an explicit language, memories are
+  written in that language even when the conversation uses another one.
+  Without a language, the existing zh/en auto-detection runs unchanged and
+  memories keep the source language. `search` has no `language`: its judge
+  and rewrite prompts are English-only and keep the query's language.
+- The HTTP server accepts `language` on `/api/v1/add` and
+  `/api/v1/add_extracted`.
+
+## Hy Memory 2.0.10 — 2026-11-01
+
+- Published
+  [`hy-memory==2.0.10`](https://pypi.org/project/hy-memory/2.0.10/).
+- New `hy_memory.reembed` module for switching the embedding
+  model. Writers must be paused for the whole run. Nothing is derived from
+  the provider or endpoint: source and target are named explicitly, and the
+  identity of a space is the model name plus the width (`space_identity`).
+  Only Chroma and Kuzu are supported.
+  - `vector_space_names(config, base_name=None)` returns every physical
+    collection a client opens for the six vector roles: memory, entities,
+    coding keys and working facts, each in the working and coding variants.
+  - `reembed_vector_space(source, target, embedding=...)` pages every raw
+    source collection, covering all users and all layers including L1_RAW. It
+    embeds the text the write path embedded (`reembed_text`: the canonical
+    state's `state_retrieval_text`, a schema's `retrieval_text`, otherwise the
+    document). It then writes each record into the target with the same id,
+    document and metadata. Each batch's widths are checked before anything is
+    written. A cancel stops at a batch boundary (`ReembedCancelled`). A rerun
+    skips the ids the target already holds, so it resumes, and a merge never
+    overwrites the target. The source is never written.
+  - `plan_reembed`, `verify_reembed` and `drop_vector_space` complete the
+    vector side. `verify_reembed` checks ids, metadata, per-user counts and
+    the width, and runs a self-recall sample. `drop_vector_space` refuses
+    collections that a live client in this process holds open.
+  - `scan_vector_spaces(persist_directory)` is read-only. It lists every
+    space on disk with its roles, counts, stored width, per-user counts and
+    the models recorded in metadata. `diff_spaces(source, target)` returns the
+    ids that the source holds and the target lacks, whatever their status.
+  - `reembed_graph(source_path, target_path, embedding=..., target_dims=...)`
+    builds a new Kuzu graph at the new width. It copies every node and edge
+    and recomputes `Memory.embedding`, `Memory.beh_embedding`, and the Topic
+    and HierarchyTopic embeddings, then rebuilds the HNSW index. The source
+    graph is opened read-only and kept for rollback. A run that fails or is
+    cancelled leaves no target behind, and a rerun starts over.
+    `verify_graph_reembed` and `drop_graph` complete the graph side.
+- `EmbedService.embed_batch` now splits large batches into
+  requests of `embedder.batch_size` texts each (`MEMORY_EMBEDDER_BATCH_SIZE`,
+  default 64); before, it sent them all in one request. On a 429 it waits for
+  the `Retry-After` time plus jitter, capped at 60 s. It takes a per-call
+  `max_retries`. A returned vector whose width differs from the configured
+  `embedding_dims` now raises `EmbeddingDimensionMismatchError` and is not
+  retried.
+- Raw conversations are stored already trimmed. MemHub now keeps every raw
+  forever and lite mode stores nothing else, so tool output and long pasted
+  logs no longer stay in full. One rule (`hy_memory/utils/raw_trim.py`) is
+  applied to each message when the raw is written:
+  - `user` and `system` turns are kept in full;
+  - `assistant` turns and other speakers (`[John]:`) longer than 500
+    characters, after stripping, are cut to the first 500 plus `...`. This is
+    the limit history injection used before;
+  - `tool` turns keep their head and tail, and the middle becomes
+    `[...N bytes omitted by truncate...]`, with the coding limit
+    `coding.tool_result_max_bytes` (`MEMORY_CODING_TOOL_RESULT_MAX_BYTES`,
+    default 2048).
+
+  The rule is idempotent. It covers chat `L1_RAW` in lite, pro and ultra (lite
+  keeps tool turns, because it has no coding route) and the `memory_history`
+  ADD record. The coding/working `coding_trace` was already trimmed when it
+  was written. Its tool and assistant truncations are now idempotent, so
+  reading the history back no longer rewrites the omitted-count markers. The
+  text embedded for `L1_RAW` is the trimmed text. New raws carry
+  `custom.raw_trimmed=true`.
+- Extractor history ("last k messages") now joins the stored raws directly
+  and does not trim them again. Raws written before this change have no
+  `raw_trimmed` flag, so they are still trimmed with the same rule when they
+  are read. The extractor still receives the current batch in full (tool
+  turns are still removed on the chat route).
+
 ## MemHub 1.0.5 — 2026-10-28
 
 Build 36, on `hy-memory==2.0.8`. Linux x64/arm64 Runtime and macOS arm64
@@ -117,6 +451,29 @@ authority on first launch.
   parked pre-invocation work, and drop only the obsolete
   `hy_node_permissions` proof table. Evidence, governed memories, model
   profiles, SDK stores, and source/host grants are preserved.
+
+## Hy Memory 2.0.9 — 2026-11-01
+
+- Published
+  [`hy-memory==2.0.9`](https://pypi.org/project/hy-memory/2.0.9/).
+- Placeholder values no longer overwrite the user's basic profile (L0). A
+  small extraction model filled `basic_info` with `{"name": "用户"}`,
+  `The user` or `N/A` when the user had said nothing about themselves, and
+  each placeholder superseded the real value, so the L0 chain read
+  费天翔 → Fei → 用户 → The user. Two defences:
+  - `upsert_basic_profile` drops placeholder values: empty, `用户`,
+    `the user`, `user`, `n/a`, `na`, `none`, `null`, `unknown`, `未提供`,
+    `未知`, `不详`, `-`, `?` and the field's own name, compared
+    case-insensitively with whitespace and punctuation stripped. When nothing
+    is left it writes no new version and no new L0 head. Placeholders already
+    stored in the chain no longer override earlier real values when the
+    profile is assembled, so `get_user_profile` of an affected user shows the
+    last real value again without any migration. This also stops an
+    assistant quoting an old memory ("The user's name is 用户.") from being
+    written back.
+  - The extraction prompts (zh and en) state the rule: only what the user
+    said in a `user` turn, never the field name or a placeholder, `{}`
+    otherwise, with a small-talk counter-example.
 
 ## Hy Memory 2.0.8 — 2026-10-28
 

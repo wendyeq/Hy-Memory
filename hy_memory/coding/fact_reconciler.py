@@ -18,17 +18,24 @@ import json
 import logging
 import os
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..agent.llm_provider import LLMProvider
 from ..core.embed_service import EmbedService
-from ..utils.lang_detect import is_chinese
+from ..prompts import (
+    get_prompt,
+    normalize_language,
+    resolve_language,
+    with_output_language,
+)
 from .store import CodingMemoryStore
 from .types import (
 
 
     MAX_FACT_CHAIN_ENTRIES,
+    CodingWriteError,
     FactReconcileOp,
     WorkingFact,
     WorkingFactDraft,
@@ -206,143 +213,10 @@ def _subject_conflict(new_subject: str, old_subject: str) -> bool:
 # General subject-isolation rules belong in the prompt; lookalike examples
 # encourage pattern matching instead of teaching the rule.
 
-FACT_RECONCILE_PROMPT = """\
-You maintain session-level WORKING FACTS. Each statement summarizes one whole
-trace/session: the user's task, the rough approach, and the result. It is not an
-atomic claim.
-
-Every new session fact below WILL be stored; that is not your decision. Your only
-job is to detect task continuation: is the new session continuing to advance the
-SAME user task as an existing session fact? If so, SUPERSEDE the older fact so
-the links form a cross-session progress chain for that task.
-
-Mark an existing fact as superseded ONLY when there is strong evidence that:
-  - The subjects match: both records are about the SAME entity — the same
-    person, the same file/module, the same host/service. A shared subject is
-    necessary but not sufficient; AND
-  - The user goal is materially the SAME, not merely in the same topic/project;
-    AND
-  - The new trace continues, retries, extends, verifies, or finishes the work
-    recorded by the existing trace.
-
-Do NOT supersede when:
-  - The two records name different subjects. Two people in one group, two files
-    in one module, two hosts in one cluster are PARALLEL, not successive: one
-    person's state is not a newer version of another's. Where a subject is shown
-    as (unspecified), fall back to judging by the statement alone.
-  - The sessions merely mention the same file, symbol, component, repository,
-    error, or technology but pursue different user goals.
-  - One task only supplies context or a technique for another task.
-  - The relationship is uncertain. Be conservative: INSERT is the safe default;
-    merging unrelated sessions destroys their separate task history.
-
-Treat each statement as evidence-bounded text. Do not reinterpret an inference
-inside it as an established cause or use a shared conjecture/error as proof that
-the user goals are the same. Your decision is only about task continuation; do
-not "correct", complete, or embellish either session record.
-
-Examples:
-  existing: "The user needed to fix CI's npm run build; traced it to
-             ERR_OSSL_EVP_UNSUPPORTED under Node 18, workflow not yet changed."
-  new:      "The user continued fixing the same CI build; raised Node in
-             .github/workflows/ci.yml to 20 and npm run build passed."
-                                                                 → SUPERSEDE
-
-  existing: "The user needed to fix JWT expiry handling in
-             auth/middleware.ts; refresh logic was added."
-  new:      "The user needed performance logging added to
-             auth/middleware.ts; a latency metric was introduced."
-                                                                 → keep both
-            (same file/project, different user goal)
-
-═══════════════════════════════════════════════════════════════════
-NEW SESSION FACTS
-═══════════════════════════════════════════════════════════════════
-{drafts_block}
-
-═══════════════════════════════════════════════════════════════════
-EXISTING SESSION FACTS (per new fact, retrieved by statement similarity)
-═══════════════════════════════════════════════════════════════════
-{candidates_block}
-
-═══════════════════════════════════════════════════════════════════
-OUTPUT (strict JSON only, no markdown)
-═══════════════════════════════════════════════════════════════════
-{{
-  "ops": [
-    {{"draft_idx": 0, "supersedes": ["fact_xxx"], "reason": "continues the same CI fix task"}},
-    {{"draft_idx": 1, "supersedes": []}}
-  ]
-}}
-
-Only use fact ids that appear in the candidate list for that same draft_idx.
-If nothing is superseded anywhere, output {{"ops": []}}.
-"""
+from ..prompts.en import CODING_FACT_RECONCILE_PROMPT as FACT_RECONCILE_PROMPT  # noqa: E402,F401  (re-export)
 
 
-CHAIN_SUMMARY_PROMPT = """\
-A user task in a working-memory store has progressed across sessions. Below are
-the session summaries in that task's progress chain, oldest first, ending with
-the current session.
-
-Summarize how the SAME task progressed across sessions to its current state.
-Cover every important stage in chronological order. For each stage, preserve
-where available: the actual action or change, its direct result, and any
-unresolved issue or limiting condition. End with an explicit current status.
-
-Rules:
-  - This is compression only. Report ONLY what the entries say; never add or
-    complete a command, cause, motive, action, test result, success state, or
-    global negative conclusion.
-  - Preserve evidence status exactly: attempted is not completed, observed is
-    not verified, inferred is not established, and unresolved stays unresolved.
-    Keep uncertainty words and search/permission/coverage limits.
-  - State the current ending status faithfully (completed, partially completed,
-    failed, blocked, or still awaiting verification). Never upgrade it based on
-    a plausible causal story or on a later entry that did not verify it.
-  - When entries mention a suspected cause and a later result, connect them
-    causally only if an entry directly says that cause was verified.
-  - Preserve concrete retrieval anchors: file paths, symbols, commands, error
-    strings, versions, config keys/values, and important numeric values that
-    matter to the progress.
-  - For chains of 2-3 generations, do not over-compress the progression into one
-    sentence. Prefer 2-4 compact paragraphs when useful, or readable prose with
-    a clear task goal, stage-by-stage progression, and current status.
-  - Do not mechanically copy the full history. Omit repetition and low-value
-    detail while retaining important actions, direct results, and leftovers.
-  - Do not invent stage headings or dates. Mention a date only when the entries
-    make it meaningful; bare timestamps are noise.
-  - If the entries say older revisions were omitted, explicitly state that
-    earlier history was omitted; do not imply the supplied entries are complete.
-  - Write in the same language the entries are written in.
-  - No preamble or enclosing quotes.
-
-Example
-  entries:
-    (2026-07-20) The user needed to fix CI's npm run build; traced it to
-                 ERR_OSSL_EVP_UNSUPPORTED under Node 18, workflow not yet
-                 changed.
-    (2026-07-24) The user continued that CI fix; raised Node in
-                 .github/workflows/ci.yml to 20, but the dependency cache
-                 still reproduced the old error.
-    (now)        The user continued verifying the same fix; after clearing the
-                 npm cache, npm run build passed.
-  output:
-    The task goal is fixing CI's npm run build. It was first traced to
-    ERR_OSSL_EVP_UNSUPPORTED under Node 18, with the workflow not yet changed;
-    then .github/workflows/ci.yml was raised to Node 20, but the dependency
-    cache kept the old error present. Finally, after clearing the npm cache,
-    npm run build passed, so this build fix is currently verified as complete.
-
-═══════════════════════════════════════════════════════════════════
-ENTRIES
-═══════════════════════════════════════════════════════════════════
-{chain_block}
-
-═══════════════════════════════════════════════════════════════════
-OUTPUT (the summary itself, nothing else)
-═══════════════════════════════════════════════════════════════════
-"""
+from ..prompts.en import CODING_CHAIN_SUMMARY_PROMPT as CHAIN_SUMMARY_PROMPT  # noqa: E402,F401  (re-export)
 
 
 def _fact_drafts_language_text(drafts: List[WorkingFactDraft]) -> str:
@@ -357,37 +231,44 @@ def _fact_drafts_language_text(drafts: List[WorkingFactDraft]) -> str:
 def build_fact_reconcile_prompt(
     drafts: List[WorkingFactDraft],
     candidates: List[List[WorkingFact]],
+    language: Optional[str] = None,
 ) -> Tuple[str, str]:
-    """Return the language-matched fact reconcile prompt and language."""
-    if is_chinese(_fact_drafts_language_text(drafts)):
-        from .prompts_zh import FACT_RECONCILE_PROMPT_ZH
+    """Return the fact reconcile prompt and its language code.
 
-        template = FACT_RECONCILE_PROMPT_ZH
-        language = "zh"
-    else:
-        template = FACT_RECONCILE_PROMPT
-        language = "en"
-    return template.format(
+    Explicit ``language`` wins; otherwise zh/en auto-detection over the drafts.
+    """
+    explicit = normalize_language(language)
+    code = resolve_language(explicit, _fact_drafts_language_text(drafts))
+    prompt = get_prompt("CODING_FACT_RECONCILE_PROMPT", code).format(
         drafts_block=WorkingFactReconciler._format_drafts(drafts),
         candidates_block=WorkingFactReconciler._format_candidates(drafts, candidates),
-    ), language
+    )
+    return with_output_language(prompt, code, explicit=explicit is not None), code
 
 
 def build_chain_summary_prompt(
     chain_block: str,
     *,
     current_statement: str,
+    language: Optional[str] = None,
 ) -> Tuple[str, str]:
-    """Return the language-matched cross-session summary prompt and language."""
-    if is_chinese(current_statement or chain_block):
-        from .prompts_zh import CHAIN_SUMMARY_PROMPT_ZH
+    """Return the cross-session summary prompt and its language code."""
+    explicit = normalize_language(language)
+    code = resolve_language(explicit, current_statement or chain_block)
+    prompt = get_prompt("CODING_CHAIN_SUMMARY_PROMPT", code).format(
+        chain_block=chain_block,
+    )
+    return with_output_language(prompt, code, explicit=explicit is not None), code
 
-        template = CHAIN_SUMMARY_PROMPT_ZH
-        language = "zh"
-    else:
-        template = CHAIN_SUMMARY_PROMPT
-        language = "en"
-    return template.format(chain_block=chain_block), language
+
+@dataclass
+class FactReconcilePlan:
+    """plan() 的产物：覆盖判定已完成、尚未落库。apply() 才执行 store 操作。"""
+
+    drafts: List[WorkingFactDraft]
+    candidates: List[List[WorkingFact]] = field(default_factory=list)
+    supersedes: Dict[int, List[str]] = field(default_factory=dict)
+    context: Dict[str, Any] = field(default_factory=dict)
 
 
 # ================================================================
@@ -455,16 +336,66 @@ class WorkingFactReconciler:
         branch: Optional[str] = None,
         source: str = "default",
         memory_at: Optional[datetime] = None,
+        language: Optional[str] = None,
     ) -> Tuple[List[WorkingFact], List[FactReconcileOp]]:
         """
-        执行 reconcile + 持久化。memory_at 是这段对话的时间，记到新事实上。
+        执行 reconcile + 持久化（plan() 后紧接 apply()）。memory_at 是这段对话的
+        时间，记到新事实上。language 为显式 prompt 语言码（None → zh/en 自动检测），
+        同时用于演变总结。
 
         Returns:
-            (真正落库的新事实, 执行过的 ops)。LLM 挂掉时退化为全 INSERT 不覆盖，
-            宁可多留一条过期事实，也不因为一次调用失败丢结论。
+            (真正落库的新事实, 执行过的 ops)。
+
+        Raises:
+            CodingWriteError(RECONCILE_FAILED)：覆盖判定的 LLM 失败 / 空回复 /
+                解析不出。此时既不插入新事实，也不覆盖任何旧事实。
         """
+        plan = await self.plan(
+            drafts,
+            user_id=user_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            workspace_id=workspace_id,
+            branch=branch,
+            source=source,
+            memory_at=memory_at,
+            language=language,
+        )
+        return await self.apply(plan)
+
+    async def plan(
+        self,
+        drafts: List[WorkingFactDraft],
+        *,
+        user_id: str,
+        agent_id: str = "default_agent",
+        session_id: Optional[str] = None,
+        workspace_id: Optional[str] = None,
+        branch: Optional[str] = None,
+        source: str = "default",
+        memory_at: Optional[datetime] = None,
+        language: Optional[str] = None,
+    ) -> FactReconcilePlan:
+        """检索 candidates + 覆盖判定，不落库。
+
+        没有任何候选时不调 LLM（全部 INSERT 是确定的结论，不是兜底）。调了 LLM 时，
+        有效回复 = JSON 对象且 "ops" 是列表（空列表 = 都不覆盖、只插入）。LLM 调用
+        失败（LLM_UNAVAILABLE）、200 但 content 为空（EMPTY_RESPONSE）、回复不是
+        上述形状（JSON_PARSE_FAILED）时抛 CodingWriteError(RECONCILE_FAILED)。
+        此前 LLM 失败会退化为全 INSERT 不覆盖，留下本该被接续的旧事实。
+        """
+        context = dict(
+            user_id=user_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            workspace_id=workspace_id,
+            branch=branch,
+            source=source,
+            memory_at=memory_at,
+            language=language,
+        )
         if not drafts:
-            return [], []
+            return FactReconcilePlan(drafts=[], context=context)
 
         candidates = await self._retrieve_candidates(
             drafts,
@@ -477,27 +408,38 @@ class WorkingFactReconciler:
         )
 
         try:
-            supersedes = await self._llm_decide(drafts, candidates)
+            supersedes = await self._llm_decide(drafts, candidates, language=language)
+        except CodingWriteError:
+            raise
         except Exception as e:
-            logger.warning(
-                f"[fact-reconcile] LLM decide failed, insert without supersede: {e}"
-            )
-            supersedes = {}
+            logger.warning(f"[fact-reconcile] LLM decide failed: {e}")
+            raise CodingWriteError(
+                "RECONCILE_FAILED",
+                f"working fact reconcile LLM call failed: {type(e).__name__}: {e}",
+                cause="LLM_UNAVAILABLE",
+            ) from e
 
+        return FactReconcilePlan(
+            drafts=list(drafts),
+            candidates=candidates,
+            supersedes=supersedes,
+            context=context,
+        )
+
+    async def apply(
+        self, plan: FactReconcilePlan,
+    ) -> Tuple[List[WorkingFact], List[FactReconcileOp]]:
+        """执行 plan() 的决策（覆盖旧事实 + 插入新事实）。"""
+        if not plan.drafts:
+            return [], []
         facts, ops = await self._execute(
-            drafts,
-            candidates,
-            supersedes,
-            user_id=user_id,
-            agent_id=agent_id,
-            session_id=session_id,
-            workspace_id=workspace_id,
-            branch=branch,
-            source=source,
-            memory_at=memory_at,
+            plan.drafts,
+            plan.candidates,
+            plan.supersedes,
+            **plan.context,
         )
         logger.info(
-            f"[fact-reconcile] drafts={len(drafts)} inserted={len(facts)} "
+            f"[fact-reconcile] drafts={len(plan.drafts)} inserted={len(facts)} "
             f"superseded={sum(1 for o in ops if o.action == 'SUPERSEDE')}"
         )
         return facts, ops
@@ -588,18 +530,24 @@ class WorkingFactReconciler:
         self,
         drafts: List[WorkingFactDraft],
         candidates: List[List[WorkingFact]],
+        language: Optional[str] = None,
     ) -> Dict[int, List[str]]:
         """返回 {draft_idx: [被它覆盖的旧 fact_id, ...]}。"""
         # 一条候选都没有就没得判，省一次 LLM 调用
         if not any(candidates):
             return {}
 
-        prompt, _ = build_fact_reconcile_prompt(drafts, candidates)
+        prompt, _ = build_fact_reconcile_prompt(drafts, candidates, language=language)
         resp = await self.llm_provider.complete(
             prompt=prompt,
             max_tokens=self.max_tokens,
             audit_stage="coding_fact_reconcile",
         )
+        failure = self._reply_failure(resp.content)
+        if failure is not None:
+            code, message = failure
+            logger.warning(f"[fact-reconcile] {code}: {message}")
+            raise CodingWriteError("RECONCILE_FAILED", message, cause=code)
         return self._parse_ops(resp.content)
 
     # ------------------------------------------------------------
@@ -638,7 +586,8 @@ class WorkingFactReconciler:
         return ordered[-MAX_FACT_CHAIN_ENTRIES:], truncated
 
     async def _summarize_chain(
-        self, history: List[WorkingFact], current: str, *, truncated: bool = False
+        self, history: List[WorkingFact], current: str, *, truncated: bool = False,
+        language: Optional[str] = None,
     ) -> str:
         """让 LLM 把同一任务的跨 session 进展写成简短摘要。
 
@@ -659,6 +608,7 @@ class WorkingFactReconciler:
         prompt, _ = build_chain_summary_prompt(
             "\n".join(rows),
             current_statement=current,
+            language=language,
         )
 
         try:
@@ -724,11 +674,24 @@ class WorkingFactReconciler:
             rows.append(f"for draft[{i}]:\n" + "\n".join(cand_rows))
         return "\n\n".join(rows) if rows else "(none)"
 
+    @classmethod
+    def _reply_failure(cls, text: Optional[str]) -> Optional[Tuple[str, str]]:
+        """回复本身是失败时返回 (cause, message)；有效回复（含 {"ops": []}）返回 None。"""
+        if not (text or "").strip():
+            return "EMPTY_RESPONSE", "working fact reconcile LLM returned empty response"
+        obj = cls._load_object(text)
+        if not isinstance(obj, dict) or not isinstance(obj.get("ops"), list):
+            return (
+                "JSON_PARSE_FAILED",
+                f"working fact reconcile output has no ops list ({len(text)} chars)",
+            )
+        return None
+
     @staticmethod
-    def _parse_ops(text: str) -> Dict[int, List[str]]:
-        """宽松解析 ops，返回 {draft_idx: [fact_id...]}。"""
+    def _load_object(text: Optional[str]) -> Optional[Dict[str, Any]]:
+        """宽松解析出顶层 JSON 对象；解析不出返回 None。"""
         if not text:
-            return {}
+            return None
         s = text.strip()
         # 去 markdown fence
         if s.startswith("```"):
@@ -746,7 +709,14 @@ class WorkingFactReconciler:
                     obj = json.loads(s[start: end + 1])
                 except Exception:
                     obj = None
+        return obj if isinstance(obj, dict) else None
 
+    @classmethod
+    def _parse_ops(cls, text: str) -> Dict[int, List[str]]:
+        """宽松解析 ops，返回 {draft_idx: [fact_id...]}。"""
+        if not text:
+            return {}
+        obj = cls._load_object(text)
         if not isinstance(obj, dict):
             logger.warning(
                 f"[fact-reconcile] failed to parse ops output ({len(text or '')} chars)"
@@ -790,6 +760,7 @@ class WorkingFactReconciler:
         branch: Optional[str] = None,
         source: str = "default",
         memory_at: Optional[datetime] = None,
+        language: Optional[str] = None,
     ) -> Tuple[List[WorkingFact], List[FactReconcileOp]]:
         inserted: List[WorkingFact] = []
         ops: List[FactReconcileOp] = []
@@ -812,6 +783,11 @@ class WorkingFactReconciler:
                 status="active",
                 memory_at=memory_at,
             )
+
+            # 先确认新事实能向量化，再去覆盖旧事实：否则 embedding 挂掉时旧事实
+            # 已被软删、新事实又落不了库，这条结论就凭空没了。失败抛
+            # CodingWriteError(EMBEDDING_FAILED)，整次写入报失败。
+            new_embedding = await self.store.embed_fact(new_fact)
 
             allowed = {c.fact_id for c in (candidates[idx] if idx < len(candidates) else [])}
             targets = [
@@ -873,7 +849,8 @@ class WorkingFactReconciler:
                     retired, user_id=user_id
                 )
                 new_fact.fact_chain_summary = await self._summarize_chain(
-                    history, new_fact.statement, truncated=truncated
+                    history, new_fact.statement, truncated=truncated,
+                    language=language,
                 )
                 # 摘要之外再把历代自己的 details 原样过继一份。摘要保叙事，过继保数值，
                 # 两者不重复：details 本来就不进摘要（_collect_history 只读 statement）。
@@ -892,7 +869,9 @@ class WorkingFactReconciler:
                         )
 
             try:
-                await self.store.insert_fact(new_fact)
+                await self.store.insert_fact(new_fact, embedding=new_embedding)
+            except CodingWriteError:
+                raise
             except Exception as e:
                 logger.warning(f"[fact-reconcile] INSERT failed: {e}")
                 continue

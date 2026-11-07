@@ -35,7 +35,7 @@ import re  # noqa: E402
 import time  # noqa: E402
 from collections.abc import Iterator, Sequence  # noqa: E402
 from pathlib import Path  # noqa: E402
-from typing import TextIO  # noqa: E402
+from typing import Any, TextIO  # noqa: E402
 
 from one_memory.config import load_settings  # noqa: E402
 from one_memory.runtime_client import RuntimeStatus, inspect_runtime  # noqa: E402
@@ -119,7 +119,7 @@ def run(arguments: Sequence[str], *, output: TextIO | None = None) -> int:
     if command == "sdk-migration-status":
         return sdk_migration_status(options, stream)
     if command == "capture" and len(options) == 1:
-        from one_memory.live_capture import capture_stdio
+        from one_memory.capture_handoff import capture_stdio
 
         return capture_stdio(options[0], sys.stdin, stream)
     if command not in {"status", "doctor"} or options not in ([], ["--json"]):
@@ -584,6 +584,7 @@ def _sdk_migration_status(options: Sequence[str], stream: TextIO) -> int:
         }
     else:
         from one_memory.hy_runtime_config import HY_MEMORY_NAMESPACE
+        from one_memory.hy_sdk_runtime import builtin_retrieval_snapshot
         from one_memory.sdk_data_plane_migration import (
             MemoryAuthority,
             SdkDataPlaneMigrationStore,
@@ -595,19 +596,27 @@ def _sdk_migration_status(options: Sequence[str], stream: TextIO) -> int:
 
         authority = SdkDataPlaneMigrationStore(database_path).authority()
         if authority is MemoryAuthority.SDK:
-            profile = read_active_profile(database_path)
+            profile = read_active_profile(database_path) or builtin_retrieval_snapshot()
             leftovers = bool(
                 legacy_tables_present(database_path)
                 or abandoned_staging_present(
                     data_dir=settings.data_dir,
                     namespace=HY_MEMORY_NAMESPACE,
                 )
-                or (profile is not None and legacy_vector_collections(settings.data_dir, profile))
+                or legacy_vector_collections(settings.data_dir, profile)
             )
             state = "required" if leftovers else "not_required"
         else:
             state = "required"
         document = {"schema_version": 1, "authority": authority.value, "state": state}
+        from one_memory.embedding_switch import read_open_job
+
+        # Informational. An unfinished embedding switch never makes a
+        # migration required or blocks it: the upgrade installs, `sdk-migrate`
+        # leaves the switch's tables alone, and the new Core resumes the job.
+        switch = read_open_job(database_path)
+        if switch is not None:
+            document["embedding_switch"] = switch
     from one_memory.sdk_migration_log import write_migration_log
 
     write_migration_log(
@@ -615,7 +624,15 @@ def _sdk_migration_status(options: Sequence[str], stream: TextIO) -> int:
         writer="core-sdk-migration-status",
         event="status.probed",
         outcome="succeeded",
-        details={"authority": document["authority"], "state": document["state"]},
+        details={
+            "authority": document["authority"],
+            "state": document["state"],
+            **(
+                {"embedding_switch": document["embedding_switch"]}
+                if "embedding_switch" in document
+                else {}
+            ),
+        },
     )
     if as_json:
         stream.write(f"{json.dumps(document, ensure_ascii=False)}\n")
@@ -695,6 +712,12 @@ def _refuse_unmigrated_home(data_dir: Path) -> None:
     raise SystemExit(SDK_MIGRATION_REQUIRED_EXIT)
 
 
+def _without_embedding_switch(settings: Any) -> Any:
+    """The maintenance Core's settings: it never resumes or runs a switch."""
+    copy = getattr(settings, "model_copy", None)
+    return copy(update={"embedding_switch_worker": False}) if callable(copy) else settings
+
+
 def serve(*, maintenance: bool = False) -> None:
     import uvicorn
 
@@ -739,7 +762,8 @@ def serve(*, maintenance: bool = False) -> None:
     if launcher is not None:
         ParentWatchdog(launcher).start()
     application = create_app(
-        settings,
+        # Only the serving Core runs or resumes an embedding switch.
+        _without_embedding_switch(settings) if maintenance else settings,
         manage_runtime=not maintenance,
     )
     if maintenance:

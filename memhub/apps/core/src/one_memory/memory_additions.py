@@ -11,10 +11,11 @@ import asyncio
 import sqlite3
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from functools import partial
 from typing import Any, Literal, cast
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
 from fastapi.params import Depends
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -33,7 +34,9 @@ from one_memory.memory_governance import MemoryGovernanceStore, MemoryStatus
 from one_memory.memory_server.durable_queue import DurableWriteQueue
 from one_memory.memory_server.unified_entry import UnifiedWriteIntake
 from one_memory.memory_tasks import MemoryTaskStatus, MemoryTaskStore
+from one_memory.model_backoff import next_retry_at
 from one_memory.secrets import SecretStoreUnavailableError
+from one_memory.user_scope import DEFAULT_USER_ID, USER_ID_PATTERN, UserId
 
 SOURCE_ID = "one-memory-manual"
 MemoryAddState = Literal[
@@ -53,6 +56,8 @@ class MemoryAddInput(BaseModel):
     request_id: UUID
     text: str = Field(min_length=1, max_length=12_000)
     scope: Literal["all-apps"]
+    #: Whose memory this is. The App never sends it and writes `local`.
+    user_id: UserId = DEFAULT_USER_ID
 
     @field_validator("text")
     @classmethod
@@ -73,6 +78,12 @@ class MemoryAddReceipt(BaseModel):
     task_id: str | None = None
     memory_ids: list[str] = Field(default_factory=list)
     error: str | None = None
+    #: Why a note still being worked on last failed (`model_auth_failed`, ...),
+    #: or why a failed one failed. A provider failure keeps it `pending`.
+    error_code: str | None = None
+    #: When a pending note is next tried: its own retry wait, or the model
+    #: provider's pause while the provider is failing.
+    next_retry_at: str | None = None
 
 
 class LegacyMemoryAdditionReader:
@@ -108,7 +119,11 @@ class MemoryAdditionStore:
 
     def save(self, addition: MemoryAddInput) -> EvidenceRecord:
         now = datetime.now(UTC)
+        if addition.user_id != DEFAULT_USER_ID and not self.sdk_authority:
+            # Legacy authority keeps one person's library only.
+            raise ValueError("memory_add_user_requires_sdk_authority")
         value = EvidenceInput(
+            user_id=addition.user_id,
             source_id=SOURCE_ID,
             conversation_id=f"note:{addition.request_id}",
             message_id=str(addition.request_id),
@@ -200,7 +215,7 @@ class MemoryAdditionStore:
                 )
         return self.require(value.evidence_id)
 
-    def require(self, evidence_id: str) -> EvidenceRecord:
+    def require(self, evidence_id: str, *, user_id: str = DEFAULT_USER_ID) -> EvidenceRecord:
         if self.sdk_authority:
             if self.write_queue is None:
                 raise KeyError(evidence_id)
@@ -219,11 +234,11 @@ class MemoryAdditionStore:
                 (item for item in payload.input_records if item.evidence_id == evidence_id),
                 None,
             )
-            if record is None:
+            if record is None or record.user_id != user_id:
                 raise KeyError(evidence_id)
             return record
         record = self.evidence.get(evidence_id)
-        if record is None or record.user_id != "local" or record.source_id != SOURCE_ID:
+        if record is None or record.user_id != user_id or record.source_id != SOURCE_ID:
             raise KeyError(evidence_id)
         metadata = record.origin_meta.get(EvidenceOrigin.MANUAL_IMPORT)
         if metadata is None or metadata.raw_meta.get("input_mode") != "direct_memory_note":
@@ -237,8 +252,8 @@ class MemoryAdditionStore:
             raise ValueError("memory_add_source_revoked")
         return record
 
-    def receipt(self, evidence_id: str) -> MemoryAddReceipt:
-        record = self.require(evidence_id)
+    def receipt(self, evidence_id: str, *, user_id: str = DEFAULT_USER_ID) -> MemoryAddReceipt:
+        record = self.require(evidence_id, user_id=user_id)
         if self.sdk_authority:
             assert self.write_queue is not None
             with main_database(self.write_queue.database_path).read() as database:
@@ -250,6 +265,8 @@ class MemoryAdditionStore:
             durable_state = durable.state if durable is not None else "failed"
             mapped: MemoryAddState = {
                 "pending": "pending",
+                # Re-run automatically within seconds (`recover_unknown`).
+                "unknown": "pending",
                 "running": "running",
                 "waiting_for_model": "waiting_for_model",
                 "waiting_for_permission": "waiting_for_permission",
@@ -264,6 +281,12 @@ class MemoryAdditionStore:
                 state=mapped,
                 memory_ids=(list(durable.sdk_memory_ids) if durable is not None else []),
                 error=durable.detail if durable is not None else "write_missing",
+                error_code=(
+                    durable.error_code
+                    if durable is not None and durable.state != "completed"
+                    else None
+                ),
+                next_retry_at=durable.retry_at if durable is not None else None,
             )
         if self.processor is None:
             raise RuntimeError("legacy_memory_add_processor_unavailable")
@@ -300,10 +323,15 @@ class MemoryAdditionStore:
             error=error,
         )
 
-    def receipt_for_request(self, request_id: UUID) -> MemoryAddReceipt:
+    def receipt_for_request(
+        self, request_id: UUID, *, user_id: str = DEFAULT_USER_ID
+    ) -> MemoryAddReceipt:
         identity = str(request_id)
         if self.sdk_authority:
+            # The Evidence id carries the user, so another user's request id
+            # names a different note and reads as not found.
             probe = EvidenceInput(
+                user_id=user_id,
                 source_id=SOURCE_ID,
                 conversation_id=f"note:{identity}",
                 message_id=identity,
@@ -316,16 +344,16 @@ class MemoryAdditionStore:
                     )
                 },
             )
-            return self.receipt(probe.evidence_id)
+            return self.receipt(probe.evidence_id, user_id=user_id)
         with main_database(self.evidence.database_path).read() as db:
             row = db.execute(
-                "SELECT evidence_id FROM evidence WHERE user_id='local' AND source_id=? "
+                "SELECT evidence_id FROM evidence WHERE user_id=? AND source_id=? "
                 "AND conversation_id=? AND message_id=?",
-                (SOURCE_ID, f"note:{identity}", identity),
+                (user_id, SOURCE_ID, f"note:{identity}", identity),
             ).fetchone()
         if row is None:
             raise KeyError(identity)
-        return self.receipt(str(row[0]))
+        return self.receipt(str(row[0]), user_id=user_id)
 
 
 def memory_add_router(dependencies: Sequence[Depends]) -> APIRouter:
@@ -376,17 +404,28 @@ def memory_add_router(dependencies: Sequence[Depends]) -> APIRouter:
             record = await asyncio.to_thread(additions.save, addition)
         except ValueError as error:
             raise HTTPException(409, str(error)) from error
-        saved = await asyncio.to_thread(additions.receipt, record.evidence_id)
+        saved = await asyncio.to_thread(
+            partial(additions.receipt, record.evidence_id, user_id=addition.user_id)
+        )
         background.add_task(schedule, additions, record)
         return saved
 
     @router.get("/additions/{request_id}", response_model=MemoryAddReceipt)
-    def memory_add_status(request_id: UUID, request: Request) -> MemoryAddReceipt:
+    def memory_add_status(
+        request_id: UUID,
+        request: Request,
+        user_id: str = Query(default=DEFAULT_USER_ID, pattern=USER_ID_PATTERN),
+    ) -> MemoryAddReceipt:
         try:
-            return store(request).receipt_for_request(request_id)
+            receipt = store(request).receipt_for_request(request_id, user_id=user_id)
         except KeyError as error:
             raise HTTPException(404, "memory_add_not_found") from error
         except ValueError as error:
             raise HTTPException(409, str(error)) from error
+        return receipt.model_copy(
+            update={
+                "next_retry_at": next_retry_at(request.app, receipt.state, receipt.next_retry_at)
+            }
+        )
 
     return router
