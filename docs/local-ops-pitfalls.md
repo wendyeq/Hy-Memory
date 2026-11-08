@@ -36,7 +36,48 @@
 
 ---
 
-## 2. 清理旧 Runtime 后 `sdk_migration_status_unavailable`
+## 2. Kuzu `graph` 文件损坏 → Core ready 后 SIGSEGV 崩溃循环
+
+### 现象（2026-11-08 实际发生）
+
+- `memhub status`：bridge 异常、全项未检查；无 `one-memory` 进程常驻
+- `service-error.log` 反复出现新的 `Started server process [PID]`，PID 每 2~3 秒换一个
+- `diagnostic-runtime.jsonl`：`core.ready` → ~0.7s 后 `core_exited_before_ready` / `SIGSEGV`
+- `~/Library/Logs/DiagnosticReports/one-memory-*.ips` 堆积，faulting thread 在
+  `_kuzu.cpython-312-darwin.so` → `PrimaryKeyIndex::load` ← `StorageManager::recover` ← `Database::Database`
+
+### 根因
+
+`~/.one-memory/hy-memory/governed-v2/graph`（Kuzu 单文件库）主键索引反序列化崩溃，多半是上次强杀/断电留下半个写。**与 ALL_PROXY 无关**——本次 launchctl 挂 SOCKS 但 LaunchAgent 已配 no-socks 包装，照样崩。
+
+### 验证（不碰原文件）
+
+```bash
+cp ~/.one-memory/hy-memory/governed-v2/graph /tmp/g-test
+python3.12 -m venv /tmp/kuzu-env && /tmp/kuzu-env/bin/pip install -q kuzu==0.11.3
+/tmp/kuzu-env/bin/python -c "import kuzu; kuzu.Connection(kuzu.Database('/tmp/g-test', read_only=True))"
+# 段错误 EXIT=139 → 确认文件本体坏，不是 Core 环境
+```
+
+注意：kuzu 与密封 Core 同版本（`kuzu-0.11.3`），系统 python3.14 无 wheel。
+
+### 修复
+
+```bash
+memhub stop
+mv ~/.one-memory/hy-memory/governed-v2/graph \
+   ~/.one-memory/hy-memory/governed-v2/graph.corrupt-<date>-segfault
+memhub start
+```
+
+hy_memory 缺文件会自动建空库（32768B 骨架）。**代价：图谱清零**，vector + sqlite 记忆仍在；图谱靠每日 13:00 evolve / `memhub evolve` 增量重建。损坏文件可保留做事后分析。
+
+### 注意
+
+- `graph-width` / `backup` 命令不管这种崩溃：doctor 在 Core 起不来时全项「未检查」，别指望它给修复建议
+- 崩溃期诊断日志每 2.5s 一轮，先看 `diagnostic-runtime.jsonl` 的 `error_code`，再看 `DiagnosticReports` 最新 .ips 的 faulting thread 定库
+
+## 3. 清理旧 Runtime 后 `sdk_migration_status_unavailable`
 
 ### 现象
 
@@ -56,7 +97,7 @@
 
 ---
 
-## 3. 钥匙串 / SecretStoreUnavailable
+## 4. 钥匙串 / SecretStoreUnavailable
 
 ### 现象
 
@@ -76,7 +117,7 @@
 
 ---
 
-## 4. 沉淀模型：用 `group/flash`，不要用 hy / hy4free
+## 5. 沉淀模型：用 `group/flash`，不要用 hy / hy4free
 
 ### 现象
 
@@ -93,7 +134,7 @@
 
 ---
 
-## 5. 其它相关
+## 6. 其它相关
 
 | 坑 | 要点 |
 | --- | --- |
