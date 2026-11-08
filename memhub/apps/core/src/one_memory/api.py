@@ -3129,11 +3129,18 @@ def create_app(
         """Run work prepared for a source after config.json has committed."""
         user_id, bare_source_id = split_lane(source_id)
         try:
+            # Incremental sync first, while a paused sync is still paused.
+            # Resuming that job first lets trigger abandon the worker it just
+            # started. A file that showed up while sync was paused is read
+            # from its start. A file that already has a cursor is read from
+            # that cursor.
+            await _live_sync(app).trigger(source_id)
             for job in await asyncio.to_thread(
                 partial(
                     _job_store(app).find_jobs,
                     user_id=user_id,
                     source_id=bare_source_id,
+                    operation="sync",
                     statuses=(
                         ImportStatus.PENDING,
                         ImportStatus.PAUSED,
@@ -3146,10 +3153,6 @@ def create_app(
                     await _supervisor(app).enqueue_off_loop(job.job_id, job=job)
                 else:
                     await _supervisor(app).resume_off_loop(job.job_id)
-            # Incremental sync, not a history job. A file that showed up
-            # while sync was paused is read from its start. A file that
-            # already has a cursor is read from that cursor.
-            await _live_sync(app).trigger(source_id)
         except SourceAccessError as error:
             raise HTTPException(status_code=409, detail=error.code) from None
         if app.state.settings.automatic_memory_processing:
@@ -3607,10 +3610,14 @@ def create_app(
                 # Another user's grant syncs while it stands (see
                 # `_lane_sync_enabled`); the App's switch is not touched.
                 await _prepare_source_resume(lane)
+                if job.status is ImportStatus.PENDING:
+                    await _supervisor(app).enqueue_off_loop(job.job_id, job=job)
                 await _activate_source_resume(lane)
             elif request.enable_sync:
                 await _prepare_source_resume(lane)
                 await asyncio.to_thread(_config_store(app).set_sync, job.source_id, True)
+                if job.status is ImportStatus.PENDING:
+                    await _supervisor(app).enqueue_off_loop(job.job_id, job=job)
                 await _activate_source_resume(lane)
         await _refresh_live_watch(app)
         return ConnectSourcesResponse(**result.model_dump())
