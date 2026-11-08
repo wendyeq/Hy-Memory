@@ -22,6 +22,7 @@ from one_memory.imports.models import (
 )
 from one_memory.imports.storage import EvidenceStore
 from one_memory.imports.supervisor import ImportSupervisor
+from one_memory.service_levels import ResourceLimit, ServiceLevelScheduler, ServiceResource
 
 
 def scanned(message_id: str, *, source_id: str = "fixture") -> ScannedEvidence:
@@ -300,14 +301,18 @@ def test_pending_workbuddy_runs_before_long_codex_history_finishes(tmp_path) -> 
     asyncio.run(scenario())
 
 
-def test_startup_recovers_interrupted_codex_before_pending_history(tmp_path) -> None:
-    async def scenario() -> None:
-        evidence_store, job_store = stores(tmp_path)
+def test_startup_recovers_interrupted_sync_before_pending_sync(tmp_path) -> None:
+    async def scenario(root) -> None:
+        evidence_store, job_store = stores(root)
         delivered: list[str] = []
-        workbuddy = job_store.create(user_id="local", source_id="workbuddy")
-        codex = job_store.create(user_id="local", source_id="codex")
+        workbuddy = job_store.create(user_id="local", source_id="workbuddy", operation="sync")
+        codex = job_store.create(user_id="local", source_id="codex", operation="sync")
+        history = job_store.create(user_id="local", source_id="codex", operation="history")
         _, token = job_store.claim(codex.job_id)
         job_store.interrupt_running(codex.job_id, runner_token=token)
+        # Sync is realtime. The default limit is max_concurrent_jobs + 1, so
+        # two sync jobs both run and their first records race. One realtime
+        # slot admits the interrupted job first and holds the pending one.
         supervisor = ImportSupervisor(
             adapters={
                 "workbuddy": CursorAwareAdapter(
@@ -318,9 +323,11 @@ def test_startup_recovers_interrupted_codex_before_pending_history(tmp_path) -> 
             },
             evidence_store=evidence_store,
             job_store=job_store,
-            max_concurrent_jobs=1,
             max_work_events_per_slice=1,
             on_evidence=lambda record: delivered.append(record.source_id),
+            service_levels=ServiceLevelScheduler(
+                {ServiceResource.IMPORT: ResourceLimit(capacity=1, background_capacity=1)}
+            ),
         )
 
         supervisor.resume_interrupted()
@@ -330,8 +337,10 @@ def test_startup_recovers_interrupted_codex_before_pending_history(tmp_path) -> 
         assert recovered.status is ImportStatus.COMPLETED
         assert pending.status is ImportStatus.COMPLETED
         assert delivered[0] == "codex"
+        assert job_store.require(history.job_id).status is ImportStatus.PENDING
 
-    asyncio.run(scenario())
+    for index in range(20):
+        asyncio.run(scenario(tmp_path / str(index)))
 
 
 def test_single_worker_rotates_across_sources(tmp_path) -> None:

@@ -178,9 +178,14 @@ class ImportSupervisor:
             )
 
     async def resume_interrupted_off_loop(self) -> None:
-        """`resume_interrupted` for the running Core: every read and write off the loop."""
+        """`resume_interrupted` for the running Core: every read and write off the loop.
+
+        Sync only. History stays stored until a person resumes that job.
+        """
         for status in (ImportStatus.INTERRUPTED, ImportStatus.PENDING):
-            jobs = await in_the_background(partial(self.job_store.find_jobs, statuses=(status,)))
+            jobs = await in_the_background(
+                partial(self.job_store.find_jobs, operation="sync", statuses=(status,))
+            )
             for job in jobs:
                 if self.lane_of(job) not in self.adapters:
                     continue
@@ -193,10 +198,10 @@ class ImportSupervisor:
                 await self.enqueue_off_loop(job.job_id, job=job)
 
     def resume_interrupted(self) -> None:
-        # A process restart must not place recoverable work behind every newly
-        # pending history. Each resumed runner will yield after one bounded slice.
+        # Sync only. History stays stored until a person resumes that job.
+        # Each resumed runner will yield after one bounded slice.
         for status in (ImportStatus.INTERRUPTED, ImportStatus.PENDING):
-            for job in self.job_store.list_jobs(status=status):
+            for job in self.job_store.find_jobs(operation="sync", statuses=(status,)):
                 if self.lane_of(job) in self.adapters:
                     if self.source_enabled is not None and not self.source_enabled(
                         self.lane_of(job)
