@@ -2,7 +2,7 @@
 
 面向本机 fork Runtime（build46 / 密封 `one-memory`）。公开上游 issue 仍走 GitHub；这里只记**本机反复踩过、且容易再犯**的坑。
 
-更新：2026-11-08（Asia/Shanghai）
+更新：2026-11-09（Asia/Shanghai）
 
 ## 1. Core 带着 `ALL_PROXY=socks5://…` → 缺 `socksio` → probe ImportError
 
@@ -155,4 +155,26 @@ launchctl getenv ALL_PROXY   # 常为 socks5；有包装时 Core 进程仍应为
 memhub models list --json
 memhub models test <profile-id> --json
 ```
+
+## 4. 清理 grok-exp 时勿删例程依赖目录
+
+### 现象（2026-11-09）
+
+- 例程「MemHub 只砍 history」找不到 `~/grok-exp/memhub-no-history-guard/memhub-enforce-freeze.sh`
+- 整夹在 2026-11-08 清理 grok-exp「施工垃圾」时被一并删掉；history 是否在跑变成未知
+
+### 根因
+
+- `~/grok-exp` 里既有一次性打包垃圾，也有**长期被例程/LaunchAgent 引用**的树外脚本
+- 同类常驻依赖还包括 `~/grok-exp/memhub-no-socks-core/`（`ONE_MEMORY_CORE_COMMAND`）
+
+### 正确做法
+
+1. 清 grok-exp 前先对照例程与 LaunchAgent 路径：至少保留 `memhub-no-history-guard/`、`memhub-no-socks-core/`
+2. 目录内应有 README 标明「例程依赖、勿清理」
+3. 脚本丢了先停清扫，按「只砍 history、保留 sync」重写并补跑；不要默默跳过例程
+
+### 改后证据
+
+- 2026-11-09 重写恢复后补跑：`CHANGED=0 history_cancelled=0`，7 看护源 `sync_enabled=True`，Runtime 1.0.6 未重启
 

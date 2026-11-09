@@ -15,3 +15,5 @@
 
 - 公开提交/PR 不要带返工台账、费用、个人绝对路径、密钥。
 - 架构边界见 `memhub/MEMORY.md` 与 `memhub/docs/ARCHITECTURE.md`。
+
+清理 `~/grok-exp` 时勿删 `memhub-no-history-guard/` 与 `memhub-no-socks-core/`（例程/LaunchAgent 依赖）。详见 `docs/local-ops-pitfalls.md` §4。
