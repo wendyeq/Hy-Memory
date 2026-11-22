@@ -233,19 +233,17 @@ class ImportSupervisor:
         if job_id in self._drains:
             raise InvalidJobTransitionError("import_cleanup_in_progress")
         queued = await in_the_background(self._queue_resumable, job_id)
+        # Cancel can return while claim is still committing RUNNING. That task
+        # is already gone, so the row has no scanner until it is queued again.
+        task = self._tasks.get(job_id)
+        if queued.status is ImportStatus.RUNNING and (task is None or task.done()):
+            await in_the_background(self._interrupt_if_running, job_id)
+            queued = await in_the_background(self._queue_resumable, job_id)
         if queued.status is not ImportStatus.PENDING:
             return queued
         return await self.enqueue_off_loop(job_id, job=queued)
 
     def _queue_resumable(self, job_id: str) -> ImportJob:
-        job = self.job_store.require(job_id)
-        if job.status not in {
-            ImportStatus.PENDING,
-            ImportStatus.PAUSED,
-            ImportStatus.INTERRUPTED,
-            ImportStatus.FAILED,
-        }:
-            return job
         return self.job_store.queue_for_resume(job_id)
 
     async def wait(self, job_id: str) -> ImportJob:

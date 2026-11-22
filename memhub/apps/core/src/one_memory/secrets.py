@@ -1,6 +1,5 @@
 import json
 import os
-import pwd
 import subprocess
 import sys
 import threading
@@ -10,6 +9,7 @@ from contextlib import suppress
 from ctypes import byref, c_void_p
 from enum import StrEnum
 from importlib import import_module
+from pathlib import Path
 from typing import Any, Protocol, cast
 
 DEFAULT_SERVICE_NAME = "one-memory"
@@ -86,7 +86,7 @@ class KeyringSecretStore:
         kr = _keyring()
         with self._lock:
             try:
-                if type(kr.get_keyring()).__module__ == "keyring.backends.macOS":
+                if _uses_bounded_child(kr):
                     _bounded_keychain_write(secret_ref, value)
                 else:
                     kr.set_password(keychain_service_name(), secret_ref, value)
@@ -114,7 +114,7 @@ class KeyringSecretStore:
                     code=SecretStoreErrorCode.BACKOFF,
                 )
             try:
-                if type(kr.get_keyring()).__module__ == "keyring.backends.macOS":
+                if _uses_bounded_child(kr):
                     value = _bounded_keychain_read(secret_ref)
                 else:
                     value = kr.get_password(keychain_service_name(), secret_ref)
@@ -137,7 +137,7 @@ class KeyringSecretStore:
         kr = _keyring()
         with self._lock:
             try:
-                if type(kr.get_keyring()).__module__ == "keyring.backends.macOS":
+                if _uses_bounded_child(kr):
                     _bounded_keychain_delete(secret_ref)
                 elif self.resolve(secret_ref) is not None:
                     kr.delete_password(keychain_service_name(), secret_ref)
@@ -154,7 +154,7 @@ class KeyringSecretStore:
         kr = _keyring()
         with self._lock:
             try:
-                if type(kr.get_keyring()).__module__ == "keyring.backends.macOS":
+                if _uses_bounded_child(kr):
                     _bounded_keychain_delete_many(secret_refs)
                 else:
                     for secret_ref in secret_refs:
@@ -169,22 +169,82 @@ class KeyringSecretStore:
                 self._read_failures.pop(secret_ref, None)
 
 
-def _keychain_read_command() -> list[str]:
+def _uses_bounded_child(kr: Any) -> bool:
+    """Whether this backend must be called from a killable child process.
+
+    A thread cannot cancel a stuck Security.framework call, and SecretService
+    blocks on a D-Bus prompt forever on headless Linux (#375). Reads, writes
+    and deletes on either backend all go through the bounded child.
+    """
+    backend = type(kr.get_keyring()).__module__
+    return backend == "keyring.backends.macOS" or backend.startswith(
+        "keyring.backends.SecretService"
+    )
+
+
+def _is_private_identity(path: Path) -> bool:
+    return path.parts[-3:] == ("id-a", "core", "one-memory")
+
+
+def _frozen_keychain_helper() -> str | None:
+    """Return the authorized frozen helper, or None when the variable is unset.
+
+    Deploy-site overlay for uv-run wrappers: do not rewrite Keychain items.
+    Only route bounded read, write, and delete through the already-authorized
+    frozen helper when ONE_MEMORY_FROZEN_KEYCHAIN_HELPER points at it.
+    Prefer that signed Core binary for the Keychain ACL. A set variable that
+    is missing, is this process, or is the private id-a binary fails closed
+    instead of falling through.
+    """
+    raw = os.environ.get("ONE_MEMORY_FROZEN_KEYCHAIN_HELPER", "").strip()
+    if not raw:
+        return None
+    candidate = Path(raw)
+    if not candidate.is_file():
+        raise SecretStoreUnavailableError("Operating system secure storage is unavailable")
+    try:
+        resolved = candidate.resolve()
+        running = Path(sys.executable).resolve()
+    except OSError:
+        raise SecretStoreUnavailableError(
+            "Operating system secure storage is unavailable"
+        ) from None
+    if resolved == running or _is_private_identity(resolved):
+        raise SecretStoreUnavailableError("Operating system secure storage is unavailable")
+    return str(resolved)
+
+
+def _refuse_private_identity_executable() -> None:
+    try:
+        running = Path(sys.executable).resolve()
+    except OSError:
+        raise SecretStoreUnavailableError(
+            "Operating system secure storage is unavailable"
+        ) from None
+    if _is_private_identity(running):
+        raise SecretStoreUnavailableError("Operating system secure storage is unavailable")
+
+
+def _keychain_command(flag: str, module: str) -> list[str]:
+    helper = _frozen_keychain_helper()
+    if helper is not None:
+        return [helper, flag]
+    _refuse_private_identity_executable()
     if getattr(sys, "frozen", False):
-        return [sys.executable, "--keychain-read"]
-    return [sys.executable, "-m", "one_memory.keychain_reader"]
+        return [sys.executable, flag]
+    return [sys.executable, "-m", module]
+
+
+def _keychain_read_command() -> list[str]:
+    return _keychain_command("--keychain-read", "one_memory.keychain_reader")
 
 
 def _keychain_write_command() -> list[str]:
-    if getattr(sys, "frozen", False):
-        return [sys.executable, "--keychain-write"]
-    return [sys.executable, "-m", "one_memory.keychain_writer"]
+    return _keychain_command("--keychain-write", "one_memory.keychain_writer")
 
 
 def _keychain_delete_command() -> list[str]:
-    if getattr(sys, "frozen", False):
-        return [sys.executable, "--keychain-delete"]
-    return [sys.executable, "-m", "one_memory.keychain_deleter"]
+    return _keychain_command("--keychain-delete", "one_memory.keychain_deleter")
 
 
 def _keychain_delete_many_command() -> list[str]:
@@ -192,8 +252,29 @@ def _keychain_delete_many_command() -> list[str]:
 
 
 def _keychain_environment() -> dict[str, str]:
+    """Environment for the Keychain child process; macOS backend only.
+
+    ``pwd`` and ``os.getuid`` do not exist on Windows. Importing pwd at
+    module level made this whole module unimportable there, and with it
+    ``model_profiles`` -> ``memory_tasks`` -> ``durable_queue``, so
+    ``_submit_live_memory`` raised inside capture_stdio's fail-open
+    handler and live record assembly never ran -- silently.
+
+    The passwd lookup is kept rather than replaced with ``expanduser``:
+    it deliberately ignores an inherited ``HOME``, which is what keeps a
+    rewritten environment from redirecting the child's Keychain lookup.
+    Both calls are POSIX-only, so a platform without them keeps the
+    environment it inherited instead of raising.
+    """
     environment = dict(os.environ)
-    environment["HOME"] = pwd.getpwuid(os.getuid()).pw_dir
+    try:
+        import pwd
+
+        home = pwd.getpwuid(os.getuid()).pw_dir
+    except (ImportError, AttributeError, KeyError):
+        # No passwd database here, and no macOS Keychain to reach either.
+        return environment
+    environment["HOME"] = home
     return environment
 
 
@@ -302,9 +383,9 @@ def _bounded_keychain_delete_many(secret_refs: tuple[str, ...]) -> None:
 
 
 def _bounded_keychain_read(secret_ref: str) -> str | None:
-    # A thread cannot cancel a stuck Security.framework call. The same
-    # executable reads in a short-lived child so its Keychain identity stays
-    # unchanged, while timeout kills and reaps the blocked process.
+    # A thread cannot cancel a stuck Security.framework or D-Bus call. The
+    # same executable reads in a short-lived child so its store identity
+    # stays unchanged, while timeout kills and reaps the blocked process.
     try:
         result = subprocess.run(
             _keychain_read_command(),

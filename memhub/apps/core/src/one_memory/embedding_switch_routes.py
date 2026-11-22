@@ -73,7 +73,9 @@ def embedding_switch_router(dependencies: Sequence[Depends]) -> APIRouter:
         spaces = await asyncio.to_thread(service.spaces.list_spaces)
         live = next((space for space in spaces if space.state == "live"), None)
         scanned: list[dict[str, object]] | None = None
-        scan_error = service.backend.unavailable_reason()
+        # The configured vector store's spaces: Chroma's files, or this home's
+        # collections on a Qdrant server. Never the files of a store left.
+        scan_error = service.scan_skip() or service.backend.unavailable_reason()
         if scan_error is None:
             try:
                 found = await service.backend.scan()

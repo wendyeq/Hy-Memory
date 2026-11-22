@@ -589,32 +589,35 @@ class ImportJobStore:
         return self.require(job_id), runner_token
 
     def queue_for_resume(self, job_id: str) -> ImportJob:
-        current = self.require(job_id)
-        if current.status is ImportStatus.PENDING:
-            return current
-        if current.status not in {
-            ImportStatus.PAUSED,
-            ImportStatus.INTERRUPTED,
-            ImportStatus.FAILED,
-        }:
-            raise InvalidJobTransitionError("Import job is not resumable")
+        """Queue a paused, interrupted, or failed job. Leave any other status.
+
+        The read and the update share one write transaction. A second startup
+        resume can meet the first resume's claim. Returning the row that won
+        keeps Core recovery from failing on that hand-off.
+        """
+        now = datetime.now(UTC).isoformat()
         with self._connect(writing=True) as connection:
-            updated = connection.execute(
-                """
-                UPDATE import_jobs
-                SET status = ?, runner_token = NULL, heartbeat_at = NULL,
-                    updated_at = ?
-                WHERE job_id = ? AND status = ?
-                """,
-                (
-                    ImportStatus.PENDING,
-                    datetime.now(UTC).isoformat(),
-                    job_id,
-                    current.status,
-                ),
-            )
-            if updated.rowcount != 1:
-                raise InvalidJobTransitionError("Import job status changed")
+            row = connection.execute(
+                "SELECT status FROM import_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown import job: {job_id}")
+            status = ImportStatus(row["status"])
+            if status in {
+                ImportStatus.PAUSED,
+                ImportStatus.INTERRUPTED,
+                ImportStatus.FAILED,
+            }:
+                connection.execute(
+                    """
+                    UPDATE import_jobs
+                    SET status = ?, runner_token = NULL, heartbeat_at = NULL,
+                        updated_at = ?
+                    WHERE job_id = ? AND status = ?
+                    """,
+                    (ImportStatus.PENDING, now, job_id, status),
+                )
         return self.require(job_id)
 
     def record_evidence(
