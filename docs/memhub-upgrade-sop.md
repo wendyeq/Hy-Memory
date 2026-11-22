@@ -246,6 +246,22 @@ memhub start --json
 
 完成条件是这些同时成立。已安装 App 与 Runtime 的 version、build 一致，且 Runtime `git_commit` 仍是 `$SHA`。现用模型列表、模式和存储后端与盘点一致。首次安装没有 profile 时，列表为空，且 `models test` 记为不适用。已有 profile 时，在已有授权内的 `models test` 成功。冷启动后的 Core 不带 SOCKS，官方 LaunchAgent 仍是产品原样，树外守护按盘点结论已加载且有效。停止前的 pid 已经退出，两分钟后新 pid 不变。已有记忆时 `recall` 返回了你预期的原文或记忆。history 没有因启动而回流，sync 只增量前进。
 
+## 8. 验收后的产物与磁盘
+
+验收通过之后，才处理本次构建产物、重复包和临时工作树。这一步会删文件，必须先列出路径和大小，得到确认后再删。没有确认不要删。不要为了腾出磁盘而跳过第 5 步的数据备份。
+
+必须保留这些：正在使用的 `$INSTALL_ROOT/current` 和已核对的 `$APP_DEST`；身份 helper 与身份锚的真实引用，不要只因旁边还有一份相似目录就删正在接线的那一份；至少一份已验证可回滚的集合，也就是一份 schema 2、含完整 Chroma 与 Kuzu 的数据备份，以及与之对应的 App 和 Runtime 副本；例程或 LaunchAgent 仍引用的树外脚本，至少包括踩坑文档里的 history 守护和 SOCKS 守护目录。官方 LaunchAgent 不要删，也不要改。
+
+没有这样一份完整数据备份时，不要删还可能用来回退的旧 App 或旧 Runtime。产品备份只放在 `$DATA_DIR/backups/`。若该目录是空的，先按第 5 步补做 `memhub backup create`，再谈清理。
+
+可以列入确认清单的，通常是：已经安装成功、且 App 与 Runtime 身份已核对的 `$OUTPUT_DIR` 构建产物，以及同目录下重复的中间输出；被更新包取代的旧候选包、预览 Runtime、日志和传输用的 git bundle；仅为这次升级建立、提交已推送、没有独有未推送提交的工作树。移除工作树用 `git worktree remove`，不要直接删目录，也不要动用户原来的仓库工作区。
+
+`$INSTALL_ROOT/versions` 里不再被 `current` 或 helper 引用、也不是回滚集合一部分的旧目录，只能单独列入确认清单。不能把清理 versions、helper 或守护当成常规自动步骤。
+
+构建和备份前先看可用空间。至少要放得下一份新的完整 App 与 Runtime 包、一份 v2 数据备份，以及余量。空间不够时，先清已经确认的候选产物，不要略过备份。默认保留当前这一份完整数据备份，以及上一份仍有效的备份；更旧的备份在新备份验证通过后再列入确认清单。
+
+完成条件是：清理清单已经确认；清单里没有 current、已核对的 App、已接线的 helper、官方服务、守护脚本，以及仅存的那份已验证回滚集合；`$DATA_DIR/backups` 里仍有可用的 schema 2 备份，或笔记已写明为什么暂时只能保留某一份手工完整副本。
+
 ## 按需参考
 
 这里只展开第 5 步已经区分过的两条路径。没有把它们合成一次自动回到旧版的步骤。
@@ -267,4 +283,4 @@ memhub backup restore \
 
 `--confirm` 必须和 `--source` 是同一个最终路径。restore 替换主库和记忆，核对条数，不一致则整份退回。旧的单个 `.sqlite3` 备份不含记忆，不能当作数据半边。restore 成功后执行 `memhub start`，仍用当前 `current`，不要换回旧 App。若当前 Runtime 仍不能读回记忆，停在现场，保留 `$PREVIOUS_RUNTIME`、`$APP_PREVIOUS`、备份目录和日志。不要改 `versions` 里的文件，也不要把这次 restore 写成已经回到旧版。
 
-清理旧 version 目录、钥匙串和 SOCKS 包装的做法只在踩坑文档里。清理数据目录以外的目录前，先确认例程仍引用的树外脚本还在。见踩坑文档「清理 grok-exp 时勿删例程依赖目录」。那不是本流程的一步。
+清理旧 version 目录、钥匙串和 SOCKS 包装的细节见踩坑文档。验收后的产物清理按第 8 步做。清理数据目录以外的目录前，先确认例程仍引用的树外脚本还在。见踩坑文档「清理 grok-exp 时勿删例程依赖目录」。
