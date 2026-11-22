@@ -2,6 +2,8 @@
 
 ## 本机运维踩坑
 
+同步上游，或升级、安装本机 MemHub Runtime 时，先读 [升级 SOP](docs/memhub-upgrade-sop.md)。那份文件是唯一流程正文。
+
 改 MemHub Runtime、模型配置、钥匙串、清理 version 目录前，先读：
 
 - [docs/local-ops-pitfalls.md](docs/local-ops-pitfalls.md)
