@@ -901,6 +901,13 @@ def _without_embedding_switch(settings: Any) -> Any:
 
 
 def serve(*, maintenance: bool = False) -> None:
+    from one_memory.keychain_helper_runtime import maybe_install_frozen_keychain_helper
+
+    # Keychain subcommands return in main before this entry, and the helper
+    # check itself ignores those argv shapes. Do not run it there: the child
+    # would treat this Core as the helper it is trying to select.
+    maybe_install_frozen_keychain_helper()
+
     import uvicorn
 
     from one_memory.diagnostic_log import configure_diagnostics, diagnostic_event
