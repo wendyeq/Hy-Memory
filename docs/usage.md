@@ -38,6 +38,10 @@ with HyMemoryClient(mode="pro") as client:
             print(channel, memory["score"], memory["content"])
 ```
 
+## 业务存储
+
+Working / Coding 业务数据默认使用 SQLite，也支持 PostgreSQL；向量配置独立。安装、部署和切换边界见 [业务存储后端](business_storage.md)。
+
 ## 配置
 
 SDK 会加载项目目录中的 `.env`。完整配置见 [env_reference.md](env_reference.md)。
@@ -346,10 +350,55 @@ page = client.list_memories(
 )
 
 result = client.clone_user("user_001", "user_002", agent_id=None)
+
+# 备份 / 恢复：按原 id 与向量导出、写回一个用户（向量库全部层级与状态，含 raw）
+exported = client.export_user_memories("user_001")
+restored = other_client.import_user_memories("user_001", exported["nodes"])
 ```
 
+启用图写入时，`update()` 和 `async_update()` 会在返回前同步已有 chat 图节点的正文。
+这项编辑保留节点的标签和已有关系边，不创建新的图节点。图写入失败时，返回的
+`success` 仍表示向量库已保存，并附加 `graph_sync_failed: true` 表明图可能仍是旧内容。
+
 对应异步方法为 `async_get()`、`async_update()`、`async_delete()`、
-`async_delete_all()`、`async_list_memories()`、`async_clone_user()`。
+`async_delete_all()`、`async_list_memories()`、`async_clone_user()`、
+`async_export_user_memories()`、`async_import_user_memories()`。
+
+`export_user_memories()` 返回该用户向量库里的每个节点（`MemoryNode.to_dict()`，
+默认带 `embedding`），每个层级（含 `L1_RAW`）、每种状态（含 superseded / shadow），
+并给出 `embedding_dims` 与 `embedding_model`。`import_user_memories()` 把这些节点
+原样写回：保留 `node_id`、层级、状态、演化链指针与时间；带向量的按原向量写入
+（宽度必须与目标向量库一致），不带的用当前 embedding 服务重算。目标用户默认
+必须为空，写入失败会回滚。两者都不碰图库：图是派生数据，恢复后用
+`build_memory_graph()` 重建。Chroma、Qdrant、FAISS 后端都适用。
+
+Qdrant BM25 schema/backfill 是显式维护操作，不在普通初始化时修改远程数据：
+
+```python
+plan = client.plan_qdrant_bm25_upgrade()  # 只读；不会加载或下载模型
+
+# 仅在所有写入者均已停止的维护窗口执行。
+if plan["state"] == "upgrade_required":
+    result = client.upgrade_qdrant_bm25(
+        writers_stopped=True,
+        batch_size=256,
+    )
+```
+
+升级使用 Qdrant 1.18+ 原生 named sparse vector 与 IDF modifier，只回填派生的
+`bm25` vector；不会改 dense vector、用户 payload 字段或 point id。Qdrant 服务端过旧、
+FastEmbed 不可用或覆盖校验失败时返回结构化 `blocked`/失败状态，不删除 collection。
+空文本或零 token 文档不写 sparse，而是在同一 Qdrant point 中写 SDK 私有派生
+payload 状态 `_hy_memory_bm25_state=empty`，用于明确记录 coverage；不会引入
+可搜索 sentinel、外部索引或旁路状态。返回值中的 `schema_ready`、`reader_enabled` 和
+`resumable` 分别说明 schema、读取开关和可重跑状态。
+
+实例内锁只防止同一 `HyMemoryClient` 重复执行升级，不是跨进程停写锁；
+`writers_stopped=True` 是调用方对整个部署维护窗口的承诺。此 API 仅属于
+Hy Memory SDK 2.0.17；普通启动和 MemHub 桌面 Runtime/CLI 都不会自动执行，
+MemHub 的 SDK pin、离线 FastEmbed 资源和维护入口将在后续独立接入。
+对应异步方法为 `async_plan_qdrant_bm25_upgrade()` 和
+`async_upgrade_qdrant_bm25()`。
 
 `get()` / `async_get()` 是统一的 ID 精确读取：返回结果的 `layer`、`kind` 和
 `variant` 表明实际类型。授权由调用 SDK 前的产品边界完成，不由 SDK 根据 layer

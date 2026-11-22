@@ -97,6 +97,45 @@ def main() -> None:
         from one_memory.keychain_deleter import main as delete_keychain
 
         raise SystemExit(delete_keychain())
+    if sys.argv[1:2] == ["--graph-open-probe"]:
+        # Hidden: the child `graph_open_guard` watches while it opens the
+        # ultra graph. Imports nothing but Kuzu.
+        from one_memory.hy_graph_admin import run_graph_open_probe
+
+        raise SystemExit(run_graph_open_probe(sys.argv[2:]))
+    if sys.argv[1:] == ["--storage-drivers"]:
+        # Hidden: the packaging guard asks the frozen Core which storage
+        # backend drivers it can import (`storage_backend_probe`).
+        from one_memory.storage_backend_probe import driver_availability
+
+        print(json.dumps(driver_availability(import_them=True), sort_keys=True), flush=True)
+        raise SystemExit(0)
+    if sys.argv[1:] == ["--bm25-assets-check"]:
+        # Hidden release gate: prove the frozen FastEmbed modules and offline
+        # Qdrant/bm25 snapshot can produce a real sparse vector.
+        from fastembed import SparseTextEmbedding
+
+        from one_memory.bm25_assets import BM25_MODEL, configure_bm25_cache
+
+        cache = configure_bm25_cache()
+        if cache is None:
+            raise SystemExit("bm25_assets_missing")
+        embedded = list(SparseTextEmbedding(BM25_MODEL).embed(["MemHub BM25"]))
+        if not embedded or len(embedded[0].indices) == 0:
+            raise SystemExit("bm25_assets_unusable")
+        print(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "product": "memhub-bm25-assets",
+                    "state": "ready",
+                    "offline": os.environ.get("HF_HUB_OFFLINE") == "1",
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        raise SystemExit(0)
     if sys.argv[1:2] == ["capture"] and __name__ != "__main__":
         _end_by(os.environ.get("ONE_MEMORY_CAPTURE_DEADLINE_S"))
 
@@ -118,6 +157,8 @@ def run(arguments: Sequence[str], *, output: TextIO | None = None) -> int:
         return sdk_migrate(options, stream)
     if command == "sdk-migration-status":
         return sdk_migration_status(options, stream)
+    if command == "bm25-maintenance":
+        return bm25_maintenance(options, stream)
     if command == "capture" and len(options) == 1:
         from one_memory.capture_handoff import capture_stdio
 
@@ -128,6 +169,7 @@ def run(arguments: Sequence[str], *, output: TextIO | None = None) -> int:
             "|restore --source <managed-backup> --yes [--json]"
             "|sdk-migrate --runtime-build <build> --yes [--json]"
             "|sdk-migration-status [--json]"
+            "|bm25-maintenance <plan|upgrade> [--batch-size <n>] [--yes] [--json]"
             "|capture SOURCE]\n"
         )
         return 2
@@ -138,6 +180,75 @@ def run(arguments: Sequence[str], *, output: TextIO | None = None) -> int:
     else:
         stream.write(f"{_status_text(command, status)}\n")
     return 0 if status.state == "running" else 3 if status.state == "stopped" else 1
+
+
+def bm25_maintenance(options: Sequence[str], stream: TextIO) -> int:
+    """Plan or explicitly run the stopped-writer Qdrant BM25 upgrade."""
+    if not options or options[0] not in {"plan", "upgrade"}:
+        stream.write("one-memory: bm25-maintenance 需要 plan 或 upgrade\n")
+        return 2
+    operation, *flags = options
+    as_json = False
+    confirmed = False
+    batch_size = 256
+    index = 0
+    while index < len(flags):
+        flag = flags[index]
+        if flag == "--json":
+            as_json = True
+        elif flag == "--yes":
+            confirmed = True
+        elif flag == "--batch-size" and index + 1 < len(flags):
+            index += 1
+            try:
+                batch_size = int(flags[index])
+            except ValueError:
+                stream.write("one-memory: --batch-size 必须是整数\n")
+                return 2
+        else:
+            stream.write(f"one-memory: 参数无效：{flag}\n")
+            return 2
+        index += 1
+    if operation == "plan" and confirmed:
+        stream.write("one-memory: plan 不接受 --yes\n")
+        return 2
+    if operation == "upgrade" and not confirmed:
+        stream.write(
+            "one-memory: upgrade 会修改 Qdrant；停止所有 Runtime/写入者后传 --yes\n"
+        )
+        return 2
+
+    from one_memory.bm25_maintenance import Bm25MaintenanceError, maintain_bm25
+
+    try:
+        document = maintain_bm25(
+            load_settings().data_dir,
+            execute=operation == "upgrade",
+            batch_size=batch_size,
+        )
+    except Bm25MaintenanceError as error:
+        document = {
+            "schema_version": 1,
+            "product": "memhub-qdrant-bm25-maintenance",
+            "state": "blocked",
+            "reason": error.code,
+            "success": False,
+            "changed": False,
+        }
+    if as_json:
+        stream.write(f"{json.dumps(document, sort_keys=True)}\n")
+    else:
+        state = document.get("state", "unknown")
+        reason = document.get("reason")
+        suffix = f" ({reason})" if reason else ""
+        stream.write(f"BM25 {operation}: {state}{suffix}\n")
+    if document.get("state") == "blocked":
+        return 4
+    if operation == "plan" and document.get("state") == "upgrade_required":
+        return 3
+    if operation == "upgrade" and not document.get("success"):
+        return 1
+    return 0
 
 
 def restore(options: Sequence[str], stream: TextIO) -> int:
@@ -231,6 +342,19 @@ def restore(options: Sequence[str], stream: TextIO) -> int:
             f"已恢复完整迁移备份：{sdk_result.bundle_id}。",
         )
         return 0
+    candidate = Path(source)
+    if (candidate if candidate.is_absolute() else settings.data_dir / candidate).is_dir():
+        # A v2 backup (memories included) is a directory; a v1 backup is
+        # the bare management database and keeps the path below.
+        from one_memory.memory_backup import BackupError, locate
+
+        try:
+            located = locate(settings.data_dir, source)
+        except BackupError as error:
+            document = {"schema_version": 1, "state": "failed", "code": error.code}
+            _write_restore(stream, as_json, document, f"恢复失败：{error.code}")
+            return 1
+        return _restore_with_memories(settings.data_dir, located, stream, as_json)
     try:
         managed_result = restore_managed_backup(data_dir=settings.data_dir, source=source)
     except RestoreRejected as error:
@@ -247,12 +371,61 @@ def restore(options: Sequence[str], stream: TextIO) -> int:
         "restored_bytes": managed_result.restored_bytes,
         "previous_backup_path": str(managed_result.previous_backup_path),
         "source_schema_version": managed_result.source_schema_version,
+        "backup_schema_version": 1,
+        "memories_included": False,
+        "note": "management_database_only_no_memories",
     }
     _write_restore(
         stream,
         as_json,
         document,
-        f"已恢复：{managed_result.previous_backup_path} 为保护性备份。",
+        f"已恢复：{managed_result.previous_backup_path} 为保护性备份。"
+        "这是旧格式备份，只含主库，不含记忆；记忆库 hy-memory/ 保持原样。",
+    )
+    return 0
+
+
+def _restore_with_memories(data_dir: Path, located: Any, stream: TextIO, as_json: bool) -> int:
+    """Restore a v2 backup (memories included) while the Runtime is stopped.
+
+    No SDK client runs in this process, so nothing is quiesced; the layer
+    counts need a model profile's client and are left to the Runtime's
+    maintenance restore (`POST /api/v1/backup/restore`), while the store and
+    graph counts are verified here.
+    """
+    import asyncio
+    from datetime import UTC, datetime
+
+    from one_memory.memory_backup import BackendIdentity, BackupError, run_restore
+    from one_memory.memory_evolution import EvolveStateStore, GraphBuildState, GraphBuildUser
+    from one_memory.memory_server.config_state import ConfigStore
+
+    def schedule(users: tuple[str, ...], clear_first: bool) -> None:
+        EvolveStateStore(data_dir).set_graph_build(
+            GraphBuildState(
+                state="running",
+                started_at=datetime.now(UTC),
+                users={user_id: GraphBuildUser() for user_id in users},
+                clear_first=clear_first,
+            )
+        )
+
+    try:
+        current = BackendIdentity.of(ConfigStore(data_dir).storage_backends())
+        result = asyncio.run(
+            run_restore(data_dir, located, current=current, schedule_graph_rebuild=schedule)
+        )
+    except BackupError as error:
+        document = {"schema_version": 1, "state": "failed", "code": error.code}
+        _write_restore(stream, as_json, document, f"恢复失败：{error.code}")
+        return 1
+    document = {"schema_version": 1, **result.document()}
+    _write_restore(
+        stream,
+        as_json,
+        document,
+        f"已恢复（含记忆）：{result.files} 个文件，{result.bytes} 字节；"
+        f"之前的数据保留在 {result.previous}。",
     )
     return 0
 
@@ -592,10 +765,17 @@ def _sdk_migration_status(options: Sequence[str], stream: TextIO) -> int:
         from one_memory.sdk_migration_runner import abandoned_staging_present
         from one_memory.sdk_migration_verify import read_active_profile
         from one_memory.sdk_vector_reattach import legacy_vector_collections
+        from one_memory.storage_backends import MIGRATION_SKIPPED, custom_backends_configured
         from one_memory.target_schema import legacy_tables_present
 
         authority = SdkDataPlaneMigrationStore(database_path).authority()
-        if authority is MemoryAuthority.SDK:
+        skipped: str | None = None
+        if authority is MemoryAuthority.SDK and custom_backends_configured(settings.data_dir):
+            # A home on another store: the upgrade's repairs of the local
+            # Kuzu/Chroma stores do not apply, and those stores stay as they
+            # are (`run_startup_migration`). Not even read here.
+            state, skipped = "not_required", MIGRATION_SKIPPED
+        elif authority is MemoryAuthority.SDK:
             profile = read_active_profile(database_path) or builtin_retrieval_snapshot()
             leftovers = bool(
                 legacy_tables_present(database_path)
@@ -609,6 +789,8 @@ def _sdk_migration_status(options: Sequence[str], stream: TextIO) -> int:
         else:
             state = "required"
         document = {"schema_version": 1, "authority": authority.value, "state": state}
+        if skipped is not None:
+            document["skipped"] = skipped
         from one_memory.embedding_switch import read_open_job
 
         # Informational. An unfinished embedding switch never makes a
@@ -732,6 +914,11 @@ def serve(*, maintenance: bool = False) -> None:
     from one_memory.runtime import CoreRuntime, parent_pid
 
     settings = load_settings()
+    from one_memory.memory_backup import recover_interrupted_restore
+
+    # A backup restore killed between its renames: put the previous data
+    # back before anything reads the home (`memory_backup.roll_back`).
+    recover_interrupted_restore(settings.data_dir)
     if not maintenance:
         _refuse_unmigrated_home(settings.data_dir)
     # HY resolves some trace paths at import time and its pipeline path when

@@ -2,14 +2,14 @@
 
 MemHub itself is licensed under Apache-2.0 (see `LICENSE`).
 It bundles the runtime dependencies listed below.
-Generated from the installed dependency tree on 2026-10-22T13:18:16Z
+Generated from the installed dependency tree on 2026-11-18T15:41:54Z
 by `python3 scripts/generate_sbom.py`. Do not edit by hand.
 
 Per-package license texts are not reproduced here yet; the license
 column is filled in as part of release review, and the SBOM records
 `NOASSERTION` until then rather than guessing.
 
-## hy-memory 2.0.14
+## hy-memory 2.0.17
 
 License: Apache-2.0
 
@@ -126,7 +126,7 @@ No Memmy brand, icon, font or mascot assets are distributed.
 - tar 7.5.22
 - three 0.185.1
 
-## Python (PyPI) — 126 packages
+## Python (PyPI) — 137 packages
 
 - aiohappyeyeballs 2.7.1
 - aiohttp 3.14.3
@@ -150,6 +150,7 @@ No Memmy brand, icon, font or mascot assets are distributed.
 - durationpy 0.11
 - execnet 2.1.2
 - fastapi 0.141.1
+- fastembed 0.9.0
 - filelock 3.32.4
 - flatbuffers 25.12.19
 - frozenlist 1.8.0
@@ -157,12 +158,15 @@ No Memmy brand, icon, font or mascot assets are distributed.
 - googleapis-common-protos 1.75.2
 - grpcio 1.83.1
 - h11 0.16.0
+- h2 4.4.1
 - hf-xet 1.6.0
+- hpack 4.2.0
 - httpcore 1.0.9
 - httptools 0.8.0
 - httpx 0.28.1
 - huggingface-hub 1.29.0
 - humanfriendly 10.0
+- hyperframe 6.1.0
 - idna 3.19
 - importlib-resources 7.1.0
 - iniconfig 2.3.0
@@ -180,6 +184,7 @@ No Memmy brand, icon, font or mascot assets are distributed.
 - kuzu 0.11.3
 - langdetect 1.0.9
 - librt 0.15.0
+- loguru 0.7.3
 - macholib 1.16.4
 - markdown-it-py 4.2.0
 - mdurl 0.1.2
@@ -190,6 +195,7 @@ No Memmy brand, icon, font or mascot assets are distributed.
 - mypy 2.3.1
 - mypy-extensions 1.1.0
 - narwhals 2.25.0
+- neo4j 6.4.1
 - numpy 2.5.2
 - oauthlib 3.3.1
 - onnxruntime 1.23.2
@@ -204,9 +210,12 @@ No Memmy brand, icon, font or mascot assets are distributed.
 - overrides 7.7.0
 - packaging 26.3
 - pathspec 1.1.1
+- pillow 12.3.0
 - pluggy 1.6.0
+- portalocker 3.2.0
 - propcache 0.5.2
 - protobuf 7.36.0
+- py-rust-stemmers 0.1.8
 - pybase64 1.5.0
 - pydantic 2.13.5
 - pydantic-core 2.46.5
@@ -221,7 +230,9 @@ No Memmy brand, icon, font or mascot assets are distributed.
 - pytest-xdist 3.8.0
 - python-dateutil 2.9.0.post0
 - python-dotenv 1.2.3
+- pytz 2026.6
 - pyyaml 6.0.3
+- qdrant-client 1.19.1
 - rank-bm25 0.2.2
 - referencing 0.37.0
 - regex 2026.8.31
