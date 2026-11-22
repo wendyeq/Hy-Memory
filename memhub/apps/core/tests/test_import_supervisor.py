@@ -13,7 +13,7 @@ from one_memory.imports.adapters import (
     SourceDescriptor,
     StorageKind,
 )
-from one_memory.imports.jobs import ImportJobStore, ImportStatus
+from one_memory.imports.jobs import ImportJobStore, ImportStatus, InvalidJobTransitionError
 from one_memory.imports.models import (
     EvidenceInput,
     EvidenceOrigin,
@@ -484,5 +484,120 @@ def test_abandon_makes_its_database_calls_off_the_event_loop(tmp_path, monkeypat
         assert {name for name, _thread in calls} == {"require", "interrupt_running"}
         assert all(thread is not loop_thread for _name, thread in calls)
         assert jobs.require(job.job_id).status is ImportStatus.INTERRUPTED
+
+    asyncio.run(scenario())
+
+
+def test_queue_for_resume_keeps_a_sync_another_worker_already_moved(tmp_path) -> None:
+    """A second resume must not raise after the first one claimed or finished the sync."""
+    _evidence, jobs = stores(tmp_path)
+    claimed = jobs.create(user_id="local", source_id="claimed", operation="sync")
+    jobs.claim(claimed.job_id)
+    kept = jobs.queue_for_resume(claimed.job_id)
+    assert kept.job_id == claimed.job_id
+    assert kept.status is ImportStatus.RUNNING
+
+    finished = jobs.create(user_id="local", source_id="finished", operation="sync")
+    jobs.claim(finished.job_id)
+    jobs.transition(finished.job_id, ImportStatus.COMPLETED)
+    kept_finished = jobs.queue_for_resume(finished.job_id)
+    assert kept_finished.job_id == finished.job_id
+    assert kept_finished.status is ImportStatus.COMPLETED
+
+
+def test_queue_for_resume_survives_a_concurrent_claim(tmp_path) -> None:
+    """Claim and queue meet on one interrupted sync. Queue must not raise."""
+    import threading
+
+    _evidence, jobs = stores(tmp_path)
+    failures: list[str] = []
+    for index in range(40):
+        job = jobs.create(user_id="local", source_id=f"source-{index}", operation="sync")
+        jobs.claim(job.job_id)
+        jobs.interrupt_running(job.job_id)
+        barrier = threading.Barrier(2)
+
+        def claim() -> None:
+            barrier.wait()
+            try:
+                jobs.claim(job.job_id)
+            except InvalidJobTransitionError:
+                return
+
+        def queue() -> None:
+            barrier.wait()
+            try:
+                jobs.queue_for_resume(job.job_id)
+            except InvalidJobTransitionError as error:
+                failures.append(str(error))
+
+        threads = (
+            threading.Thread(target=claim),
+            threading.Thread(target=queue),
+        )
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert jobs.require(job.job_id).status in {ImportStatus.PENDING, ImportStatus.RUNNING}
+    assert failures == []
+
+
+def test_resume_off_loop_restarts_an_ownerless_running_sync(tmp_path) -> None:
+    """A running sync whose task already exited is started again. History is not."""
+
+    async def scenario() -> None:
+        evidence, jobs = stores(tmp_path)
+        supervisor = ImportSupervisor(
+            adapters={"fixture": ControlledAdapter([scanned("sync-row")])},
+            evidence_store=evidence,
+            job_store=jobs,
+        )
+        sync = jobs.create(user_id="local", source_id="fixture", operation="sync")
+        history = jobs.create(user_id="local", source_id="fixture", operation="history")
+        jobs.claim(sync.job_id)
+
+        await supervisor.resume_off_loop(sync.job_id)
+        finished = await asyncio.wait_for(supervisor.wait(sync.job_id), 5)
+
+        assert finished.job_id == sync.job_id
+        assert finished.status is ImportStatus.COMPLETED
+        assert finished.stored == 1
+        assert jobs.require(history.job_id).status is ImportStatus.PENDING
+        assert history.job_id not in supervisor.active_job_ids()
+        await supervisor.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_resume_off_loop_leaves_a_live_sync_running(tmp_path) -> None:
+    async def scenario() -> None:
+        evidence, jobs = stores(tmp_path)
+        gate = asyncio.Event()
+        supervisor = ImportSupervisor(
+            adapters={"fixture": ControlledAdapter([scanned("sync-row")], gate)},
+            evidence_store=evidence,
+            job_store=jobs,
+        )
+        sync = jobs.create(user_id="local", source_id="fixture", operation="sync")
+        history = jobs.create(user_id="local", source_id="fixture", operation="history")
+        supervisor.enqueue(sync.job_id)
+        for _ in range(100):
+            if jobs.require(sync.job_id).status is ImportStatus.RUNNING:
+                break
+            await asyncio.sleep(0.01)
+        assert jobs.require(sync.job_id).status is ImportStatus.RUNNING
+
+        resumed = await supervisor.resume_off_loop(sync.job_id)
+
+        assert resumed.job_id == sync.job_id
+        assert resumed.status is ImportStatus.RUNNING
+        assert sync.job_id in supervisor.active_job_ids()
+        assert jobs.require(history.job_id).status is ImportStatus.PENDING
+        gate.set()
+        finished = await asyncio.wait_for(supervisor.wait(sync.job_id), 5)
+        assert finished.status is ImportStatus.COMPLETED
+        assert jobs.require(history.job_id).status is ImportStatus.PENDING
+        await supervisor.shutdown()
 
     asyncio.run(scenario())
