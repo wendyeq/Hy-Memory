@@ -13,7 +13,7 @@
 
 ## 仓规提醒
 
-- 公开提交/PR 不要带返工台账、费用、个人绝对路径、密钥。
+- 公开提交/PR 不要带返工台账、费用、个人绝对路径、密钥。内部报告、会话复盘若已误提交且尚未推送，不要只在最新提交里删除文件：从干净合并点另开待发布分支，重放必要提交，使待发布历史中不再含这些文件。
 - 架构边界见 `memhub/MEMORY.md` 与 `memhub/docs/ARCHITECTURE.md`。
 
 清理 `~/grok-exp` 时勿删 `memhub-no-history-guard/` 与 `memhub-no-socks-core/`（例程/LaunchAgent 依赖）。详见 `docs/local-ops-pitfalls.md` §4。
