@@ -70,7 +70,9 @@ launchctl getenv ALL_PROXY
 
 再看两处，不要看进程路径像不像包装。包装 `exec` 真正的 `one-memory` 之后，进程路径就是密封二进制。接线生效是指已加载的 LaunchAgent 的启动命令仍指向包装，并且这个 Core 进程的代理变量为空。只记录启动命令是否指向包装，以及代理变量是否为空。不要把 EnvironmentVariables 或其他环境写进笔记，里面可能有密钥。文件在旁边的目录里，不算接线生效。现象和错误做法见 [local-ops-pitfalls.md](local-ops-pitfalls.md) 里「Core 带着 `ALL_PROXY`」一节。
 
-身份 helper 同样只认当前启动链。不要记录钥匙串哈希或身份锚的秘密。若 doctor 或日志已经是 `sdk_migration_status_unavailable`，或凭据状态不可用，先按踩坑文档里「清理旧 Runtime 后 `sdk_migration_status_unavailable`」和「钥匙串」两节处理，不要进入安装。
+身份 helper 同样只认当前启动链。不要记录钥匙串哈希或身份锚的秘密。只在 version 目录里看到 helper 文件，不算接线生效。生效证据是现用配置列表可读，且凭据状态可用。若 doctor 或日志已经是 `sdk_migration_status_unavailable`，或凭据状态不可用，先按踩坑文档里「清理旧 Runtime 后 `sdk_migration_status_unavailable`」和「钥匙串」两节处理，不要进入安装。
+
+不要手改官方 LaunchAgent。改了会出现 `runtime_service_file_modified`。SOCKS 包装若存在，应作为树外守护接到已加载的服务，不要写进官方 plist。
 
 history 行为以 `$SHA` 的代码为准，不把某一个天数写成以后的标准。符号是 `memhub/apps/core/src/one_memory/api.py` 里的 `RESUME_HISTORY_WINDOW` 和 `ONBOARDING_HISTORY_WINDOW`。本 fork 要保住的行为是启动和同步恢复不继续 history，只走增量 sync。
 
@@ -78,12 +80,14 @@ history 行为以 `$SHA` 的代码为准，不把某一个天数写成以后的�
 
 ## 2. 对照上游 tag，只留最小补丁
 
+若还没有 `upstream` 远程，先加官方仓 `https://github.com/Tencent-Hunyuan/Hy-Memory`，远程名用 `upstream`。
+
 ```bash
 git fetch upstream tag "$UPSTREAM_TAG"
 git diff "$UPSTREAM_TAG" -- memhub
 ```
 
-只保留盘点证明正在生效、且上游 tag 里没有的改动。本 fork 留下的是 history 窗口，以及启动和 sync resume 不继续 history。回归测试是 `memhub/apps/core/tests/test_resume_history_window.py`。树外 helper 留在树外，不要为了升级把它们提交进仓库。上游已经有的补丁不要再叠一遍。
+只保留盘点证明正在生效、且上游 tag 里没有的改动。本 fork 通常要留下的是 history 窗口、启动和 sync resume 不继续 history，以及密封身份 helper。对照 `$UPSTREAM_TAG` 时以 diff 为准：上游已经吸收的就不要再叠一遍。树外 helper 留在树外，不要为了升级把它们提交进仓库。
 
 若当前 HEAD 已经是要安装的树，确认上面的 diff 只含这些补丁，把 `git rev-parse HEAD` 记为 `$SHA`。工作区要干净。
 
@@ -102,9 +106,15 @@ bash scripts/run-tests-isolated.sh core tests/test_resume_history_window.py
 bash scripts/run-tests-isolated.sh node --test scripts/platform/macos/macos-release-scripts.test.mjs
 ```
 
-两条都结束后再看一次 `git rev-parse HEAD`。
+第 2 步还留下的私有补丁，把 `$SHA` 里对应的回归测试一并列入。身份 helper 仍在 fork 里时，再跑：
 
-完成条件是两条命令退出码都是 0，且 HEAD 仍是 `$SHA`。
+```bash
+bash scripts/run-tests-isolated.sh core tests/test_frozen_keychain_helper.py
+```
+
+这些命令都结束后再看一次 `git rev-parse HEAD`。
+
+完成条件是列入的命令退出码都是 0，且 HEAD 仍是 `$SHA`。
 
 ## 4. 打出与该 SHA 一致的 App 与 Runtime
 
@@ -146,7 +156,7 @@ memhub backup create --target "$DATA_DIR/backups/$BACKUP_NAME" --yes
 
 ## 6. 用官方入口安装
 
-从这里开始会替换正在运行的服务。使用刚打出的 Runtime 里的 CLI，让 CLI 和包是同一次构建。不要省略 `--source`，避免 CLI 去访问网络。
+从这里开始会替换正在运行的服务。使用刚打出的 Runtime 里的 CLI，让 CLI 和包是同一次构建。不要省略 `--source`，避免 CLI 去访问网络。安装完成后，验收和日常 `start`、`stop`、`status` 改用 `$INSTALL_ROOT/current/bin/one-memory`，或已经指向同一安装根的受管 `memhub`。不要再用构建目录里的 CLI，又漏掉 `--install-root`。
 
 首次安装没有 `current`。预览用 `install`，不要用 `upgrade`。
 
@@ -184,7 +194,7 @@ memhub backup create --target "$DATA_DIR/backups/$BACKUP_NAME" --yes
 
 若构建号更低，预览给出 `distribution_downgrade_refused`。停止。这不是这次升级的路径。
 
-完成条件是下面三者之一。首次 `install --yes` 之后，`current` 的 manifest `git_commit` 是 `$SHA`。升级后 `current` 指向新版本目录，且其 `git_commit` 是 `$SHA`。同 build、字节相同，且现有 `current` 已经核对为 `$SHA`。
+完成条件是下面四者之一。首次 `install --yes` 之后，`current` 的 manifest `git_commit` 是 `$SHA`。升级后 `current` 指向新版本目录，且其 `git_commit` 是 `$SHA`。同 build、字节不同，已由 `$APP_DEST` 完成替换，且新的 `current` manifest 提交仍是 `$SHA`。同 build、字节相同，且现有 `current` 已经核对为 `$SHA`。
 
 ## 7. 验收
 
@@ -192,7 +202,7 @@ memhub backup create --target "$DATA_DIR/backups/$BACKUP_NAME" --yes
 
 服务起来之后，先看新的 Core，不要用第 1 步的旧进程记录代替。已加载的 LaunchAgent 仍应指向盘点时的包装。Core 进程的代理变量必须为空。不要用进程路径是否等于包装来判断。Core 进程带着 SOCKS 时，不要做 `models test`，也不要把验收记为通过。包装和代理的判据见踩坑文档里 SOCKS 那一节。
 
-然后做只读核对。不要换模型，也不要新开 history。`$RECALL_QUERY_FILE` 必须在跑命令前就写好。首次安装没有旧记忆时，跳过 `recall`，并在笔记里写明没有旧查询。
+然后做只读核对。不要换模型，也不要新开 history。`$RECALL_QUERY_FILE` 必须在跑命令前就写好。验收记忆召回时加 `--kind memory`。首次安装没有旧记忆时，跳过 `recall`，并在笔记里写明没有旧查询。
 
 ```bash
 memhub models list --json
@@ -201,7 +211,7 @@ memhub settings backends show --json
 memhub sources list --json
 memhub sync status --json
 memhub jobs list --json
-memhub recall --query-file "$RECALL_QUERY_FILE" --json
+memhub recall --query-file "$RECALL_QUERY_FILE" --kind memory --json
 ```
 
 冷启动会停服务。做完上面的只读核对再做。首次安装也做一次，用来看 helper 是否还在。
