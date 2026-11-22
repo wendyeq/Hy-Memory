@@ -582,10 +582,10 @@ def test_resume_off_loop_leaves_a_live_sync_running(tmp_path) -> None:
         sync = jobs.create(user_id="local", source_id="fixture", operation="sync")
         history = jobs.create(user_id="local", source_id="fixture", operation="history")
         supervisor.enqueue(sync.job_id)
-        for _ in range(100):
+        for _ in range(40):
             if jobs.require(sync.job_id).status is ImportStatus.RUNNING:
                 break
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0)
         assert jobs.require(sync.job_id).status is ImportStatus.RUNNING
 
         resumed = await supervisor.resume_off_loop(sync.job_id)
