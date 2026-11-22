@@ -95,27 +95,40 @@ def test_install_selects_the_kc_a_helper(tmp_path: Path, monkeypatch) -> None:
     assert Path(selected).parts[-3:] == ("kc-a", "core", "one-memory")
 
 
-def test_install_uses_the_home_versions_layout(monkeypatch) -> None:
+def test_default_versions_root_uses_application_support_layout() -> None:
+    assert helper_runtime.default_versions_root() == (
+        Path.home() / "Library" / "Application Support" / "One Memory" / "versions"
+    )
+
+
+def test_install_uses_the_default_versions_root(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv(helper_runtime.HELPER_ENV, raising=False)
-    root = Path.home() / "Library" / "Application Support" / "One Memory" / "versions"
-    identity = root / "id-a" / "core" / "one-memory"
-    helper = root / "kc-a" / "core" / "one-memory"
-    running = root / "running-core"
-    identity.parent.mkdir(parents=True, exist_ok=True)
-    helper.parent.mkdir(parents=True, exist_ok=True)
-    identity.write_bytes(FIXTURE_IDENTITY)
-    helper.write_bytes(b"frozen-helper")
+    root = _versions(tmp_path, identity=FIXTURE_IDENTITY, helper=True)
+    running = tmp_path / "running-core"
     running.write_bytes(b"running")
-    try:
-        selected = helper_runtime.install_frozen_keychain_helper(
-            identity_sha256=FIXTURE_SHA256,
-            executable=running,
-        )
-    finally:
-        for path in (identity, helper, running):
-            path.unlink(missing_ok=True)
+    monkeypatch.setattr(helper_runtime, "default_versions_root", lambda: root)
+    live_root = Path.home() / "Library" / "Application Support" / "One Memory"
+    live_identity = live_root / "versions" / "id-a" / "core" / "one-memory"
+    live_helper = live_root / "versions" / "kc-a" / "core" / "one-memory"
+    before_identity = live_identity.read_bytes() if live_identity.is_file() else None
+    before_helper = live_helper.read_bytes() if live_helper.is_file() else None
+    selected = helper_runtime.install_frozen_keychain_helper(
+        identity_sha256=FIXTURE_SHA256,
+        executable=running,
+    )
+    helper = root / "kc-a" / "core" / "one-memory"
     assert selected == str(helper.resolve())
     assert os.environ[helper_runtime.HELPER_ENV] == selected
+    if before_identity is None:
+        assert not live_identity.exists()
+    else:
+        assert live_identity.read_bytes() == before_identity
+        assert before_identity != FIXTURE_IDENTITY
+    if before_helper is None:
+        assert not live_helper.exists()
+    else:
+        assert live_helper.read_bytes() == before_helper
+        assert before_helper != b"frozen-helper"
 
 
 def test_install_refuses_to_run_as_id_a(tmp_path: Path, monkeypatch) -> None:
